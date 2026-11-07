@@ -8,6 +8,7 @@ node_modules/
 # 本地状态与密钥（管理密钥、令牌绝不进版本库）
 .env
 .env.*
+!.env.example
 *.local.json
 
 # 测试与覆盖率

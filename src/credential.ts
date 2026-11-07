@@ -502,7 +502,36 @@ export class MinimaxTokenManager {
     return this.refresh(cred);
   }
 
+  /**
+   * 刷新令牌。
+   *
+   * ★ **自愈**：refresh token 是一次性的，若**别的进程**（宿主机上的 CLI、
+   *   另一个容器实例…）先刷新过并把新的 refresh token 写回了同一个文件，
+   *   本进程内存里那份就**作废了** —— 直接抛错会把好账号误判成失效。
+   *   所以失败时先**重读文件比对**：发现 refresh token 变了，就用新的那份重试一次。
+   */
   private async refresh(cred: MinimaxCredential): Promise<string> {
+    let current = cred;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await this.tryRefresh(current);
+      } catch (err) {
+        if (attempt > 0) throw err;
+        /* 失败 ⇒ 看看是不是「凭证已被别的进程刷新过」。 */
+        const latest = readSavedCredential(this.dir);
+        if (latest && latest.refreshToken !== current.refreshToken) {
+          this.onLog('检测到凭证已被其它进程刷新过 —— 改用新的 refresh token 重试');
+          current = latest;
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new CredentialError('刷新令牌失败');
+  }
+
+  /** 真正打一次 token 端点。 */
+  private async tryRefresh(cred: MinimaxCredential): Promise<string> {
     if (!cred.refreshToken.startsWith('mmort_')) {
       throw new CredentialError('凭证不是有效的 MiniMax refresh token（应以 mmort_ 开头）—— 请跑 `mmcode login` 重新登录');
     }

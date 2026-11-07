@@ -3,10 +3,14 @@
 # 用法：
 #   docker compose up -d --build
 #   docker compose logs -f mmcode        # 首次启动这里会打印**管理密钥明文**
-#   docker compose exec mmcode cat /data/.waygate/mmcode/admin.json   # 随时再查
+#   cat ~/.waygate/mmcode/admin.json     # 随时再查（状态目录与宿主机共用）
 #
-# ⚠️ 端口暴露：8789 对外。管理页有密钥保护，但**反代入站密钥同样有效** ——
-#    只在可信网络里用；要放到公网请自己在前面套一层 TLS + 防火墙。
+# ⚠️ 状态目录是**绑定挂载宿主的 ~/.waygate**，不是命名卷 —— 这样容器与宿主机上的
+#    `mmcode` CLI 共用**同一份**凭证。MiniMax 的 refresh token 是一次性的，
+#    两份拷贝会互相顶掉（表现为账号突然 401），所以必须只有一份状态。
+#
+# ⚠️ 端口暴露：默认只绑 127.0.0.1。管理页有密钥保护，但**反代入站密钥同样有效** ——
+#    要放到局域网/公网请改成 "8789:8789" 并自行套 TLS + 防火墙。
 
 services:
   mmcode:
@@ -15,19 +19,21 @@ services:
     container_name: waygate-mmcode
     restart: unless-stopped
 
+    # 以宿主用户身份运行 —— 绑定挂载的 ~/.waygate 归宿主机所有（uid 1000），
+    # 容器内的默认用户（uid 100）写不进去。用 .env 里的 UID/GID 保持一致。
+    user: "${WAYGATE_UID}:${WAYGATE_GID}"
+
     ports:
-      - "127.0.0.1:8789:8789"   # 默认只绑本机；要对外改成 "8789:8789"
+      - "127.0.0.1:8789:8789"
 
     volumes:
-      # ★ 关键：状态卷。不挂 = 容器重建后账号、令牌、管理密钥全丢，
-      #   得重新走一遍浏览器授权。
-      - mmcode-data:/data
+      # ★ 状态：账号、令牌、管理密钥、注册表。宿主机与容器共用同一份。
+      - ${WAYGATE_STATE}:/data/.waygate
 
     environment:
       TZ: Asia/Shanghai
-      # 管理密钥不设时容器首次启动会自动生成（打印在日志里）。
-      # 想自己指定就在下面加一行（留空则用文件里的）：
-      # MMCODE_ADMIN_KEY: ""
+      MMCODE_HOME: /data/.waygate
+      WAYGATE_HOME: /data/.waygate
 
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -41,6 +47,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  mmcode-data:

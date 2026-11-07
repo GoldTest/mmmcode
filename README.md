@@ -157,27 +157,67 @@ mmcode web --host 0.0.0.0 --port 8789
 ## Docker 部署
 
 ```bash
+cd ~/项目/waygate-mmcode
 docker compose up -d --build
 
 # 首次启动：日志里会打印管理密钥明文
 docker compose logs -f mmcode
 
-# 随时再查
-docker compose exec mmcode cat /data/.waygate/mmcode/admin.json
+# 随时再查（状态目录与宿主机共用）
+cat ~/.waygate/mmcode/admin.json
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。
-- **状态卷** `mmcode-data` → `/data`：账号、令牌、管理密钥都在这儿。
-  ⚠️ **不挂卷 = 容器重建后全部重来**（每个账号都要重新走浏览器授权）。
-- 默认只绑 `127.0.0.1`（compose 里）；要对外暴露改成 `"8789:8789"`，
+- **非 root 运行**（以宿主用户身份），带 `/healthz` 健康检查，`restart: unless-stopped` 开机自起。
+- 默认只绑 `127.0.0.1`；要对外暴露改成 `"8789:8789"`，
   但请注意**反代入站密钥同样有效** —— 公网部署请在前面套一层 TLS + 防火墙。
-- 非 root 运行（`mmcode` 用户），带 `/healthz` 健康检查。
 
-不用 compose 也能直接跑：
+### ★ 状态目录为什么是「绑定挂载」而不是命名卷
+
+`docker-compose.yml` 把宿主机的 `~/.waygate` **直接挂进**容器（`/data/.waygate`），
+容器以宿主用户身份运行（uid/gid 写在 `.env` 里），因此：
+
+- 容器与宿主机的 `mmcode` CLI 共用**同一份**凭证 —— 不存在第二份副本；
+- 宿主机 `~/.waygate` 的文件权限不用改，容器照样能读写。
+
+> [!IMPORTANT]
+> **绝不能**把 `~/.waygate` 拷一份进命名卷。
+> MiniMax 的 refresh token 是**一次性**的：两份拷贝各自刷新，
+> 后刷的那份会把先刷的**顶掉**（表现为账号突然 401、被误判失效）。
+> 凭证**只能有一份**。
+
+### 自动签到在 Docker 模式下怎么跑
+
+宿主机原来的 `auto_checkin.sh` **不能**再用 —— 它会在宿主机上另起进程刷令牌，
+与容器内存里那份凭证抢 refresh token（一次性），把好账号误判成失效。
+
+所以签到改为**通过容器 API 触发**（`docker_checkin.sh`），凭证生命周期由容器进程独占维护：
+
+```bash
+# 手动跑一次
+./docker_checkin.sh
+
+# 或让 systemd 定时器每天 09:30 自动跑（单元已指向 docker_checkin.sh）
+systemctl --user start mmcode-checkin.service
+```
+
+签到结果照旧写进 `~/.waygate/mmcode/checkin.log`。
+
+### 令牌刷新会「自愈」
+
+若宿主机上的 CLI 抢先刷新了令牌（写回了同一个 `credential.json`），
+容器内存里那份 refresh token 就作废了。刷新失败时本工具会**重读文件比对**，
+发现 refresh token 变了就用新的那份重试一次 —— 不会误判账号失效。
+
+### 不用 compose 也能直接跑
 
 ```bash
 docker build -t waygate-mmcode .
-docker run -d --name mmcode -p 8789:8789 -v mmcode-data:/data waygate-mmcode
+docker run -d --name mmcode \
+  -p 127.0.0.1:8789:8789 \
+  -v "$HOME/.waygate:/data/.waygate" \
+  -u "$(id -u):$(id -g)" \
+  waygate-mmcode
 ```
 
 ## 凭证互斥（必读）
@@ -342,7 +382,7 @@ flowchart LR
 每个号仍需**各自**跑一次 `mmcode login`（或在管理页里逐个授权）——
 它们是**独立会话**，互相之间不共享 refresh token。
 
-**管理页的密钥忘记了？** `cat ~/.waygate/mmcode/admin.json`（Docker 里是 `docker compose exec mmcode cat /data/.waygate/mmcode/admin.json`）。
+**管理页的密钥忘记了？** `cat ~/.waygate/mmcode/admin.json`（Docker 模式下状态目录与宿主机共用，同一条命令即可）。
 实在找不回就删掉这个文件 —— 下次启动会**自动生成一把新的**。
 
 **管理密钥和反代密钥能混用吗？** **不能**，是两把不同的钥匙：管理密钥进管理页，反代入站密钥给客户端调模型。
