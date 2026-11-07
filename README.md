@@ -11,7 +11,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D4?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
 
-[快速开始](#快速开始) · [凭证互斥](#凭证互斥必读) · [客户端配置](#客户端怎么填) · [工作原理](#工作原理) · [常见问题](#常见问题) · [相关项目](#相关项目)
+[快速开始](#快速开始) · [多账号与管理页](#多账号与-web-管理页) · [Docker 部署](#docker-部署) · [凭证互斥](#凭证互斥必读) · [客户端配置](#客户端怎么填) · [工作原理](#工作原理) · [常见问题](#常见问题) · [相关项目](#相关项目)
 
 </div>
 
@@ -21,8 +21,10 @@
 > **凭证互斥（必读）**：MiniMax 的 refresh token 是**一次性**的，且**同一账号同时只有一个有效会话**。
 > 本工具与官方客户端（桌面端**或**官方 `mcode` CLI）登录**同一个账号**会**互相踢下线**。
 >
-> **解决**：给本工具配一个**专用账号**（与日常使用的账号分开注册一个即可）。
+> **解决**：给本工具配**专用账号**（与日常使用的账号分开注册一个即可）——
 > 跑 `mmcode login`（浏览器授权）→ 此后**永远不在那个账号上登录任何官方客户端**。
+>
+> 备了**多个**专用账号？本工具会**自动切换**：某个号被顶掉时自动换下一个，服务不中断。
 
 **用官方 OAuth 设备授权登录，在本机起一个 Anthropic / OpenAI 兼容的聊天端点** ——
 Cursor、Claude Code、Cherry Studio、任何能改 base_url 的工具，都能直接用你的订阅额度。
@@ -31,6 +33,9 @@ Cursor、Claude Code、Cherry Studio、任何能改 base_url 的工具，都能�
 - **浏览器授权登录** —— `mmcode login` 打印一个链接，点开授权即可；**不需要装桌面客户端**，
   服务器上也能自助登录（这正是它相比「读本机登录态」方案的用处）
 - **两个协议都认** —— `POST /v1/chat/completions`（OpenAI）与 `POST /v1/messages`（Anthropic）
+- **多账号 + 自动切换** —— 配多个账号，某个被顶掉（401）时**自动换号**，反代不中断
+- **Web 管理页** —— 浏览器里登录、授权、签到、看状态；密钥保护，状态**落盘持久**
+- **Docker 一键部署** —— 一个容器、一个端口，反代与管理页都在里面
 - **只在本机转** —— 写 `~/.waygate/`、本机转发；不向任何第三方上传数据
 
 ## 快速开始
@@ -83,6 +88,98 @@ mmcode
 
 **要求**：Node.js ≥ 20；**不需要**装 MiniMax Code 桌面客户端（登录走浏览器授权）。
 
+## 多账号与 Web 管理页
+
+`mmcode web` 起一个**统一服务**：同一个端口上同时提供**反代**、**管理页**和**管理 API**。
+
+```bash
+mmcode web                # 默认 127.0.0.1:8789
+mmcode web --host 0.0.0.0 --port 8789
+```
+
+```
+  管理页        http://127.0.0.1:8789/
+  反代地址      http://127.0.0.1:8789/v1
+  健康检查      http://127.0.0.1:8789/healthz
+
+  ⚠️  已生成管理密钥（首次启动自动生成，仅此一次明文显示）：
+     adm-mmcode-fec39de54700c82229e5ca893a13505f
+     已保存到 ~/.waygate/mmcode/admin.json（权限 0600）
+```
+
+### 管理密钥
+
+- **未设置则自动生成一个**（首次启动时打印到日志里，之后只打码显示）。
+- 保存在 `~/.waygate/mmcode/admin.json`（**0600**），重启不丢。
+- **可修改**：管理页「设置」里改 —— 必须提供**当前正确的旧密钥**；改完**所有旧会话立刻失效**。
+- 管理密钥与**反代入站密钥**（`~/.waygate/mmcode/key`）是**两把不同的钥匙**：
+  前者进管理页，后者给 Claude Code / Cursor 用。
+
+> 浏览器里**不存密钥**：登录时把密钥交给服务端换成 HttpOnly 会话 Cookie，密钥本身不落 localStorage。
+
+### 账号管理页能做什么
+
+| 能力 | 说明 |
+| --- | --- |
+| 新增账号 | 填名字 + 选区域（国内 / 海外），即建即用 |
+| OAuth 授权登录 | 点「登录」拿到短码与授权链接，**在浏览器完成授权，页面自动继续** |
+| 状态一览 | 登录态、令牌剩余、健康状态、冷却中、签到结果、积分余额 |
+| 签到 / 积分 | 点一下就代签，**不用为了签到去登客户端**（登客户端反而会踢掉反代） |
+| 启用 / 停用 | 停用的账号保留配置，但不参与自动切换 |
+| 删除账号 | 连同令牌文件一起清掉 |
+| 切换策略 | 「粘性优先 + 故障转移」或「严格轮询（均摊额度）」 |
+| 修改管理密钥 | 需旧密钥校验 |
+
+### 账号状态是**持久**的
+
+分两层落盘（都不进版本库）：
+
+| 内容 | 位置 |
+| --- | --- |
+| 令牌（access / refresh） | `~/.waygate/accounts/<name>/mmcode/credential.json`（0600） |
+| 运营状态（健康、冷却、签到记录、余额快照、启用与否） | `~/.waygate/mmcode/accounts.json` |
+
+**冷却是持久化的** —— 某个号刚被顶掉，服务重启后依然记得，不会又去撞一次 401。
+
+### 自动账号切换
+
+因为 MiniMax「同一账号只能有一个有效会话」，**多账号是唯一解法**。
+
+默认策略是**粘性优先 + 故障转移**：
+
+1. 尽量一直用同一个账号（额度消耗最低）；
+2. 上游返回 **401 / 403**（凭证被别处登录顶掉）→ 标记该号失效、冷却 30 分钟，**自动换下一个**；
+3. 上游返回 **429**（限流）→ 冷却 60 秒，自动换下一个；
+4. **5xx / 网络抖动不换号** —— 那是上游整体的问题，换号只会把所有号都标记成坏。
+
+想均摊额度可在设置里切到「严格轮询」。
+
+## Docker 部署
+
+```bash
+docker compose up -d --build
+
+# 首次启动：日志里会打印管理密钥明文
+docker compose logs -f mmcode
+
+# 随时再查
+docker compose exec mmcode cat /data/.waygate/mmcode/admin.json
+```
+
+- **一个端口**（8789）：反代、管理页、管理 API 全在里面。
+- **状态卷** `mmcode-data` → `/data`：账号、令牌、管理密钥都在这儿。
+  ⚠️ **不挂卷 = 容器重建后全部重来**（每个账号都要重新走浏览器授权）。
+- 默认只绑 `127.0.0.1`（compose 里）；要对外暴露改成 `"8789:8789"`，
+  但请注意**反代入站密钥同样有效** —— 公网部署请在前面套一层 TLS + 防火墙。
+- 非 root 运行（`mmcode` 用户），带 `/healthz` 健康检查。
+
+不用 compose 也能直接跑：
+
+```bash
+docker build -t waygate-mmcode .
+docker run -d --name mmcode -p 8789:8789 -v mmcode-data:/data waygate-mmcode
+```
+
 ## 凭证互斥（必读）
 
 MiniMax 的会话机制决定了**同一个账号同时只有一个有效会话**。这意味着：
@@ -95,6 +192,9 @@ MiniMax 的会话机制决定了**同一个账号同时只有一个有效会话*
 **正确姿势**：注册一个专用账号，**只用它跑 `mmcode login`**（在浏览器里授权），
 此后**永远不在那个账号上登录任何官方客户端**。日常账号照常用客户端，两边互不干扰。
 
+> **备多个专用账号更好用**：反代会**自动切换** —— 某个号被顶掉（401）时自动换下一个，
+> 服务不中断。见[多账号与 Web 管理页](#多账号与-web-管理页)。
+
 > ⚠️ **走设备授权并不会解除互斥**。它改变的是「在哪台机器上登录」（服务器也能自助授权），
 > 不是「能有几个会话」。同一个账号只要在别处登过一次，本工具手里的 refresh token 立刻作废。
 
@@ -102,12 +202,31 @@ MiniMax 的会话机制决定了**同一个账号同时只有一个有效会话*
 
 ```bash
 mmcode               # 启动反代（同 mmcode serve），打印模型 ID 与代理地址
+mmcode web           # 统一服务：反代 + 管理页 + 管理 API（同一端口，默认 8789）
 mmcode models        # 只列出模型 ID（不起服务）
 mmcode doctor        # 自检：端口 / 凭证 / 令牌刷新 / 上游连通
 mmcode login         # 登录（浏览器授权一次；等 2 分钟无授权则改用 login-poll）
 mmcode login-poll    # 完成登录：浏览器授权后取票（`login` 等待超时也用它）
+mmcode accounts      # 列出所有账号及其状态（区域 / 健康 / 冷却 / 签到）
 mmcode checkin       # 每日签到领积分（用本工具令牌代签，无需开客户端）
 mmcode credits       # 查积分账本（剩余 / 已消耗 / 累计，精确到 0.01）
+```
+
+> `mmcode checkin` / `mmcode credits` 可带账号名：`mmcode checkin haiwai1`。
+> 不带则作用于当前（粘性）账号。
+
+**多账号速览**：
+
+```bash
+$ mmcode accounts
+MiniMax Code 账号池
+
+ ✓ default     [国内] 已登录  健康:healthy
+ ✓ haiwai1     [国内] 已登录  健康:healthy  签到:claimed
+ ✗ rjh521      [海外] 未登录  健康:unknown
+ ✓ zhanghx101  [海外] 已登录  健康:healthy 冷却至 2026/11/8 3:05:00
+
+策略：sticky（可用 3/4）
 ```
 
 **签到与积分**（MiniMax Code 专属）：
@@ -164,36 +283,50 @@ ANTHROPIC_API_KEY=sk-mmcode-…
 
 ## 工作原理
 
-```mermaid
-flowchart LR
-  C[你的客户端<br/>Cursor / Claude Code]
-  M[mmcode<br/>本机 8788]
-  G[MiniMax mavis 网关]
-  B[浏览器<br/>授权页]
-
-  C -->|OpenAI / Anthropic 协议| M
-  M -->|Anthropic 兼容协议| G
-
-  subgraph local [本机]
-    M
-    F[~/.waygate/mmcode/credential.json]
-  end
-  B -.->|mmcode login 设备授权| F
-  F -.->|令牌自动刷新写回| M
-
-  style M fill:#EDE9FE,stroke:#8B5CF6,color:#1F2328
-  style F fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
-  style C fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
-  style G fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
-  style B fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
-  style local fill:#F6F8FA,stroke:#D0D7DE
-```
-
 - **凭证**：走 MiniMax **官方 OAuth 2.0 设备授权**（RFC 8628 + PKCE S256，端点 `account.minimax.cn/oauth2/device/code`）。
   `mmcode login` 打印授权链接，你在浏览器完成授权后取票，写到 `~/.waygate/mmcode/credential.json`（0600）。
   **不读本机客户端文件、不解密任何东西**；参数与官方 `mcode` CLI 同一个 OAuth client（`mcode-public`）。
 - **令牌生命周期**：access token（`mmoat_`）寿命短（约 1–4 小时），到期前 2 分钟自动刷新；refresh token（`mmort_`）刷新后会被上游**轮换**，本工具自动写回本地。
-- **模型清单**：上游**没有**清单端点（实测 `/models` 恒 503）—— 用内置清单（4 个模型），这是「目录 = 接口」原则的唯一例外。
+- **模型清单**：上游的清单端点是 `/mavis/api/v1/models`（**无需鉴权**即可读）—— 本工具**真拉取**，失败时回落内置清单（4 个模型）。
+- **多账号**：每个账号一套独立令牌（`accounts/<name>/mmcode/`）+ 一条运营状态（`accounts.json`）。
+  `AccountPool` 负责选号（粘性优先，401/429 自动换号），**冷却状态落盘**，重启不丢。
+- **统一服务**：`mmcode web` 把反代（内部委托给 `waygate-core` 的 `startServer`，**协议零重复实现**）、
+  静态管理页、管理 API 挂在**同一个端口**上。
+
+```mermaid
+flowchart LR
+  C[你的客户端<br/>Cursor / Claude Code]
+  M[mmcode web<br/>:8789]
+  W[浏览器<br/>管理页]
+  G[MiniMax mavis 网关]
+  B[浏览器<br/>授权页]
+
+  C -->|OpenAI / Anthropic 协议| M
+  W -->|管理 API| M
+  M -->|Anthropic 兼容协议| G
+  M -->|账号池<br/>粘性 + 故障转移| G
+
+  subgraph local [本机]
+    M
+    F[~/.waygate/mmcode/<br/>credential.json]
+    R[~/.waygate/mmcode/<br/>accounts.json]
+    A[~/.waygate/accounts/&lt;name&gt;/<br/>mmcode/]
+  end
+  B -.->|设备授权| F
+  B -.->|设备授权| A
+  F -.->|令牌自动刷新写回| M
+  R -.->|账号状态| M
+
+  style M fill:#EDE9FE,stroke:#8B5CF6,color:#1F2328
+  style F fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style R fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style A fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style C fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style G fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style B fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style W fill:#FFFFFF,stroke:#D0D7DE,color:#1F2328
+  style local fill:#F6F8FA,stroke:#D0D7DE
+```
 
 > [!NOTE]
 > **单次请求的积分消耗上游不回报** —— MiniMax 的聊天响应只有 token 数，没有单次费用字段。
@@ -204,6 +337,21 @@ flowchart LR
 **要装 MiniMax Code 客户端吗？** **不要。** 登录走浏览器授权（`mmcode login`），任何能开浏览器的机器都行 —— 服务器上也能自助登录。
 
 **令牌被顶掉了怎么办？** 有人用同一账号登录了官方客户端或 `mcode` CLI —— 本工具被踢。跑一次 `mmcode login` 重新授权即可（确保此后没人再登那个账号）。
+
+**配多个号就不用管顶号了吗？** 不用管，但要**都授权给本工具**。多号的价值是：某个号被顶掉时**自动换下一个**，反代不中断。
+每个号仍需**各自**跑一次 `mmcode login`（或在管理页里逐个授权）——
+它们是**独立会话**，互相之间不共享 refresh token。
+
+**管理页的密钥忘记了？** `cat ~/.waygate/mmcode/admin.json`（Docker 里是 `docker compose exec mmcode cat /data/.waygate/mmcode/admin.json`）。
+实在找不回就删掉这个文件 —— 下次启动会**自动生成一把新的**。
+
+**管理密钥和反代密钥能混用吗？** **不能**，是两把不同的钥匙：管理密钥进管理页，反代入站密钥给客户端调模型。
+
+**`mmcode web` 和 `mmcode serve` 有什么区别？** `serve` 是**纯反代**（老行为不变，8788 端口）；`web` 是**统一服务**（8789 端口），
+反代 + 管理页 + 管理 API 都在上面。两者共用同一份账号状态，可以只开一个。
+
+**网页能放到公网吗？** 技术上可以，但**反代入站密钥等于模型额度**，管理页虽有密钥保护，
+公网暴露仍建议在前面套 TLS 反代 + IP 白名单/防火墙。
 
 **会不会把我的令牌上传？** 不会。全程只在本机读写：浏览器授权 → 写 `~/.waygate/` → 本机转发。代码开源可查。
 
