@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax Code 账号管理</title>
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔑</text></svg>">
+</head>
+<body>
+
+<!-- ─────────── 登录 ─────────── -->
+<div id="login-view" class="login-wrap hidden">
+  <form id="login-form" class="login-card">
+    <h1>MiniMax Code 账号管理</h1>
+    <p class="muted">请输入管理密钥以继续。</p>
+    <input id="login-key" type="password" placeholder="管理密钥" autocomplete="current-password" autofocus>
+    <button type="submit" class="primary">进入</button>
+    <p id="login-error" class="error hidden"></p>
+    <details class="hint">
+      <summary>管理密钥在哪？</summary>
+      <p id="key-path-hint" class="muted small">首次启动服务时会自动生成，保存在 <code>~/.waygate/mmcode/admin.json</code>（权限 0600）。</p>
+    </details>
+  </form>
+</div>
+
+<!-- ─────────── 主界面 ─────────── -->
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◈</span>
+      <div>
+        <h1>MiniMax Code 账号管理</h1>
+        <p id="upstream-label" class="muted small">加载中…</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="proxy-badge" class="badge">反代 —</span>
+      <button id="btn-settings" class="ghost">设置</button>
+      <button id="btn-logout" class="ghost">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 账号池 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>账号池</h2>
+        <div class="panel-actions">
+          <label class="field inline">
+            切换策略
+            <select id="strategy-select">
+              <option value="sticky">粘性优先 + 故障转移</option>
+              <option value="round-robin">严格轮询（均摊额度）</option>
+            </select>
+          </label>
+          <button id="btn-add" class="primary">新增账号</button>
+          <button id="btn-refresh" class="ghost">刷新</button>
+        </div>
+      </div>
+      <div id="account-list" class="cards"></div>
+      <p id="accounts-empty" class="muted hidden">还没有账号。点「新增账号」登记一个，再到 MiniMax 官网授权登录。</p>
+    </section>
+
+    <!-- 服务 -->
+    <section class="panel">
+      <div class="panel-head"><h2>服务</h2></div>
+      <div id="service-info" class="kv"></div>
+    </section>
+  </main>
+</div>
+
+<!-- ─────────── 弹窗 ─────────── -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="modal-title">标题</h3>
+      <button id="modal-close" class="icon-btn" aria-label="关闭">✕</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+    <div id="modal-foot" class="modal-foot"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="./app.js"></script>
+</body>
+</html>

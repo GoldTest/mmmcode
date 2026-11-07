@@ -34,11 +34,33 @@
  *   · refresh token（`mmort_`）刷新后会被上游**轮换**，必须写回本地（否则下次刷新失败）。
  */
 
-import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { commandDir } from 'waygate-core';
 import { CredentialError, UpstreamError } from './errors.js';
+
+export type MinimaxRegion = 'cn' | 'global';
+
+export function resolveRegion(candidate?: string | null): MinimaxRegion {
+  const raw = (candidate ?? process.env.MINIMAX_REGION ?? '').trim().toLowerCase();
+  if (raw === 'global' || raw === 'en' || raw === 'intl' || raw === 'io') {
+    return 'global';
+  }
+  return 'cn';
+}
+
+export function getAccountBase(region?: MinimaxRegion | string | null): string {
+  return resolveRegion(region) === 'global'
+    ? 'https://account.minimax.io'
+    : 'https://account.minimax.cn';
+}
+
+export function getAgentBase(region?: MinimaxRegion | string | null): string {
+  return resolveRegion(region) === 'global'
+    ? 'https://agent.minimax.io'
+    : 'https://agent.minimax.cn';
+}
 
 const MINIMAX_ACCOUNT_BASE = 'https://account.minimax.cn';
 const DEVICE_CODE_ENDPOINT = `${MINIMAX_ACCOUNT_BASE}/oauth2/device/code`;
@@ -59,14 +81,20 @@ const OAUTH_FORM = {
 /** 设备码的 grant_type（RFC 8628）。 */
 const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 
-/** 本工具自己的凭证落盘位置（`~/.waygate/mmcode/credential.json`）。 */
-export function credentialPath(): string {
-  return join(commandDir('mmcode'), 'credential.json');
+/**
+ * 本工具自己的凭证落盘位置（`~/.waygate/mmcode/credential.json`）。
+ *
+ * `dir` 为空 = 默认单账户目录；传入账号目录 = 该账号的独立凭证
+ * （`~/.waygate/accounts/<name>/mmcode`）。**多账号必须各持一份** ——
+ * refresh token 是一次性的，两个账号共用一份文件会互相顶掉。
+ */
+export function credentialPath(dir?: string): string {
+  return join(dir ?? commandDir('mmcode'), 'credential.json');
 }
 
 /** 未完成登录的暂存（device_code + code_verifier），供 `login-poll` 续跑。 */
-export function loginStatePath(): string {
-  return join(commandDir('mmcode'), 'login-state.json');
+export function loginStatePath(dir?: string): string {
+  return join(dir ?? commandDir('mmcode'), 'login-state.json');
 }
 
 export interface MinimaxCredential {
@@ -76,6 +104,8 @@ export interface MinimaxCredential {
   expiresAt: number;
   /** 账号标识（从 access token 的 JWT `sub` 取前 8 位；仅用于展示）。 */
   account?: string;
+  /** 账户所属区域（'global' 海外 / 'cn' 国内；缺省回退 'cn'）。 */
+  region?: MinimaxRegion;
 }
 
 /** 一次设备授权会话（`login` 建立、`login-poll` 续用）。 */
@@ -91,9 +121,18 @@ export interface LoginState {
   expiresAt: number;
   /** 上游建议的轮询间隔（ms）。 */
   intervalMs: number;
+  /** 授权请求的目标区域。 */
+  region?: MinimaxRegion;
 }
 
+/**
+ * 私密写（0600）。
+ *
+ * ⚠️ 必须先建目录：多账号场景下账号目录（`accounts/<name>/mmcode`）**还不存在**
+ *    就开始登录是常态（先建账号再授权），不 mkdir 会直接 ENOENT。
+ */
 function writePrivate(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, content, { mode: 0o600 });
   try {
     chmodSync(path, 0o600);
@@ -105,7 +144,11 @@ function writePrivate(path: string, content: string): void {
 /* ─────────────────────── 设备授权流程 ─────────────────────── */
 
 /** 第 ① 步：申请设备码 + 授权链接（带 S256 PKCE）。 */
-export async function startDeviceLogin(): Promise<LoginState> {
+export async function startDeviceLogin(region?: MinimaxRegion | string | null, dir?: string): Promise<LoginState> {
+  const resolvedRegion = resolveRegion(region);
+  const accountBase = getAccountBase(resolvedRegion);
+  const deviceCodeEndpoint = `${accountBase}/oauth2/device/code`;
+
   /* PKCE：verifier 是随机串，challenge 是它的 SHA-256（base64url 无填充）。 */
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier, 'ascii').digest('base64url');
@@ -118,14 +161,14 @@ export async function startDeviceLogin(): Promise<LoginState> {
 
   let res: Response;
   try {
-    res = await fetch(DEVICE_CODE_ENDPOINT, {
+    res = await fetch(deviceCodeEndpoint, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
       signal: AbortSignal.timeout(20_000),
     });
   } catch (err) {
-    throw new UpstreamError(`申请设备码失败（account.minimax.cn 不可达）：${(err as Error).message}`);
+    throw new UpstreamError(`申请设备码失败（${accountBase} 不可达）：${(err as Error).message}`);
   }
   const raw = await res.text().catch(() => '');
   let body: Record<string, unknown>;
@@ -159,14 +202,15 @@ export async function startDeviceLogin(): Promise<LoginState> {
     verificationUriComplete: uri,
     expiresAt: Date.now() + expiresInSec * 1000,
     intervalMs: intervalSec * 1000,
+    region: resolvedRegion,
   };
-  writePrivate(loginStatePath(), JSON.stringify(state, null, 2) + '\n');
+  writePrivate(loginStatePath(dir), JSON.stringify(state, null, 2) + '\n');
   return state;
 }
 
 /** 读回未完成的登录会话（无 / 已过期则 null）。 */
-export function readLoginState(): LoginState | null {
-  const p = loginStatePath();
+export function readLoginState(dir?: string): LoginState | null {
+  const p = loginStatePath(dir);
   if (!existsSync(p)) return null;
   try {
     const s = JSON.parse(readFileSync(p, 'utf8')) as LoginState;
@@ -177,9 +221,9 @@ export function readLoginState(): LoginState | null {
   }
 }
 
-function clearLoginState(): void {
+function clearLoginState(dir?: string): void {
   try {
-    if (existsSync(loginStatePath())) unlinkSync(loginStatePath());
+    if (existsSync(loginStatePath(dir))) unlinkSync(loginStatePath(dir));
   } catch {
     /* 清理失败不影响登录结果 */
   }
@@ -200,6 +244,8 @@ type PollOutcome =
  * 同时兼容 CLI 里 `200 + status:"pending"` 的另一种表达。
  */
 async function pollOnce(state: LoginState): Promise<PollOutcome> {
+  const accountBase = getAccountBase(state.region);
+  const tokenEndpoint = `${accountBase}/oauth2/token`;
   const form = new URLSearchParams({
     grant_type: DEVICE_CODE_GRANT,
     device_code: state.deviceCode,
@@ -208,14 +254,14 @@ async function pollOnce(state: LoginState): Promise<PollOutcome> {
   });
   let res: Response;
   try {
-    res = await fetch(MINIMAX_TOKEN_ENDPOINT, {
+    res = await fetch(tokenEndpoint, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
       signal: AbortSignal.timeout(20_000),
     });
   } catch (err) {
-    throw new UpstreamError(`轮询取票失败（account.minimax.cn 不可达）：${(err as Error).message}`);
+    throw new UpstreamError(`轮询取票失败（${accountBase} 不可达）：${(err as Error).message}`);
   }
   const raw = await res.text().catch(() => '');
   let body: Record<string, unknown> = {};
@@ -284,8 +330,9 @@ function accountFromToken(token: string): string | undefined {
 export async function pollDeviceLogin(
   timeoutMs = LOGIN_WAIT_MS,
   onTick?: (info: { waitedMs: number; remainingMs: number }) => void,
+  dir?: string,
 ): Promise<MinimaxCredential> {
-  const state = readLoginState();
+  const state = readLoginState(dir);
   if (!state) {
     throw new CredentialError('没有待完成的登录 —— 先跑 `mmcode login`');
   }
@@ -301,9 +348,10 @@ export async function pollDeviceLogin(
         refreshToken: outcome.refreshToken,
         expiresAt: outcome.expiresAt,
         account: accountFromToken(outcome.accessToken),
+        region: state.region ?? resolveRegion(),
       };
-      saveCredential(cred);
-      clearLoginState();
+      saveCredential(cred, dir);
+      clearLoginState(dir);
       return cred;
     }
     if (outcome.kind === 'error') throw new CredentialError(outcome.message);
@@ -315,7 +363,7 @@ export async function pollDeviceLogin(
 
   /* 到点仍未授权：区分「我们等够了」与「设备码本身过期了」。 */
   if (Date.now() >= state.expiresAt) {
-    clearLoginState();
+    clearLoginState(dir);
     throw new CredentialError('设备码已过期（5 分钟）—— 重新跑 `mmcode login`');
   }
   throw new PendingLoginError('尚未完成授权');
@@ -329,11 +377,58 @@ export class PendingLoginError extends Error {
   }
 }
 
+/** 设备授权的单次轮询结果（供 Web 管理端非阻塞地查询授权进度）。 */
+export type DeviceLoginStatus =
+  | { status: 'pending'; userCode: string; verificationUriComplete: string; expiresAt: number }
+  | { status: 'slow_down'; userCode: string; verificationUriComplete: string; expiresAt: number }
+  | { status: 'ok'; credential: MinimaxCredential }
+  | { status: 'expired'; message: string }
+  | { status: 'error'; message: string }
+  | { status: 'none'; message: string };
+
+/**
+ * 轮询**一次**设备授权（不阻塞）。
+ *
+ * 终端场景用 `pollDeviceLogin`（原地等），但 Web 管理端不能阻塞 HTTP 请求 ——
+ * 那会让浏览器一直挂着直到超时。这里改成「浏览器每 3 秒问一次」，
+ * 语义等价但不会占住一个连接。
+ */
+export async function pollDeviceLoginOnce(dir?: string): Promise<DeviceLoginStatus> {
+  const state = readLoginState(dir);
+  if (!state) {
+    return { status: 'none', message: '没有待完成的登录 —— 先发起一次登录' };
+  }
+  if (Date.now() > state.expiresAt) {
+    clearLoginState(dir);
+    return { status: 'expired', message: '设备码已过期（5 分钟）—— 请重新发起登录' };
+  }
+  const outcome = await pollOnce(state);
+  if (outcome.kind === 'ok') {
+    const cred: MinimaxCredential = {
+      accessToken: outcome.accessToken,
+      refreshToken: outcome.refreshToken,
+      expiresAt: outcome.expiresAt,
+      account: accountFromToken(outcome.accessToken),
+      region: state.region ?? resolveRegion(),
+    };
+    saveCredential(cred, dir);
+    clearLoginState(dir);
+    return { status: 'ok', credential: cred };
+  }
+  if (outcome.kind === 'error') return { status: 'error', message: outcome.message };
+  const common = {
+    userCode: state.userCode,
+    verificationUriComplete: state.verificationUriComplete,
+    expiresAt: state.expiresAt,
+  };
+  return outcome.kind === 'slow_down' ? { status: 'slow_down', ...common } : { status: 'pending', ...common };
+}
+
 /* ─────────────────────── 凭证读写 ─────────────────────── */
 
 /** 读本工具已落盘的凭证（无则 null）。 */
-export function readSavedCredential(): MinimaxCredential | null {
-  const file = credentialPath();
+export function readSavedCredential(dir?: string): MinimaxCredential | null {
+  const file = credentialPath(dir);
   if (!existsSync(file)) return null;
   try {
     const c = JSON.parse(readFileSync(file, 'utf8')) as MinimaxCredential;
@@ -344,18 +439,19 @@ export function readSavedCredential(): MinimaxCredential | null {
 }
 
 /** 落盘（0600）。refresh token 轮换后也要调用本函数写回。 */
-export function saveCredential(cred: MinimaxCredential): string {
-  const path = credentialPath();
+export function saveCredential(cred: MinimaxCredential, dir?: string): string {
+  const path = credentialPath(dir);
   writePrivate(path, JSON.stringify(cred, null, 2) + '\n');
   return path;
 }
 
 /** 供 doctor / 启动输出展示的摘要（**绝不回显令牌**）。 */
-export function credentialSummary(): string {
-  const cred = readSavedCredential();
+export function credentialSummary(dir?: string): string {
+  const cred = readSavedCredential(dir);
   if (!cred) return '未登录（跑 `mmcode login`）';
   const left = cred.expiresAt ? Math.round((cred.expiresAt - Date.now()) / 60000) : null;
-  const who = cred.account ? `账号 ${cred.account}…` : '已登录';
+  const regionTag = cred.region === 'global' ? ' [海外 Global]' : ' [国内 China]';
+  const who = cred.account ? `账号 ${cred.account}…${regionTag}` : `已登录${regionTag}`;
   return left !== null ? `${who}（access 有效约 ${left} 分钟）` : who;
 }
 
@@ -371,11 +467,18 @@ export class MinimaxTokenManager {
   private cached: MinimaxCredential | null = null;
   private inFlight: Promise<string> | null = null;
 
-  constructor(private readonly onLog: (line: string) => void = () => {}) {}
+  /**
+   * @param onLog 日志回调
+   * @param dir   该账号的凭证目录（多账号时各持一份；空 = 默认单账户目录）
+   */
+  constructor(
+    private readonly onLog: (line: string) => void = () => {},
+    private readonly dir?: string,
+  ) {}
 
   /** 取可用 access token（必要时刷新并写回）。 */
   async accessToken(): Promise<string> {
-    const cred = this.cached ?? readSavedCredential();
+    const cred = this.cached ?? readSavedCredential(this.dir);
     if (!cred) {
       throw new CredentialError('未登录 —— 先跑 `mmcode login`（浏览器授权一次）');
     }
@@ -392,7 +495,7 @@ export class MinimaxTokenManager {
 
   /** 立即刷新（不看余量）。doctor 体检用。 */
   async forceRefresh(): Promise<string> {
-    const cred = this.cached ?? readSavedCredential();
+    const cred = this.cached ?? readSavedCredential(this.dir);
     if (!cred) {
       throw new CredentialError('未登录 —— 先跑 `mmcode login`（浏览器授权一次）');
     }
@@ -403,6 +506,9 @@ export class MinimaxTokenManager {
     if (!cred.refreshToken.startsWith('mmort_')) {
       throw new CredentialError('凭证不是有效的 MiniMax refresh token（应以 mmort_ 开头）—— 请跑 `mmcode login` 重新登录');
     }
+    const region = cred.region ?? resolveRegion();
+    const accountBase = getAccountBase(region);
+    const tokenEndpoint = `${accountBase}/oauth2/token`;
     const form = new URLSearchParams({
       grant_type: 'refresh_token',
       refresh_token: cred.refreshToken,
@@ -410,14 +516,14 @@ export class MinimaxTokenManager {
     });
     let res: Response;
     try {
-      res = await fetch(MINIMAX_TOKEN_ENDPOINT, {
+      res = await fetch(tokenEndpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: form.toString(),
         signal: AbortSignal.timeout(20_000),
       });
     } catch (err) {
-      throw new UpstreamError(`刷新令牌失败（account.minimax.cn 不可达）：${(err as Error).message}`);
+      throw new UpstreamError(`刷新令牌失败（${accountBase} 不可达）：${(err as Error).message}`);
     }
     if (!res.ok) {
       const raw = await res.text().catch(() => '');
@@ -436,13 +542,14 @@ export class MinimaxTokenManager {
       ...cred,
       accessToken: grant.access_token,
       expiresAt,
+      region,
     };
     /* refresh token 轮换（一次性）—— 必须写回，否则下次刷新用的是已作废的旧值。 */
     if (typeof grant.refresh_token === 'string' && grant.refresh_token.startsWith('mmort_')) {
       next.refreshToken = grant.refresh_token;
     }
     this.cached = next;
-    saveCredential(next);
+    saveCredential(next, this.dir);
     this.onLog(`令牌已刷新（有效至 ${new Date(expiresAt).toISOString()}）`);
     return next.accessToken;
   }

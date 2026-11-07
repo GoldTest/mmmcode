@@ -6,6 +6,16 @@
  *     这样服务器（无反代目标机的桌面客户端）也能自助登录，无需人工注入 token；
  *   · 协议：上游是 **Anthropic 兼容**（`/mavis/api/v1/llm/v1/messages`），不是自研签名；
  *   · ⚠️ 有**凭证互斥**问题（见 README），必须给用户明确告警。
+ *
+ * ## 多账号与自动切换（本文件的核心）
+ * MiniMax **同一账号只能有一个有效会话** —— 上游 401 通常意味着「这个号在别处登过」，
+ * 光重试没用。所以反代必须**手上有多个号**：
+ *   · `AccountPool` 负责选号（粘性优先，失败自动换号）；
+ *   · 本文件的 `chat()` 负责「换号重试」的执行：401/403/429 → 标记该号 → 换下一个；
+ *   · 每个账号**各自持有**令牌管理器（各自缓存、各自刷新、各自写回），互不干扰。
+ *
+ * ⚠️ **区域随账号走**：cn 与 global 是两套完全不同的域名，
+ *    切号时 base URL 必须跟着换 —— 否则国内号会被打到海外端点上（401/404）。
  */
 
 import {
@@ -21,17 +31,29 @@ import {
   PendingLoginError,
   credentialPath,
   credentialSummary,
+  getAgentBase,
   pollDeviceLogin,
   readSavedCredential,
+  resolveRegion,
   startDeviceLogin,
+  type MinimaxRegion,
 } from './credential.js';
 import { CredentialError, UpstreamError } from './errors.js';
 import { MinimaxActivity, renderCheckin, renderCredits } from './activity.js';
 import { anthropicToOpenAiSse } from './protocol/stream-decode.js';
 import { toAnthropicRequest } from './protocol/translate.js';
+import { AccountStore, DEFAULT_ACCOUNT_NAME } from './accounts.js';
+import { AccountPool, type PoolAccount } from './pool.js';
 
 export const DEFAULT_MMCODE_BASE_URL = 'https://agent.minimax.cn';
 export const DEFAULT_MMCODE_CHAT_PATH = '/mavis/api/v1/llm/v1/messages';
+
+export function resolveAdapterBaseUrl(opts: { baseUrl?: string; region?: MinimaxRegion } = {}): string {
+  if (opts.baseUrl) return opts.baseUrl.replace(/\/+$/, '');
+  const saved = readSavedCredential();
+  const region = saved?.region ?? resolveRegion(opts.region);
+  return getAgentBase(region);
+}
 
 /**
  * MiniMax 内置模型清单 —— **仅作回落**（v0.3.5 起）。
@@ -125,17 +147,75 @@ function mutualExclusionNotice(): string {
   );
 }
 
-export function createMmcodeAdapter(opts: { baseUrl?: string; chatPath?: string } = {}): Adapter {
-  const baseUrl = (opts.baseUrl ?? DEFAULT_MMCODE_BASE_URL).replace(/\/+$/, '');
+/** 适配器构造选项。 */
+export interface MmcodeAdapterOptions {
+  /** 强制指定上游 base（调试用；否则按账号区域推导）。 */
+  baseUrl?: string;
+  /** 聊天端点路径（默认 Anthropic 兼容路径）。 */
+  chatPath?: string;
+  /** 区域兜底（账号未记录区域时用）。 */
+  region?: MinimaxRegion;
+  /** 账号池（不传则基于默认注册表自建）。 */
+  pool?: AccountPool;
+  /** 日志回调。 */
+  log?: (line: string) => void;
+}
+
+export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
+  const log = opts.log ?? ((line: string) => process.stdout.write(`[mmcode] ${line}\n`));
   const chatPath = opts.chatPath ?? DEFAULT_MMCODE_CHAT_PATH;
-  const tokens = new MinimaxTokenManager((line) => process.stdout.write(`[mmcode] ${line}\n`));
-  const activity = new MinimaxActivity(() => tokens.accessToken());
+
+  /* 账号池：外部可注入（管理端与 CLI 共用一个实例），否则自建。 */
+  const pool = opts.pool ?? new AccountPool(new AccountStore(), { log });
+
+  /** 某账号的 base URL —— **区域随账号走**（cn/global 是两套域名）。 */
+  const baseUrlFor = (account: PoolAccount): string => {
+    if (opts.baseUrl) return opts.baseUrl.replace(/\/+$/, '');
+    const region = account.credential?.region ?? account.record.region ?? resolveRegion(opts.region);
+    return getAgentBase(region);
+  };
+
+  /** 当前（粘性）账号；没有则 null。 */
+  const currentAccount = (): PoolAccount | null => {
+    const activeName = pool.getAccountStore().activeName();
+    if (activeName) {
+      const found = pool.get(activeName);
+      if (found) return found;
+    }
+    return pool.available()[0] ?? pool.all()[0] ?? null;
+  };
+
+  /** 某账号的签到/积分客户端（用该账号自己的令牌）。 */
+  const activityFor = (account: PoolAccount): MinimaxActivity =>
+    new MinimaxActivity(
+      () => account.tokens.accessToken(),
+      () => account.credential?.region ?? account.record.region,
+    );
+
+  /** 取账号：指定名字优先；否则当前粘性账号；再否则第一个可用账号。 */
+  const pickAccount = (name?: string): PoolAccount | null => {
+    if (name) {
+      const found = pool.get(name);
+      if (found) return found;
+      throw new CredentialError(`没有账号 [${name}] —— 先用 \`mmcode accounts\` 看有哪些`);
+    }
+    return currentAccount();
+  };
 
   return {
     command: 'mmcode',
     displayName: 'MiniMax Code',
     defaultPort: 8788,
-    upstreamLabel: `${baseUrl}  (Anthropic 兼容)`,
+    get upstreamLabel(): string {
+      const account = currentAccount();
+      const r = account?.credential?.region ?? account?.record.region ?? resolveRegion(opts.region);
+      const tag = r === 'global' ? ' (海外 Global)' : ' (国内 China)';
+      const total = pool.all().length;
+      const usable = pool.available().length;
+      const who = account ? account.record.name : '未登录';
+      const base = opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(r);
+      return `${base}${tag}  (Anthropic 兼容)  账号 ${who}（可用 ${usable}/${total}）`;
+    },
     // 模型清单走公开的 /mavis/api/v1/models（无需登录）；这里说明的是**聊天**所需凭证。
     loginHint: '登录（官方 OAuth 设备授权；按提示在浏览器完成授权）',
 
@@ -144,11 +224,22 @@ export function createMmcodeAdapter(opts: { baseUrl?: string; chatPath?: string 
       {
         name: 'login-poll',
         summary: `完成登录：轮询取票（浏览器授权后执行；\`login\` 等待超时也用这条）`,
-        usage: 'login-poll',
-        async run() {
+        usage: 'login-poll [账号名]',
+        async run({ args }) {
+          const name = args[0];
+          const account = pickAccount(name);
+          const dir = account?.dir;
           try {
-            const cred = await pollDeviceLogin(LOGIN_WAIT_MS, tickTo(process.stdout));
-            return '✓ 登录成功 → ' + credentialPath() + '\n' + credentialSummary() + '\n' + mutualExclusionNotice();
+            const cred = await pollDeviceLogin(LOGIN_WAIT_MS, tickTo(process.stdout), dir);
+            if (account) pool.getAccountStore().upsert(account.record.name, cred.region);
+            return (
+              '✓ 登录成功 → ' +
+              credentialPath(dir) +
+              '\n' +
+              credentialSummary(dir) +
+              '\n' +
+              mutualExclusionNotice()
+            );
           } catch (err) {
             if (err instanceof PendingLoginError) {
               return '⏳ 还没看到你的授权完成 —— 请先在浏览器里打开链接完成授权，然后重跑：mmcode login-poll';
@@ -158,33 +249,106 @@ export function createMmcodeAdapter(opts: { baseUrl?: string; chatPath?: string 
         },
       },
       {
+        name: 'accounts',
+        summary: '列出所有已配置账号及其状态（区域 / 健康 / 冷却 / 签到）',
+        usage: 'accounts',
+        async run({ json }) {
+          const list = pool.refresh().map((a) => ({
+            name: a.record.name,
+            region: a.record.region,
+            enabled: a.record.enabled,
+            loggedIn: a.credential !== null,
+            health: a.record.health,
+            healthDetail: a.record.healthDetail ?? null,
+            disabledUntil: a.record.disabledUntil ?? null,
+            lastUsedAt: a.record.lastUsedAt ?? null,
+            lastCheckin: a.record.lastCheckin ?? null,
+            account: a.credential?.account ?? null,
+            tokenExpiresAt: a.credential?.expiresAt ?? null,
+          }));
+          if (json) return JSON.stringify(list, null, 2);
+          if (list.length === 0) return '还没有任何账号 —— 跑 `mmcode login` 登录一个。';
+          const lines = ['MiniMax Code 账号池', ''];
+          for (const a of list) {
+            const regionTag = a.region === 'global' ? '海外' : '国内';
+            const mark = a.enabled ? (a.loggedIn ? '✓' : '○') : '✗';
+            const cooling =
+              a.disabledUntil && a.disabledUntil > Date.now()
+                ? ` 冷却至 ${new Date(a.disabledUntil).toLocaleString('zh-CN')}`
+                : '';
+            const checkin = a.lastCheckin ? ` 签到:${a.lastCheckin.outcome}` : '';
+            lines.push(
+              ` ${mark} ${a.name}  [${regionTag}]  ${a.loggedIn ? '已登录' : '未登录'}  健康:${a.health}${cooling}${checkin}`,
+            );
+          }
+          lines.push('', `策略：${pool.getAccountStore().strategy()}（可用 ${pool.available().length}/${list.length}）`);
+          return lines.join('\n');
+        },
+      },
+      {
         name: 'checkin',
         summary: '每日签到领积分（用本工具令牌代签，无需开客户端）',
-        usage: 'checkin',
-        async run({ json }) {
-          const r = await activity.checkin();
+        usage: 'checkin [账号名]',
+        async run({ json, args }) {
+          const account = pickAccount(args[0]);
+          if (!account) throw new CredentialError('没有可用账号 —— 先跑 `mmcode login`');
+          const r = await activityFor(account).checkin();
+          pool.getAccountStore().update(account.record.name, {
+            lastCheckin: { at: Date.now(), ...r },
+          });
           return json ? JSON.stringify(r, null, 2) : renderCheckin(r);
         },
       },
       {
         name: 'credits',
         summary: '查询积分账本（剩余/已消耗/累计，精确到 0.01）',
-        usage: 'credits',
-        async run({ json }) {
-          const l = await activity.credits();
+        usage: 'credits [账号名]',
+        async run({ json, args }) {
+          const account = pickAccount(args[0]);
+          if (!account) throw new CredentialError('没有可用账号 —— 先跑 `mmcode login`');
+          const l = await activityFor(account).credits();
+          pool.getAccountStore().update(account.record.name, {
+            lastCredits: {
+              at: Date.now(),
+              granted: l.granted,
+              remaining: l.remaining,
+              consumed: l.consumed,
+              nextExpireAt: l.nextExpireAt,
+            },
+          });
           return json ? JSON.stringify(l, null, 2) : renderCredits(l);
         },
       },
     ],
 
     async credentialStatus(): Promise<CredentialStatus> {
-      const saved = readSavedCredential();
-      if (!saved) {
-        return { ok: false, detail: '未登录 —— 跑 `mmcode login`（浏览器授权一次）', source: credentialPath() };
+      const accounts = pool.all();
+      if (accounts.length === 0) {
+        return {
+          ok: false,
+          detail: '未登录 —— 跑 `mmcode login`（浏览器授权一次）',
+          source: credentialPath(),
+        };
       }
-      const left = saved.expiresAt ? Math.round((saved.expiresAt - Date.now()) / 60000) : null;
-      const state = left !== null && left > 0 ? `access 有效约 ${left} 分钟` : 'access 可能已过期（下次请求会自动刷新）';
-      return { ok: true, detail: `${state}${saved.account ? `（账号 ${saved.account}…）` : ''}`, source: credentialPath() };
+      const usable = pool.available();
+      const active = currentAccount();
+      const parts = accounts.map((a) => {
+        const regionTag = a.record.region === 'global' ? '海外' : '国内';
+        const state = a.credential
+          ? a.record.disabledUntil && a.record.disabledUntil > Date.now()
+            ? '冷却中'
+            : '就绪'
+          : '未登录';
+        return `${a.record.name}[${regionTag}]${state}`;
+      });
+      const detail =
+        `账号 ${parts.length} 个（可用 ${usable.length}）：${parts.join('、')}` +
+        (active ? `；当前 ${active.record.name}` : '');
+      return {
+        ok: usable.length > 0,
+        detail,
+        source: accounts.length > 0 ? undefined : credentialPath(),
+      };
     },
 
     /**
@@ -196,17 +360,25 @@ export function createMmcodeAdapter(opts: { baseUrl?: string; chatPath?: string 
      * 改用 `mmcode login-poll` 续跑（设备码本身有效期 5 分钟）。
      */
     async login(): Promise<void> {
-      const state = await startDeviceLogin();
+      /* 登录进「当前账号」；一个号都没注册时用默认账号目录（老行为）。 */
+      const account = currentAccount();
+      const dir = account?.dir;
+      const region = account?.record.region ?? resolveRegion(opts.region);
+      const state = await startDeviceLogin(region, dir);
       const out = process.stdout;
+      const regionLabel = state.region === 'global' ? ' [海外 Global]' : ' [国内 China]';
+      const who = account ? `账号 [${account.record.name}]` : '默认账号';
       out.write(
-        '请用浏览器打开下面的链接完成授权（用你的 MiniMax 账号）：\n\n' +
+        `请用浏览器打开下面的链接完成授权（用你的 MiniMax${regionLabel} 账号${who}）：\n\n` +
           `  ${state.verificationUriComplete}\n\n` +
           `  短码：${state.userCode}（链接已含，直接打开即可）\n\n` +
           `授权完成后本终端会**自动继续**（最多等 ${Math.round(LOGIN_WAIT_MS / 1000)} 秒）。\n`,
       );
       try {
-        const cred = await pollDeviceLogin(LOGIN_WAIT_MS, tickTo(out));
-        out.write('\n✓ 登录成功 → ' + credentialPath() + '\n' + credentialSummary() + '\n' + mutualExclusionNotice());
+        const cred = await pollDeviceLogin(LOGIN_WAIT_MS, tickTo(out), dir);
+        /* 登录后把账号登记进注册表 —— 否则新号不会被自动切换看见。 */
+        pool.getAccountStore().upsert(account?.record.name ?? DEFAULT_ACCOUNT_NAME, cred.region);
+        out.write('\n✓ 登录成功 → ' + credentialPath(dir) + '\n' + credentialSummary(dir) + '\n' + mutualExclusionNotice());
       } catch (err) {
         if (err instanceof PendingLoginError) {
           out.write(
@@ -223,11 +395,19 @@ export function createMmcodeAdapter(opts: { baseUrl?: string; chatPath?: string 
     async listModels(): Promise<ModelEntry[]> {
       /* v0.3.5：真拉取 /mavis/api/v1/models（无需鉴权），失败回落内置清单。
          此前返回硬编码常量 —— 上游新增模型时必须发版才能跟上。 */
+      const account = currentAccount();
+      const baseUrl = account
+        ? baseUrlFor(account)
+        : opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(resolveRegion(opts.region));
       return (await pullMinimaxModels(baseUrl)) ?? MINIMAX_MODELS;
     },
 
     async doctorChecks() {
       const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+      const account = currentAccount();
+      const baseUrl = account
+        ? baseUrlFor(account)
+        : opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(resolveRegion(opts.region));
       /* [复核修正] 此前 .catch(()=>null) 吞掉了所有网络错误 → 「上游连通」恒报 ✓。
          fetch 只在网络不可达（DNS/超时/拒连）时抛错；HTTP 404/502 不抛（反而证明可达）。 */
       try {
@@ -236,45 +416,132 @@ export function createMmcodeAdapter(opts: { baseUrl?: string; chatPath?: string 
       } catch (err) {
         checks.push({ name: '上游连通', ok: false, detail: (err as Error).message });
       }
-      /* 取一次 token：既验证刷新链是否可用，也把轮换写回（doctor 顺手做体检）。 */
-      try {
-        const t = await tokens.accessToken();
-        checks.push({ name: '令牌刷新', ok: true, detail: `可刷新（${t.slice(0, 8)}…）` });
-      } catch (err) {
-        checks.push({ name: '令牌刷新', ok: false, detail: (err as Error).message });
+
+      /* 账号池总览：每个可用账号各取一次 token —— 既验证刷新链，也把轮换写回。 */
+      const usable = pool.available();
+      if (usable.length === 0) {
+        checks.push({
+          name: '令牌刷新',
+          ok: false,
+          detail: '没有可用账号 —— 先跑 `mmcode login`',
+        });
+      } else {
+        for (const a of usable) {
+          try {
+            const t = await a.tokens.accessToken();
+            checks.push({ name: `令牌刷新 [${a.record.name}]`, ok: true, detail: `可刷新（${t.slice(0, 8)}…）` });
+          } catch (err) {
+            checks.push({ name: `令牌刷新 [${a.record.name}]`, ok: false, detail: (err as Error).message });
+          }
+        }
+        const cooling = pool.all().filter((a) => (a.record.disabledUntil ?? 0) > Date.now());
+        if (cooling.length > 0) {
+          checks.push({
+            name: '账号冷却',
+            ok: true,
+            detail: cooling.map((a) => a.record.name).join('、') + ' 暂时不可用（已自动跳过）',
+          });
+        }
       }
       return checks;
     },
 
+    /**
+     * 聊天 —— **带自动换号重试**。
+     *
+     * 换号触发条件（且仅这些）：
+     *   401 / 403 → 凭证被别处登录顶掉（换号才有意义）；
+     *   429      → 限流（换号避让）；
+     *   令牌拿不到（refresh token 失效）→ 换号。
+     *
+     * ⚠️ 其它错误（5xx / 网络抖动）**不换号** —— 那是上游或网络整体的问题，
+     *    换号只会把所有号都标记成故障，反而降低可用性。
+     */
     async chat(body: ChatRequestBody, signal: AbortSignal): Promise<UpstreamCallResult> {
-      const token = await tokens.accessToken();
       const payload = JSON.stringify(toAnthropicRequest(body));
+      const tried = new Set<string>();
+      let lastError: Error | null = null;
 
-      const res = await fetch(`${baseUrl}${chatPath}`, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/json',
-          accept: 'text/event-stream',
-          'anthropic-version': '2023-06-01',
-          'user-agent': 'MiniMaxCode',
-        },
-        body: payload,
-        signal,
-      });
+      /* 最多试 4 个账号（再多也没意义 —— 用户通常只备了两三个号）。 */
+      const maxAttempts = Math.max(1, Math.min(pool.all().length || 1, 4));
 
-      if (!res.ok || !res.body) {
-        const text = await res.text().catch(() => '');
-        if (res.status === 401 || res.status === 403) {
-          throw new CredentialError(
-            `上游鉴权失败（HTTP ${res.status}）—— 令牌可能已被官方客户端顶掉或过期：在客户端重新登录后跑一次 mmcode login`,
-          );
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        let account = await pool.acquire();
+        if (!account) break;
+        if (tried.has(account.record.name)) {
+          /* 池又给了同一个号（理论上冷却已排除，这里兜底）—— 找没试过的。 */
+          const next = pool.available().find((a) => !tried.has(a.record.name));
+          if (!next) break;
+          tried.add(next.record.name);
+          account = next;
+        } else {
+          tried.add(account.record.name);
         }
-        throw new UpstreamError(`上游 HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`);
+
+        /* ① 取令牌。取不到 = refresh token 已被顶掉/失效 → 换号。 */
+        let token: string;
+        try {
+          token = await account.tokens.accessToken();
+        } catch (err) {
+          if (signal.aborted) throw err;
+          pool.reportFailure(account, 'unauthorized', (err as Error).message);
+          lastError = err as Error;
+          continue;
+        }
+
+        /* ② 打上游。 */
+        const baseUrl = baseUrlFor(account);
+        let res: Response;
+        try {
+          res = await fetch(`${baseUrl}${chatPath}`, {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${token}`,
+              'content-type': 'application/json',
+              accept: 'text/event-stream',
+              'anthropic-version': '2023-06-01',
+              'user-agent': 'MiniMaxCode',
+            },
+            body: payload,
+            signal,
+          });
+        } catch (err) {
+          /* 客户端断连不是账号的错 —— 不换号、不惩罚账号。 */
+          if (signal.aborted) throw err;
+          pool.reportFailure(account, 'error', (err as Error).message);
+          lastError = err as Error;
+          continue;
+        }
+
+        /* ③ 非 2xx：只有「换号有意义」的状态才继续往下走。 */
+        if (!res.ok || !res.body) {
+          const text = await res.text().catch(() => '');
+          const detail = `上游 HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`;
+          if (res.status === 401 || res.status === 403 || res.status === 429) {
+            pool.reportFailure(account, AccountPool.classify(res.status), detail);
+            lastError =
+              res.status === 429
+                ? new UpstreamError(`${detail}（已限流，自动换下一个账号重试）`)
+                : new CredentialError(
+                    `上游鉴权失败（HTTP ${res.status}）—— 账号 [${account.record.name}] 的凭证已被别处登录顶掉` +
+                      '：请给该账号重新授权（管理页或 `mmcode login`）',
+                  );
+            continue;
+          }
+          /* 5xx 等：上游整体异常，不换号。 */
+          throw new UpstreamError(detail);
+        }
+
+        pool.reportSuccess(account);
+        /* 上游 Anthropic 事件流 → OpenAI SSE（core 负责把流吐给客户端）。 */
+        return { stream: res.body.pipeThrough(anthropicToOpenAiSse()), status: 200 };
       }
 
-      /* 上游 Anthropic 事件流 → OpenAI SSE（core 负责把流吐给客户端）。 */
-      return { stream: res.body.pipeThrough(anthropicToOpenAiSse()), status: 200 };
+      /* 所有账号都试过了。 */
+      throw (
+        lastError ??
+        new CredentialError('没有可用账号 —— 先跑 `mmcode login` 登录至少一个账号')
+      );
     },
   };
 }

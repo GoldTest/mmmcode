@@ -18,8 +18,12 @@
 
 import { describeFetchError, fetchWithRetry } from 'waygate-core';
 import { UpstreamError } from './errors.js';
+import { getAgentBase, type MinimaxRegion, readSavedCredential, resolveRegion } from './credential.js';
 
-const MINIMAX_API = 'https://agent.minimax.cn/minimax-cloud/api/v1';
+export function getActivityApiBase(region?: MinimaxRegion | string | null): string {
+  return `${getAgentBase(region)}/minimax-cloud/api/v1`;
+}
+
 /** 签到「今天」的时区边界（与官方客户端一致；缺参数上游报 invalid timezone_id）。 */
 const SIGNIN_TZ = 'Asia/Shanghai';
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -88,7 +92,14 @@ function toAmount(v: unknown): number | null {
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 export class MinimaxActivity {
-  constructor(private readonly token: () => Promise<string>) {}
+  constructor(
+    private readonly token: () => Promise<string>,
+    private readonly getRegion: () => MinimaxRegion = () => readSavedCredential()?.region ?? resolveRegion(),
+  ) {}
+
+  private apiBase(): string {
+    return getActivityApiBase(this.getRegion());
+  }
 
   /** 打一次签到接口，返回 data 段。 */
   /**
@@ -100,7 +111,7 @@ export class MinimaxActivity {
    */
   private async callSignin(action: 'status' | 'claim'): Promise<Record<string, unknown>> {
     const token = await this.token();
-    const url = `${MINIMAX_API}/signin/${action}?timezone_id=${encodeURIComponent(SIGNIN_TZ)}`;
+    const url = `${this.apiBase()}/signin/${action}?timezone_id=${encodeURIComponent(SIGNIN_TZ)}`;
     let res: Response;
     try {
       res = await fetchWithRetry(
@@ -182,7 +193,7 @@ export class MinimaxActivity {
     let res: Response;
     try {
       res = await fetchWithRetry(
-        `${MINIMAX_API}/credit/details`,
+        `${this.apiBase()}/credit/details`,
         { headers: { authorization: `Bearer ${token}`, accept: 'application/json' } },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );

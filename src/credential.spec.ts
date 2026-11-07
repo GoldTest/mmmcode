@@ -30,6 +30,9 @@ const {
   readSavedCredential,
   saveCredential,
   startDeviceLogin,
+  resolveRegion,
+  getAccountBase,
+  getAgentBase,
 } = await import('./credential.js');
 
 afterEach(() => {
@@ -179,5 +182,97 @@ describe('MinimaxTokenManager', () => {
 describe('常量', () => {
   it('login 原地等待 2 分钟（用户口径）', () => {
     expect(LOGIN_WAIT_MS).toBe(120_000);
+  });
+});
+
+describe('多区域支持 (Region & BaseUrls)', () => {
+  const origEnv = process.env.MINIMAX_REGION;
+
+  afterEach(() => {
+    if (origEnv !== undefined) {
+      process.env.MINIMAX_REGION = origEnv;
+    } else {
+      delete process.env.MINIMAX_REGION;
+    }
+  });
+
+  it('resolveRegion 正常解析别名与环境变量', () => {
+    delete process.env.MINIMAX_REGION;
+    expect(resolveRegion('global')).toBe('global');
+    expect(resolveRegion('intl')).toBe('global');
+    expect(resolveRegion('en')).toBe('global');
+    expect(resolveRegion('io')).toBe('global');
+    expect(resolveRegion('cn')).toBe('cn');
+    expect(resolveRegion('china')).toBe('cn');
+    expect(resolveRegion('zh')).toBe('cn');
+    expect(resolveRegion()).toBe('cn');
+
+    process.env.MINIMAX_REGION = 'global';
+    expect(resolveRegion()).toBe('global');
+    expect(resolveRegion('cn')).toBe('cn'); // 显式入参优先于环境变量
+  });
+
+  it('getAccountBase 与 getAgentBase 正确映射国内与海外域名', () => {
+    expect(getAccountBase('cn')).toBe('https://account.minimax.cn');
+    expect(getAgentBase('cn')).toBe('https://agent.minimax.cn');
+    expect(getAccountBase('global')).toBe('https://account.minimax.io');
+    expect(getAgentBase('global')).toBe('https://agent.minimax.io');
+  });
+
+  it('海外端点登录：startDeviceLogin 打到 .minimax.io 且 state 记录 region: global', async () => {
+    let requestedUrl = '';
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      requestedUrl = String(u);
+      return jsonResponse({
+        ...DEVICE_OK,
+        verification_uri: 'https://account.minimax.io/oauth-authorize',
+        verification_uri_complete: 'https://account.minimax.io/oauth-authorize?user_code=Z2MD-MW5P',
+      });
+    }));
+
+    const st = await startDeviceLogin('global');
+    expect(requestedUrl).toBe('https://account.minimax.io/oauth2/device/code');
+    expect(st.region).toBe('global');
+
+    const state = readLoginState();
+    expect(state?.region).toBe('global');
+  });
+
+  it('海外端点轮询取票：根据 state.region 打到 .minimax.io 且落盘凭证含 region: global', async () => {
+    let tokenUrl = '';
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      if (String(u).includes('/device/code')) {
+        return jsonResponse(DEVICE_OK);
+      }
+      tokenUrl = String(u);
+      return jsonResponse({ access_token: 'mmoat_global', refresh_token: 'mmort_global', expires_in: 3600 });
+    }));
+
+    await startDeviceLogin('global');
+    const cred = await pollDeviceLogin(2000);
+    expect(tokenUrl).toBe('https://account.minimax.io/oauth2/token');
+    expect(cred.region).toBe('global');
+    expect(readSavedCredential()?.region).toBe('global');
+  });
+
+  it('海外凭证刷新：TokenManager 根据凭证 region 打到 .minimax.io 且保留 region', async () => {
+    saveCredential({ accessToken: 'mmoat_old', refreshToken: 'mmort_old', expiresAt: 0, region: 'global' });
+    let refreshUrl = '';
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      refreshUrl = String(u);
+      return jsonResponse({
+        access_token: 'mmoat_global_new',
+        refresh_token: 'mmort_global_new',
+        expires_in: 3600,
+      });
+    }));
+
+    const mgr = new MinimaxTokenManager();
+    const tok = await mgr.accessToken();
+    expect(tok).toBe('mmoat_global_new');
+    expect(refreshUrl).toBe('https://account.minimax.io/oauth2/token');
+    const persisted = readSavedCredential();
+    expect(persisted?.region).toBe('global');
+    expect(persisted?.refreshToken).toBe('mmort_global_new');
   });
 });

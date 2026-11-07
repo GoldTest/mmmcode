@@ -1,6 +1,6 @@
 {
   "name": "waygate-mmcode",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "description": "MiniMax Code 本地反代：官方 OAuth 设备授权登录，提供 Anthropic/OpenAI 兼容的本地聊天端点",
   "keywords": [
     "minimax",
@@ -17,11 +17,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zhanghaojie513/waygate-mmcode.git"
+    "url": "git+https://github.com/zhanghaojie513/mmmcode.git"
   },
-  "homepage": "https://github.com/zhanghaojie513/waygate-mmcode#readme",
+  "homepage": "https://github.com/zhanghaojie513/mmmcode#readme",
   "bugs": {
-    "url": "https://github.com/zhanghaojie513/waygate-mmcode/issues"
+    "url": "https://github.com/zhanghaojie513/mmmcode/issues"
   },
   "type": "module",
   "engines": {
@@ -40,7 +40,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-web.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.test.json",
     "dev": "node --experimental-strip-types src/index.ts"
