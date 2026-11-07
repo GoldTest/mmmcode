@@ -99,10 +99,25 @@ export class KeyRegistry {
   private readonly file: string;
   private readonly primaryFile: string;
 
+  /**
+   * 临时密钥（`--key` 显式指定的那种）—— **只在内存里，不落盘**。
+   *
+   * 沿用 core 的语义：「用户显式指定即由用户自管」—— `--key` 给的钥匙不该被
+   * 悄悄写进注册表。但鉴权层只看注册表，所以必须把它**临时登记**进来，
+   * 否则 `mmcode serve --key xxx` 会打印出这把钥匙、然后把每个请求都拒掉。
+   */
+  private readonly transient = new Set<string>();
+
   constructor(opts: { filePath?: string; primaryPath?: string } = {}) {
     this.file = opts.filePath ?? keysFilePath();
     this.primaryFile = opts.primaryPath ?? primaryKeyFilePath();
     this.data = this.load();
+  }
+
+  /** 登记一把临时密钥（不落盘，进程结束即失效）。 */
+  addTransient(key: string): void {
+    const v = key.trim();
+    if (v) this.transient.add(v);
   }
 
   private load(): KeysFile {
@@ -294,6 +309,8 @@ export class KeyRegistry {
   accepts(candidate: string | undefined | null): boolean {
     if (!candidate || !candidate.trim()) return false;
     const value = candidate.trim();
+    /* 临时密钥（--key 指定的）：用户自己给的，无需时序保护。 */
+    if (this.transient.has(value)) return true;
     const now = Date.now();
     return this.data.keys.some(
       (k) =>

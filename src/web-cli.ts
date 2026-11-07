@@ -101,6 +101,8 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
   /* 入站密钥（给客户端用）与管理密钥（给管理页用）—— 两把不同的钥匙。 */
   const apiKey = resolveKey(opts.adapter.command, args.key);
   const adminKey = ensureAdminKey();
+  /* 同 serve：显式 --key 要临时登记进鉴权层，否则横幅上印着的钥匙实际用不了。 */
+  if (args.key?.trim()) opts.keys.addTransient(args.key);
 
   const running = await startWebServer({
     host: args.host,
@@ -191,6 +193,10 @@ export async function runServeCommand(opts: ServeCliOptions): Promise<number> {
   let key = opts.key?.trim();
   if (!key) key = opts.keys.primaryKey() ?? undefined;
   if (!key) key = opts.keys.create('默认密钥').key;
+  /* ★ 显式 --key 必须**临时登记**进鉴权层 ——
+     否则它只出现在启动横幅里，实际每个请求都会被 401 拒掉。
+     临时登记不落盘，沿用 core「用户显式指定即由用户自管」的语义。 */
+  if (opts.key?.trim()) opts.keys.addTransient(opts.key);
 
   const cred = await opts.adapter.credentialStatus();
   const models = await opts.adapter.listModels().catch(() => []);

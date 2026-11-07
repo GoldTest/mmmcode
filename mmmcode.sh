@@ -10,6 +10,10 @@ function show_help() {
     cat <<EOF
 mmmcode - MiniMax Code 多账户管理与批量签到工具
 
+⚠️  已过时：请优先用 \`mmcode web\` —— 它起一个统一服务（反代 + 管理页 + 管理 API），
+   多账号的登录/签到/密钥管理都在网页上做，状态统一持久化。本脚本只留给
+   「纯命令行、不起服务」的场景。
+
 用法:
   mmmcode login <账户名> [--region global|cn]   登录/授权指定账户（可指定海外 global 或国内 cn，默认 cn）
   mmmcode login-poll <账户名>                  续跑轮询授权（若登录等待超时）

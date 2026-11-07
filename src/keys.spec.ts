@@ -179,8 +179,34 @@ describe('吊销与轮换', () => {
   });
 });
 
-describe('持久化', () => {
-  it('★ 新实例读回同样的密钥（重启不丢）', () => {
+describe('临时密钥（--key 显式指定）', () => {
+  it('★ 登记后能通过鉴权（否则 --key 指定的钥匙会被全部请求拒掉）', () => {
+    const reg = newRegistry();
+    const custom = 'sk-mmcode-custom00000000000000000000000';
+    expect(reg.accepts(custom)).toBe(false);
+    reg.addTransient(custom);
+    expect(reg.accepts(custom)).toBe(true);
+  });
+
+  it('临时密钥**不落盘**（沿用 core「用户显式指定即由用户自管」）', () => {
+    const reg = newRegistry();
+    reg.create('已持久化的钥匙'); /* 先有一把持久密钥，让注册表文件必然存在 */
+    reg.addTransient('sk-mmcode-custom00000000000000000000000');
+    const reloaded = newRegistry();
+    expect(reloaded.accepts('sk-mmcode-custom00000000000000000000000')).toBe(false);
+    /* 注册表文件里也不该出现它。 */
+    expect(readFileSync(keysFilePath(), 'utf8')).not.toContain('custom0000');
+  });
+
+  it('空白/未登记的密钥不通过', () => {
+    const reg = newRegistry();
+    reg.addTransient('   ');
+    expect(reg.accepts('')).toBe(false);
+    expect(reg.accepts('sk-mmcode-nope0000000000000000000000000')).toBe(false);
+  });
+});
+
+describe('持久化', () => {  it('★ 新实例读回同样的密钥（重启不丢）', () => {
     const reg = newRegistry();
     const k = reg.create('A');
     const reloaded = newRegistry();

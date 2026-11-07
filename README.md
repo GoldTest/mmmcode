@@ -248,6 +248,12 @@ systemctl --user start mmcode-checkin.service
 
 签到结果照旧写进 `~/.waygate/mmcode/checkin.log`。
 
+> 旧的 `auto_checkin.sh`（在宿主机上直接刷令牌）**检测到容器在跑就会拒绝执行**，
+> 并在日志里指向 `docker_checkin.sh` —— 免得有人误用又把令牌竞态搞回来。
+
+> `mmmcode.sh`（早期的多账户命令行包装）也已在帮助里标注**过时**：
+> 多账号的登录/签到/密钥管理现在都在 `mmcode web` 的网页上做，状态统一持久化。
+
 ### 令牌刷新会「自愈」
 
 若宿主机上的 CLI 抢先刷新了令牌（写回了同一个 `credential.json`），
