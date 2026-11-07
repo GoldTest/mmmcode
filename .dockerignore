@@ -1,0 +1,21 @@
+# 构建产物（镜像内会重新编译，不需要进上下文）
+node_modules
+dist
+*.tgz
+
+# 版本控制与 CI
+.git
+.gitignore
+.github
+
+# 本地状态与日志
+*.log
+.env
+.env.*
+coverage
+.vitest
+
+# 编辑器
+.DS_Store
+.idea
+.vscode

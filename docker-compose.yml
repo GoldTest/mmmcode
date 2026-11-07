@@ -1,0 +1,46 @@
+# waygate-mmcode —— 反代 + 多账号管理（统一 Web 服务）
+#
+# 用法：
+#   docker compose up -d --build
+#   docker compose logs -f mmcode        # 首次启动这里会打印**管理密钥明文**
+#   docker compose exec mmcode cat /data/.waygate/mmcode/admin.json   # 随时再查
+#
+# ⚠️ 端口暴露：8789 对外。管理页有密钥保护，但**反代入站密钥同样有效** ——
+#    只在可信网络里用；要放到公网请自己在前面套一层 TLS + 防火墙。
+
+services:
+  mmcode:
+    build: .
+    image: waygate-mmcode:latest
+    container_name: waygate-mmcode
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8789:8789"   # 默认只绑本机；要对外改成 "8789:8789"
+
+    volumes:
+      # ★ 关键：状态卷。不挂 = 容器重建后账号、令牌、管理密钥全丢，
+      #   得重新走一遍浏览器授权。
+      - mmcode-data:/data
+
+    environment:
+      TZ: Asia/Shanghai
+      # 管理密钥不设时容器首次启动会自动生成（打印在日志里）。
+      # 想自己指定就在下面加一行（留空则用文件里的）：
+      # MMCODE_ADMIN_KEY: ""
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mmcode-data:
