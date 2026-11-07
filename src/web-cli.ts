@@ -9,11 +9,13 @@
  * 端口默认 8789（`serve` 的 8788 留给纯反代）。
  */
 
-import { resolveKey, type Adapter } from 'waygate-core';
+import { resolveKey, renderReady, renderReadyJson, type Adapter } from 'waygate-core';
 import { AccountPool } from './pool.js';
 import { startWebServer } from './web-server.js';
+import { startProxyServer } from './proxy.js';
 import { ensureAdminKey, maskAdminKey } from './admin.js';
 import { adminKeyPath } from './admin.js';
+import type { KeyRegistry } from './keys.js';
 
 /** `web` 的默认端口（`serve` 用 8788）。 */
 export const DEFAULT_WEB_PORT = 8789;
@@ -22,6 +24,7 @@ export interface WebCliOptions {
   argv: string[];
   adapter: Adapter;
   pool: AccountPool;
+  keys: KeyRegistry;
   version: string;
 }
 
@@ -103,6 +106,7 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
     host: args.host,
     port: args.port,
     apiKey,
+    keys: opts.keys,
     adapter: opts.adapter,
     pool: opts.pool,
     version: opts.version,
@@ -127,6 +131,7 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
   lines.push(`  凭证          ${cred.ok ? '✓' : '✗'} ${cred.detail}`);
   lines.push(`  入站密钥      ${apiKey}`);
   lines.push(`                 （客户端填这个：Claude Code 用 x-api-key，OpenAI 客户端用 Bearer）`);
+  lines.push(`                 共 ${opts.keys.list().length} 把，可在管理页生成/吊销`);
   if (adminKey.generated) {
     lines.push('');
     lines.push('  ⚠️  已生成管理密钥（首次启动自动生成，仅此一次明文显示）：');
@@ -156,4 +161,83 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
 
   /* 常驻直到信号触发。 */
   return await new Promise(() => {});
+}
+
+/* ─────────────────────── serve（纯反代） ─────────────────────── */
+
+export interface ServeCliOptions {
+  host: string;
+  port: number;
+  /** 显式指定的入站密钥（优先于注册表）。 */
+  key?: string;
+  json: boolean;
+  verbose: boolean;
+  adapter: Adapter;
+  keys: KeyRegistry;
+  version: string;
+}
+
+/**
+ * `mmcode serve` —— 纯反代（不含管理页）。
+ *
+ * 与 core 自带的 serve 行为一致，但走**本仓的代理层**，因此支持
+ * **多把**入站密钥（注册表里任意一把启用且未过期的都能通过）。
+ * 协议部分仍由 core 的 `startServer` 处理 —— 没有重复实现。
+ */
+export async function runServeCommand(opts: ServeCliOptions): Promise<number> {
+  const log = (line: string) => process.stdout.write(line + '\n');
+
+  /* 密钥优先级：显式 --key > 注册表主密钥 > 新生成一把。 */
+  let key = opts.key?.trim();
+  if (!key) key = opts.keys.primaryKey() ?? undefined;
+  if (!key) key = opts.keys.create('默认密钥').key;
+
+  const cred = await opts.adapter.credentialStatus();
+  const models = await opts.adapter.listModels().catch(() => []);
+
+  if (!cred.ok && !opts.json) {
+    process.stderr.write(`凭证未就绪：${cred.detail}\n先运行：${opts.adapter.command} login\n`);
+  }
+
+  try {
+    const running = await startProxyServer({
+      host: opts.host,
+      port: opts.port,
+      adapter: opts.adapter,
+      keys: opts.keys,
+      verbose: opts.verbose,
+      log,
+    });
+
+    const ready = {
+      command: opts.adapter.command,
+      displayName: opts.adapter.displayName,
+      version: opts.version,
+      upstream: opts.adapter.upstreamLabel,
+      host: opts.host,
+      port: running.port,
+      key,
+      credential: cred,
+      models,
+    };
+    process.stdout.write((opts.json ? renderReadyJson(ready) : renderReady(ready)) + '\n');
+
+    const shutdown = () => {
+      process.stdout.write('\n正在停止…\n');
+      void running.close().then(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    return await new Promise(() => {
+      /* 常驻：直到信号触发 exit */
+    });
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === 'EADDRINUSE') {
+      process.stderr.write(`端口 ${opts.port} 已被占用 —— 换一个：${opts.adapter.command} --port ${opts.port + 1}\n`);
+      return 1;
+    }
+    process.stderr.write(`启动失败：${e.message}\n`);
+    return 1;
+  }
 }

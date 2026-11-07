@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MiniMax Code 账号管理</title>
 <link rel="stylesheet" href="./style.css">
+<link rel="stylesheet" href="./keys.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔑</text></svg>">
 </head>
 <body>
@@ -60,6 +61,20 @@
       </div>
       <div id="account-list" class="cards"></div>
       <p id="accounts-empty" class="muted hidden">还没有账号。点「新增账号」登记一个，再到 MiniMax 官网授权登录。</p>
+    </section>
+
+    <!-- 客户端密钥 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>客户端密钥</h2>
+        <div class="panel-actions">
+          <button id="btn-new-key" class="primary">生成新密钥</button>
+          <button id="btn-refresh-keys" class="ghost">刷新</button>
+        </div>
+      </div>
+      <div id="client-setup" class="setup"></div>
+      <div id="key-list" class="keys"></div>
+      <p id="keys-empty" class="muted hidden pad">还没有客户端密钥。点「生成新密钥」创建一把，填进 Claude Code / Cursor 等客户端。</p>
     </section>
 
     <!-- 服务 -->

@@ -23,7 +23,6 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { request as httpRequest } from 'node:http';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,12 +31,16 @@ import { AccountPool } from './pool.js';
 import { SessionStore, ensureAdminKey, maskAdminKey } from './admin.js';
 import { createAdminApi } from './admin-api.js';
 import { adminKeyPath } from './admin.js';
+import { createProxyForwarder, INTERNAL_KEY } from './proxy.js';
+import type { KeyRegistry } from './keys.js';
 
 export interface WebServerOptions {
   host: string;
   port: number;
-  /** 反代入站密钥。 */
+  /** 反代入站密钥（展示时打码；真正的鉴权走 keys 注册表）。 */
   apiKey: string;
+  /** 入站密钥注册表（多把，支持生成/吊销）。 */
+  keys: KeyRegistry;
   adapter: Adapter;
   pool: AccountPool;
   version: string;
@@ -94,43 +97,6 @@ function isProxyPath(path: string): boolean {
   return path === '/models' || path === '/chat/completions' || path === '/messages';
 }
 
-/**
- * 把请求转发到内部反代服务器。
- *
- * 关键点：**客户端断连要传导到内部请求** —— core 的服务器靠 `req` 的
- * `close` 事件中止上游调用；不传导就会留下孤儿的上游请求（继续烧额度）。
- */
-function forwardToProxy(proxyPort: number, req: IncomingMessage, res: ServerResponse): void {
-  const preq = httpRequest(
-    {
-      host: '127.0.0.1',
-      port: proxyPort,
-      method: req.method,
-      path: req.url,
-      headers: { ...req.headers, host: `127.0.0.1:${proxyPort}` },
-    },
-    (pres) => {
-      res.writeHead(pres.statusCode ?? 502, pres.headers);
-      pres.pipe(res);
-      pres.on('error', () => res.destroy());
-    },
-  );
-  preq.on('error', (err) => {
-    if (!res.headersSent) {
-      const text = JSON.stringify({ error: { message: `反代内部错误：${err.message}`, type: 'waygate_error' } });
-      res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(text);
-    } else {
-      res.destroy();
-    }
-  });
-  res.on('close', () => {
-    /* 只有未正常结束才算断连 —— 正常收完别去打断内部请求。 */
-    if (!res.writableEnded) preq.destroy();
-  });
-  req.pipe(preq);
-}
-
 export async function startWebServer(opts: WebServerOptions): Promise<WebServerHandle> {
   const log = opts.log ?? ((line: string) => process.stdout.write(line + '\n'));
   const sessions = new SessionStore();
@@ -138,26 +104,29 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
   /* 管理密钥：不存在就生成一个（首次启动会把明文打到日志里）。 */
   const adminKey = ensureAdminKey();
 
-  /* ① 内部反代（环回）。 */
+  /* ① 内部反代（环回）+ 鉴权转发器。 */
   const proxy = await startServer(opts.adapter, {
     host: '127.0.0.1',
     port: 0,
-    apiKey: opts.apiKey,
+    apiKey: INTERNAL_KEY,
     verbose: opts.verbose,
     log: (line) => log(line),
   });
+  const forwardProxy = createProxyForwarder(proxy.port, opts.keys, log);
 
   const proxyStatus = () => ({
     port: proxy.port,
     upstream: opts.adapter.upstreamLabel,
     accounts: opts.pool.all().length,
     available: opts.pool.available().length,
+    baseUrl: `http://${opts.host === '0.0.0.0' ? '127.0.0.1' : opts.host}:${opts.port}`,
   });
 
   const handleAdmin = createAdminApi({
     pool: opts.pool,
     sessions,
     adapter: opts.adapter,
+    keys: opts.keys,
     apiKey: opts.apiKey,
     version: opts.version,
     log,
@@ -208,7 +177,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
 
     /* 反代路由。 */
     if (isProxyPath(path)) {
-      forwardToProxy(proxy.port, req, res);
+      forwardProxy(req, res);
       return;
     }
 

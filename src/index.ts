@@ -9,11 +9,12 @@
  */
 
 import { createRequire } from 'node:module';
-import { helpText, runCli, type Adapter } from 'waygate-core';
+import { helpText, parseArgs, runCli, type Adapter } from 'waygate-core';
 import { createMmcodeAdapter } from './adapter.js';
 import { AccountStore } from './accounts.js';
 import { AccountPool } from './pool.js';
-import { DEFAULT_WEB_PORT, runWebCommand } from './web-cli.js';
+import { KeyRegistry } from './keys.js';
+import { DEFAULT_WEB_PORT, runServeCommand, runWebCommand } from './web-cli.js';
 
 /* 版本从 package.json 读 —— 硬编码会与 npm 发布版本漂移（已踩过：package 升 0.1.2 而 CLI 仍显示 0.1.0）。 */
 const VERSION = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
@@ -28,14 +29,22 @@ const log = (line: string) => process.stdout.write(`[mmcode] ${line}\n`);
  */
 const store = new AccountStore();
 const pool = new AccountPool(store, { log });
-const adapter = createMmcodeAdapter({ pool, log });
+
+/**
+ * 入站密钥注册表 —— 客户端用的那些 token（可多把、可单独吊销）。
+ *
+ * 主密钥同时写进 core 的 `~/.waygate/mmcode/key`，保证既有客户端配置不受影响。
+ */
+const keys = new KeyRegistry();
+
+const adapter = createMmcodeAdapter({ pool, keys, log });
 
 const argv = process.argv.slice(2);
 
 /* `web` 是本仓自带的**统一服务**（反代 + 管理页 + 管理 API）——
    core 的 CLI 不认识它，所以在这里分流，不走 runCli。 */
 if (argv[0] === 'web') {
-  const code = await runWebCommand({ argv: argv.slice(1), adapter, pool, version: VERSION });
+  const code = await runWebCommand({ argv: argv.slice(1), adapter, pool, keys, version: VERSION });
   process.exit(code);
 }
 
@@ -52,6 +61,33 @@ function fullHelp(a: Adapter): string {
 if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
   process.stdout.write(fullHelp(adapter) + '\n');
   process.exit(0);
+}
+
+/**
+ * `serve` 走**本仓的代理层** —— 支持多把入站密钥（core 的只认一把）。
+ * 其余子命令（models / doctor / login / accounts / checkin / credits / keys）
+ * 仍由 core 的统一 CLI 处理。
+ */
+let parsed;
+try {
+  parsed = parseArgs(argv, adapter);
+} catch (err) {
+  process.stderr.write(`${(err as Error).message}\n`);
+  process.exit(2);
+}
+
+if (parsed.command === 'serve') {
+  const code = await runServeCommand({
+    host: parsed.host,
+    port: parsed.port ?? adapter.defaultPort,
+    key: parsed.key,
+    json: parsed.json,
+    verbose: parsed.verbose,
+    adapter,
+    keys,
+    version: VERSION,
+  });
+  process.exit(code);
 }
 
 const code = await runCli(adapter, { version: VERSION });

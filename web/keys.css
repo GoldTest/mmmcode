@@ -1,0 +1,64 @@
+/* ───────── 密钥卡片 ───────── */
+.setup {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 18px 18px 0;
+}
+.setup-item {
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.setup-label { font-size: 12px; color: var(--fg-dim); margin-bottom: 6px; }
+.setup-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+.setup-value code { background: transparent; padding: 0; flex: 1; min-width: 0; }
+
+.keys { display: flex; flex-direction: column; gap: 10px; padding: 14px 18px 18px; }
+.key-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  flex-wrap: wrap;
+}
+.key-row.disabled { opacity: .55; }
+.key-main { flex: 1; min-width: 220px; }
+.key-name { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.key-secret {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--fg-dim);
+  margin-top: 4px;
+  word-break: break-all;
+}
+.key-secret.revealed { color: var(--fg); }
+.key-meta { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+.key-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.star { color: var(--warn); }
+
+.copy-btn {
+  padding: 4px 9px;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.copy-btn.copied { border-color: var(--ok); color: var(--ok); }
+
+.pad { padding: 18px; }
+
+@media (max-width: 640px) {
+  .setup { grid-template-columns: 1fr; }
+}

@@ -44,6 +44,7 @@ import { anthropicToOpenAiSse } from './protocol/stream-decode.js';
 import { toAnthropicRequest } from './protocol/translate.js';
 import { AccountStore, DEFAULT_ACCOUNT_NAME } from './accounts.js';
 import { AccountPool, type PoolAccount } from './pool.js';
+import { maskInboundKey, type KeyRegistry } from './keys.js';
 
 export const DEFAULT_MMCODE_BASE_URL = 'https://agent.minimax.cn';
 export const DEFAULT_MMCODE_CHAT_PATH = '/mavis/api/v1/llm/v1/messages';
@@ -157,6 +158,8 @@ export interface MmcodeAdapterOptions {
   region?: MinimaxRegion;
   /** 账号池（不传则基于默认注册表自建）。 */
   pool?: AccountPool;
+  /** 入站密钥注册表（提供后才有 `mmcode keys` 子命令）。 */
+  keys?: KeyRegistry;
   /** 日志回调。 */
   log?: (line: string) => void;
 }
@@ -251,8 +254,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       {
         name: 'accounts',
         summary: '列出所有已配置账号及其状态（区域 / 健康 / 冷却 / 签到）',
-        usage: 'accounts',
-        async run({ json }) {
+        usage: 'accounts',        async run({ json }) {
           const list = pool.refresh().map((a) => ({
             name: a.record.name,
             region: a.record.region,
@@ -286,6 +288,57 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
         },
       },
       {
+        name: 'keys',
+        summary: '管理客户端用的入站密钥（生成 / 列出 / 吊销）',
+        usage: 'keys [list|new <名字>|revoke <id>|rotate <id>]',
+        async run({ json, args }) {
+          const registry = opts.keys;
+          if (!registry) {
+            throw new CredentialError('密钥注册表未启用');
+          }
+          const [action = 'list', ...rest] = args;
+
+          if (action === 'list' || action === undefined) {
+            const list = registry.list();
+            if (json) return JSON.stringify(list, null, 2);
+            if (list.length === 0) return '还没有入站密钥 —— 跑 `mmcode keys new <名字>` 生成一把。';
+            const lines = ['客户端入站密钥', ''];
+            for (const k of list) {
+              const mark = k.primary ? '★' : ' ';
+              const state = k.enabled ? '启用' : '停用';
+              const used = k.lastUsedAt ? ` 上次使用 ${new Date(k.lastUsedAt).toLocaleString('zh-CN')}` : ' 从未使用';
+              lines.push(` ${mark} ${k.name}  [${state}]  ${maskInboundKey(k.key)}  (${k.id})${used}`);
+              lines.push(`     ${k.key}`);
+            }
+            lines.push('', '★ = 主密钥（core 的 key 文件指向它）');
+            return lines.join('\n');
+          }
+
+          if (action === 'new') {
+            const name = rest.join(' ').trim() || `密钥 ${registry.list().length + 1}`;
+            const created = registry.create(name);
+            return `✓ 已生成入站密钥\n  名称：${created.name}\n  密钥：${created.key}\n  id  ：${created.id}\n\n把它填进客户端的 API Key 即可。`;
+          }
+
+          if (action === 'revoke') {
+            const id = rest[0] ?? '';
+            if (!id) throw new CredentialError('请指定要吊销的密钥 id（先用 `mmcode keys list` 看）');
+            if (!registry.revoke(id)) throw new CredentialError(`没有密钥 [${id}]`);
+            return `✓ 已吊销密钥 [${id}]`;
+          }
+
+          if (action === 'rotate') {
+            const id = rest[0] ?? '';
+            if (!id) throw new CredentialError('请指定要轮换的密钥 id');
+            const rotated = registry.rotate(id);
+            if (!rotated) throw new CredentialError(`没有密钥 [${id}]`);
+            return `✓ 已轮换密钥 [${id}]\n  新密钥：${rotated.key}\n\n旧密钥立即失效，记得同步更新客户端配置。`;
+          }
+
+          throw new CredentialError(`未知操作：${action}（可用：list / new / revoke / rotate）`);
+        },
+      },
+      {
         name: 'checkin',
         summary: '每日签到领积分（用本工具令牌代签，无需开客户端）',
         usage: 'checkin [账号名]',
@@ -302,8 +355,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       {
         name: 'credits',
         summary: '查询积分账本（剩余/已消耗/累计，精确到 0.01）',
-        usage: 'credits [账号名]',
-        async run({ json, args }) {
+        usage: 'credits [账号名]',        async run({ json, args }) {
           const account = pickAccount(args[0]);
           if (!account) throw new CredentialError('没有可用账号 —— 先跑 `mmcode login`');
           const l = await activityFor(account).credits();

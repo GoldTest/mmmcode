@@ -14,6 +14,7 @@ const state = {
   strategy: 'sticky',
   active: null,
   config: null,
+  keys: [],
   pollTimer: null,
 };
 
@@ -28,6 +29,64 @@ function toast(message, kind = '') {
   el.className = 'toast ' + kind;
   clearTimeout(el._t);
   el._t = setTimeout(() => el.classList.add('hidden'), 3200);
+}
+
+/**
+ * 复制到剪贴板。
+ *
+ * `navigator.clipboard` 只在**安全上下文**可用（https 或 localhost）。
+ * 用局域网 IP 以 http 访问时没有它 —— 所以留了 execCommand 兜底，
+ * 否则「点击复制」在这种部署下会静默失效。
+ */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* 落到兜底 */
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/** 带「已复制」反馈的复制按钮。 */
+function makeCopyBtn(getText, label = '复制') {
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn ghost';
+  btn.textContent = label;
+  btn.addEventListener('click', async () => {
+    const text = getText();
+    if (!text) {
+      toast('没有可复制的内容', 'err');
+      return;
+    }
+    const ok = await copyText(text);
+    if (ok) {
+      btn.classList.add('copied');
+      btn.textContent = '✓ 已复制';
+      setTimeout(() => {
+        btn.classList.remove('copied');
+        btn.textContent = label;
+      }, 1400);
+    } else {
+      toast('复制失败 —— 请手动选中复制（浏览器可能不允许自动复制）', 'err');
+    }
+  });
+  return btn;
 }
 
 async function api(path, options = {}) {
@@ -136,7 +195,7 @@ $('#btn-logout').addEventListener('click', async () => {
 /* ───────────────────────── 数据加载 ───────────────────────── */
 
 async function refreshAll() {
-  await Promise.all([loadAccounts(), loadConfig()]);
+  await Promise.all([loadAccounts(), loadConfig(), loadKeys()]);
 }
 
 async function loadAccounts() {
@@ -147,10 +206,21 @@ async function loadAccounts() {
   renderAccounts();
 }
 
+async function loadKeys() {
+  try {
+    const data = await api('/admin/api/keys');
+    state.keys = data.keys || [];
+    renderKeys();
+  } catch (err) {
+    toast('读取密钥列表失败：' + err.message, 'err');
+  }
+}
+
 async function loadConfig() {
   try {
     state.config = await api('/admin/api/config');
     renderService();
+    renderClientSetup();
   } catch {
     /* 配置拿不到不影响账号列表 */
   }
@@ -302,6 +372,130 @@ function mkBtn(text, cls, onClick) {
   b.textContent = text;
   b.addEventListener('click', () => onClick(b));
   return b;
+}
+
+/* ───────────────────────── 渲染：客户端密钥 ───────────────────────── */
+
+function renderKeys() {
+  const list = $('#key-list');
+  list.innerHTML = '';
+  $('#keys-empty').classList.toggle('hidden', state.keys.length > 0);
+
+  for (const k of state.keys) {
+    const row = document.createElement('div');
+    row.className = 'key-row' + (k.enabled ? '' : ' disabled');
+
+    const main = document.createElement('div');
+    main.className = 'key-main';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'key-name';
+    nameEl.innerHTML =
+      `<span>${escapeHtml(k.name)}</span>` +
+      (k.primary ? '<span class="star" title="主密钥">★</span>' : '') +
+      (k.enabled ? '' : '<span class="tag warn">已停用</span>');
+    main.appendChild(nameEl);
+
+    const secret = document.createElement('div');
+    secret.className = 'key-secret';
+    secret.textContent = k.masked || k.key;
+    main.appendChild(secret);
+
+    const meta = document.createElement('div');
+    meta.className = 'key-meta';
+    const used = k.lastUsedAt ? `上次使用 ${fmtTime(k.lastUsedAt)}` : '从未使用';
+    meta.textContent = `${used} · 创建于 ${fmtTime(k.createdAt)} · id ${k.id}${k.purpose ? ' · ' + k.purpose : ''}`;
+    main.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'key-actions';
+
+    /* 复制完整密钥 */
+    actions.appendChild(makeCopyBtn(() => k.key, '复制密钥'));
+
+    /* 显示 / 隐藏 */
+    const reveal = document.createElement('button');
+    reveal.className = 'ghost sm';
+    reveal.textContent = '显示';
+    let shown = false;
+    reveal.addEventListener('click', () => {
+      shown = !shown;
+      secret.textContent = shown ? k.key : k.masked || k.key;
+      secret.classList.toggle('revealed', shown);
+      reveal.textContent = shown ? '隐藏' : '显示';
+    });
+    actions.appendChild(reveal);
+
+    /* 启用 / 停用 */
+    actions.appendChild(mkBtn(k.enabled ? '停用' : '启用', 'ghost sm', async () => {
+      await api(`/admin/api/keys/${encodeURIComponent(k.id)}`, {
+        method: 'PATCH',
+        body: { enabled: !k.enabled },
+      });
+      toast(`密钥「${k.name}」已${k.enabled ? '停用' : '启用'}`, 'ok');
+      await loadKeys();
+    }));
+
+    /* 轮换 */
+    actions.appendChild(mkBtn('轮换', 'ghost sm', async () => {
+      if (!confirm(`轮换密钥「${k.name}」？\n旧密钥立即失效，记得同步更新客户端配置。`)) return;
+      try {
+        const r = await api(`/admin/api/keys/${encodeURIComponent(k.id)}/rotate`, { method: 'POST' });
+        toast(`已轮换「${k.name}」，新密钥：${r.key.key}`, 'ok');
+        await loadKeys();
+      } catch (err) {
+        toast('轮换失败：' + err.message, 'err');
+      }
+    }));
+
+    /* 吊销 */
+    actions.appendChild(mkBtn('吊销', 'danger sm', async () => {
+      if (!confirm(`吊销密钥「${k.name}」？\n用它的客户端会立刻开始 401。`)) return;
+      try {
+        await api(`/admin/api/keys/${encodeURIComponent(k.id)}`, { method: 'DELETE' });
+        toast(`密钥「${k.name}」已吊销`, 'ok');
+        await loadKeys();
+        await loadConfig();
+      } catch (err) {
+        toast('吊销失败：' + err.message, 'err');
+      }
+    }));
+
+    row.appendChild(main);
+    row.appendChild(actions);
+    list.appendChild(row);
+  }
+
+  renderClientSetup();
+}
+
+/** 顶部「客户端怎么填」——地址与主密钥，一键复制。 */
+function renderClientSetup() {
+  const el = $('#client-setup');
+  const c = state.config && state.config.client ? state.config.client : {};
+  const baseUrl = c.baseUrl || '';
+  const primary = state.keys.find((k) => k.primary);
+  const primaryKey = primary ? primary.key : c.primaryKey || '';
+
+  el.innerHTML = `
+    <div class="setup-item">
+      <div class="setup-label">Base URL（Claude Code 用这个，不要带 /v1）</div>
+      <div class="setup-value">
+        <code>${escapeHtml(baseUrl)}</code>
+        <span class="copy-slot"></span>
+      </div>
+    </div>
+    <div class="setup-item">
+      <div class="setup-label">API Key（主密钥）</div>
+      <div class="setup-value">
+        <code>${escapeHtml(primaryKey ? primaryKey.slice(0, 14) + '…' : '—')}</code>
+        <span class="copy-slot"></span>
+      </div>
+    </div>`;
+
+  const slots = el.querySelectorAll('.copy-slot');
+  if (slots[0]) slots[0].appendChild(makeCopyBtn(() => baseUrl, '复制地址'));
+  if (slots[1]) slots[1].appendChild(makeCopyBtn(() => primaryKey, '复制密钥'));
 }
 
 /* ───────────────────────── 渲染：服务信息 ───────────────────────── */
@@ -491,6 +685,51 @@ $('#strategy-select').addEventListener('change', async (e) => {
 $('#btn-refresh').addEventListener('click', async () => {
   await refreshAll();
   toast('已刷新', 'ok');
+});
+
+/* ───────────────────────── 生成新密钥 ───────────────────────── */
+
+$('#btn-new-key').addEventListener('click', () => {
+  openModal(
+    '生成客户端密钥',
+    `<label class="field">用途名称
+       <input id="key-name" type="text" placeholder="例如 Claude Code（笔记本）" autocomplete="off">
+     </label>
+     <label class="field">备注（可选）
+       <input id="key-purpose" type="text" placeholder="例如 公司项目 / 家里台式机" autocomplete="off">
+     </label>
+     <p class="muted small">每把密钥可**单独吊销** —— 某一台设备泄露了，只换它，不影响其它客户端。<br>
+     密钥只在生成时完整显示一次（也可以随时点「显示」查看）。</p>`,
+    `<button class="ghost" data-close>取消</button><button class="primary" id="do-new-key">生成</button>`,
+  );
+  $('#do-new-key').addEventListener('click', async () => {
+    const name = $('#key-name').value.trim();
+    const purpose = $('#key-purpose').value.trim();
+    try {
+      const r = await api('/admin/api/keys', { method: 'POST', body: { name, purpose } });
+      closeModal();
+      await loadKeys();
+      await loadConfig();
+      /* 生成后直接把密钥摆出来，方便当场复制。 */
+      openModal(
+        '密钥已生成',
+        `<div class="usercode" style="font-size:14px;word-break:break-all;letter-spacing:0">${escapeHtml(r.key.key)}</div>
+         <p class="muted small">名称：${escapeHtml(r.key.name)}　id：${escapeHtml(r.key.id)}</p>
+         <p class="muted small">填进客户端的 API Key 即可。这把密钥以后可在列表里随时吊销。</p>`,
+        `<button class="ghost" data-close>关闭</button><span class="copy-slot2"></span>`,
+      );
+      const slot = document.querySelector('.copy-slot2');
+      if (slot) slot.appendChild(makeCopyBtn(() => r.key.key, '复制密钥'));
+    } catch (err) {
+      toast('生成失败：' + err.message, 'err');
+    }
+  });
+  $('#key-name').focus();
+});
+
+$('#btn-refresh-keys').addEventListener('click', async () => {
+  await loadKeys();
+  toast('密钥列表已刷新', 'ok');
 });
 
 $('#modal-close').addEventListener('click', closeModal);

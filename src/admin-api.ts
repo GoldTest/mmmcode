@@ -42,6 +42,7 @@ import {
 } from './admin.js';
 import { AccountStore, DEFAULT_ACCOUNT_NAME, resolveAccountDir, type PoolStrategy } from './accounts.js';
 import { AccountPool, type PoolAccount } from './pool.js';
+import { maskInboundKey, type KeyRegistry } from './keys.js';
 import {
   credentialPath,
   loginStatePath,
@@ -62,12 +63,14 @@ export interface AdminApiContext {
   pool: AccountPool;
   sessions: SessionStore;
   adapter: Adapter;
+  /** 入站密钥注册表（客户端用的那些 token）。 */
+  keys: KeyRegistry;
   /** 反代入站密钥（展示时打码）。 */
   apiKey: string;
   version: string;
   log: (line: string) => void;
   /** 反代运行状态。 */
-  proxyStatus: () => { port: number; upstream: string; accounts: number; available: number };
+  proxyStatus: () => { port: number; upstream: string; accounts: number; available: number; baseUrl?: string };
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -239,9 +242,75 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         return true;
       }
 
+      /* ── 入站密钥（客户端 token）的生成与管理 ── */
+      if (route === 'keys' && method === 'GET') {
+        /* 返回**明文**密钥 —— 管理页要支持「点击复制」，不给明文就没法复制。
+           该接口受管理密钥/会话保护，浏览器本地不落盘。 */
+        sendJson(res, 200, {
+          keys: ctx.keys.list().map((k) => ({ ...k, masked: maskInboundKey(k.key) })),
+          primaryId: ctx.keys.primary()?.id ?? null,
+        });
+        return true;
+      }
+
+      if (route === 'keys' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const name = typeof body.name === 'string' ? body.name.trim() : '';
+        const purpose = typeof body.purpose === 'string' ? body.purpose.slice(0, 200) : undefined;
+        const expiresAt = typeof body.expiresAt === 'number' ? body.expiresAt : null;
+        const created = ctx.keys.create(name, { purpose, expiresAt });
+        sendJson(res, 200, { ok: true, key: { ...created, masked: maskInboundKey(created.key) } });
+        return true;
+      }
+
+      const keyMatch = /^keys\/([^/]+)(?:\/(.+))?$/.exec(route);
+      if (keyMatch) {
+        const id = decodeURIComponent(keyMatch[1] ?? '');
+        const action = keyMatch[2] ?? '';
+
+        if (!action && method === 'PATCH') {
+          const body = await readJsonBody(req);
+          const patch: Record<string, unknown> = {};
+          if (typeof body.name === 'string') patch.name = body.name;
+          if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+          if (typeof body.purpose === 'string') patch.purpose = body.purpose;
+          if ('expiresAt' in body) patch.expiresAt = body.expiresAt === null ? null : Number(body.expiresAt);
+          const updated = ctx.keys.update(id, patch);
+          if (!updated) {
+            sendJson(res, 404, { error: `没有密钥 [${id}]` });
+            return true;
+          }
+          sendJson(res, 200, { ok: true, key: { ...updated, masked: maskInboundKey(updated.key) } });
+          return true;
+        }
+
+        /* 轮换：保留名字与元信息，换一把新的密钥本体。 */
+        if (action === 'rotate' && method === 'POST') {
+          const rotated = ctx.keys.rotate(id);
+          if (!rotated) {
+            sendJson(res, 404, { error: `没有密钥 [${id}]` });
+            return true;
+          }
+          sendJson(res, 200, { ok: true, key: { ...rotated, masked: maskInboundKey(rotated.key) } });
+          return true;
+        }
+
+        if (!action && method === 'DELETE') {
+          const ok = ctx.keys.revoke(id);
+          if (!ok) {
+            sendJson(res, 404, { error: `没有密钥 [${id}]` });
+            return true;
+          }
+          sendJson(res, 200, { ok: true });
+          return true;
+        }
+
+        sendJson(res, 404, { error: `未知密钥操作 ${action}` });
+        return true;
+      }
+
       /* ── 单账号操作 ── */
-      const accountMatch = /^accounts\/([^/]+)(?:\/(.+))?$/.exec(route);
-      if (accountMatch) {
+      const accountMatch = /^accounts\/([^/]+)(?:\/(.+))?$/.exec(route);      if (accountMatch) {
         const name = decodeURIComponent(accountMatch[1] ?? '');
         const action = accountMatch[2] ?? '';
 
@@ -385,12 +454,18 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           strategy: store.strategy(),
           active: store.activeName(),
           apiKeyMasked: maskAdminKey(ctx.apiKey),
-          apiKeyPath: store ? undefined : undefined,
           accounts: accounts.length,
           available: ctx.pool.available().length,
           adminKeyPath: adminKeyPath(),
           proxy: ctx.proxyStatus(),
           version: ctx.version,
+          /* 客户端接入信息（复制用）。 */
+          client: {
+            baseUrl: ctx.proxyStatus().baseUrl ?? null,
+            primaryKey: ctx.keys.primaryKey(),
+            primaryKeyMasked: ctx.keys.primary() ? maskInboundKey(ctx.keys.primaryKey() ?? '') : null,
+            keyCount: ctx.keys.list().length,
+          },
         });
         return true;
       }
