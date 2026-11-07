@@ -49,10 +49,24 @@ if [ -z "${ADMIN_KEY}" ]; then
 fi
 
 # 容器在不在？探活（不鉴权）。
-if ! curl -sf --max-time 5 "${BASE_URL}/healthz" >/dev/null 2>&1; then
-  log "容器未响应（${BASE_URL}/healthz）—— 跳过本次签到。"
-  exit 0
-fi
+#
+# ⚠️ **必须等，而不是直接跳过**：
+#   systemd 定时器设了 Persistent=true —— 关机时错过签到，开机会**立刻**补跑。
+#   而那正是 Docker 还在启动、容器还没就绪的时刻。此时直接跳过就等于
+#   **漏签一整天**。所以这里最多等 ${WAIT_SECONDS} 秒让容器起来。
+WAIT_SECONDS="${MMCODE_WAIT_SECONDS:-180}"
+waited=0
+until curl -sf --max-time 5 "${BASE_URL}/healthz" >/dev/null 2>&1; do
+  if [ "${waited}" -ge "${WAIT_SECONDS}" ]; then
+    log "等待 ${WAIT_SECONDS} 秒后容器仍未响应（${BASE_URL}/healthz）—— 跳过本次签到。"
+    log "提示：可手动执行 docker compose -f ${COMPOSE_FILE:-$(dirname "$0")/docker-compose.yml} up -d 后重跑本脚本。"
+    exit 0
+  fi
+  [ "${waited}" -eq 0 ] && log "容器未响应，最多等待 ${WAIT_SECONDS} 秒…"
+  sleep 5
+  waited=$((waited + 5))
+done
+[ "${waited}" -gt 0 ] && log "容器已就绪（等待了 ${waited} 秒）。"
 
 # 取账号列表。
 ACCOUNTS=$(curl -sf --max-time 10 \
