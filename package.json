@@ -17,11 +17,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zhanghaojie513/mmmcode.git"
+    "url": "git+https://github.com/GoldTest/mmmcode.git"
   },
-  "homepage": "https://github.com/zhanghaojie513/mmmcode#readme",
+  "homepage": "https://github.com/GoldTest/mmmcode#readme",
   "bugs": {
-    "url": "https://github.com/zhanghaojie513/mmmcode/issues"
+    "url": "https://github.com/GoldTest/mmmcode/issues"
   },
   "type": "module",
   "engines": {
