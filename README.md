@@ -237,6 +237,14 @@ $ mmcode keys revoke <id>
 
 ## Docker 部署
 
+从 GHCR 拉取已发布镜像（推荐，无需本地构建）：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+从源码本地构建：
+
 ```bash
 cd ~/项目/waygate-mmcode
 docker compose up -d --build
@@ -246,6 +254,22 @@ docker compose logs -f mmcode
 
 # 随时再查（状态目录与宿主机共用）
 cat ~/.waygate/mmcode/admin.json
+```
+
+### 镜像标签与版本
+
+版本由 **Git tag** 管理（`vX.Y.Z`），推送 tag 即自动发布镜像：
+
+| 标签 | 含义 |
+| --- | --- |
+| `ghcr.io/goldtest/mmmcode:X.Y.Z` | 正式版（由 `vX.Y.Z` tag 触发） |
+| `ghcr.io/goldtest/mmmcode:latest` | 指向最新正式版 |
+| `ghcr.io/goldtest/mmmcode:main-<sha>` | 主分支的临时构建，不覆盖 `latest` |
+
+要**固定版本**部署，把 `docker-compose.yml` 里的 `image` 改成具体版本标签：
+
+```yaml
+image: ghcr.io/goldtest/mmmcode:0.5.3
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。

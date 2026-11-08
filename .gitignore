@@ -5,6 +5,10 @@ node_modules/
 # 打包产物（npm pack 的临时物，绝不入库）
 *.tgz
 
+# 构建产物（dist/ 由 npm run build 生成，镜像与 npm 包都在 CI 里从源码构建）
+# —— 不入库：产物随代码漂移会污染 diff，且版本由 Git tag 管理，产物无需追溯。
+dist/
+
 # 本地状态与密钥（管理密钥、令牌绝不进版本库）
 .env
 .env.*
