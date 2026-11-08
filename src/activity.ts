@@ -206,6 +206,15 @@ export class MinimaxActivity {
       details?: unknown;
     };
     assertOk(body);
+    if (body.details == null || (Array.isArray(body.details) && body.details.length === 0)) {
+      return {
+        granted: 0,
+        remaining: 0,
+        consumed: 0,
+        nextExpireAt: null,
+        grants: [],
+      };
+    }
     if (!Array.isArray(body.details)) throw new UpstreamError('账本响应缺少 details 数组');
 
     const grants: CreditGrant[] = [];

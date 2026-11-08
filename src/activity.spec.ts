@@ -81,7 +81,29 @@ describe('MinimaxActivity.credits', () => {
     await expect(new MinimaxActivity(async () => 'tok').credits()).rejects.toThrow('没有可识别的积分批次');
   });
 
-  it('details 不是数组 → 抛错', async () => {
+  it('details 缺失（新账号无 token 产出）→ 返回全 0 空账本', async () => {
+    stub({ base_resp: { status_code: 0 } });
+    const l = await new MinimaxActivity(async () => 'tok').credits();
+    expect(l.granted).toBe(0);
+    expect(l.remaining).toBe(0);
+    expect(l.consumed).toBe(0);
+    expect(l.grants).toEqual([]);
+    expect(l.nextExpireAt).toBeNull();
+  });
+
+  it('details 为 null 或空数组 → 返回全 0 空账本', async () => {
+    stub({ base_resp: { status_code: 0 }, details: null });
+    const l1 = await new MinimaxActivity(async () => 'tok').credits();
+    expect(l1.granted).toBe(0);
+    expect(l1.grants).toEqual([]);
+
+    stub({ base_resp: { status_code: 0 }, details: [] });
+    const l2 = await new MinimaxActivity(async () => 'tok').credits();
+    expect(l2.granted).toBe(0);
+    expect(l2.grants).toEqual([]);
+  });
+
+  it('details 不是数组且非空值 → 抛错', async () => {
     stub({ base_resp: { status_code: 0 }, details: 'nope' });
     await expect(new MinimaxActivity(async () => 'tok').credits()).rejects.toThrow('缺少 details');
   });

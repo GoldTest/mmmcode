@@ -17,7 +17,7 @@
  * 拿它做「累计用量」会随时间失真。台账是**累计型**的，独立落盘。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { waygateRoot } from './accounts.js';
 
@@ -164,9 +164,23 @@ export class InsightsLedger {
     this.data.updatedAt = Date.now();
     writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', { mode: 0o600 });
     try {
+      chmodSync(tmp, 0o600);
+    } catch {
+      /* Windows 上 chmod 语义有限 */
+    }
+    try {
       renameSync(tmp, this.filePath);
     } catch {
-      /* 落盘失败不影响记账（内存里还在）。 */
+      try {
+        writeFileSync(this.filePath, JSON.stringify(this.data, null, 2) + '\n', { mode: 0o600 });
+      } catch {
+        /* 落盘失败不影响记账（内存里还在）。 */
+      }
+      try {
+        unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
     }
   }
 

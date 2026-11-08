@@ -20,6 +20,7 @@ import {
   readAdminKeyFile,
   setAdminKey,
   SessionStore,
+  SESSION_TTL_MS,
   verifyAdminKey,
 } from './admin.js';
 
@@ -122,10 +123,23 @@ describe('打码', () => {
 });
 
 describe('会话', () => {
+  it('会话默认有效期为 3 天', () => {
+    expect(SESSION_TTL_MS).toBe(3 * 24 * 60 * 60 * 1000);
+  });
+
   it('创建后能校验通过', () => {
     const s = new SessionStore();
     const t = s.create();
     expect(s.verify(t)).toBe(true);
+  });
+
+  it('持久化会话：重启加载未过期会话', () => {
+    const s1 = new SessionStore();
+    const t = s1.create();
+    expect(s1.verify(t)).toBe(true);
+
+    const s2 = new SessionStore();
+    expect(s2.verify(t)).toBe(true);
   });
 
   it('未知 token 不通过', () => {

@@ -5,7 +5,7 @@
  * Token 用量、状态码及耗时，并提供先进先出与按时长的缓存淘汰策略。
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export interface RequestRecord {
@@ -114,6 +114,13 @@ export interface RequestListFilter {
 export const DEFAULT_MAX_ITEMS = 200;
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000; // 默认保留 24 小时
 
+export interface RequestsDataFile {
+  version: number;
+  updatedAt: number;
+  totalLogged: number;
+  items: RequestRecord[];
+}
+
 export class RequestStore {
   private items: RequestRecord[] = [];
   private totalLogged = 0;
@@ -122,10 +129,15 @@ export class RequestStore {
     retentionMs: DEFAULT_RETENTION_MS,
   };
   private readonly configPath?: string;
+  private readonly dataPath?: string;
+  private lastFlush = 0;
+  private flushTimer: NodeJS.Timeout | null = null;
 
-  constructor(configPath?: string) {
+  constructor(configPath?: string, dataPath?: string) {
     this.configPath = configPath;
+    this.dataPath = dataPath ?? (configPath ? dirname(configPath) + '/requests.json' : undefined);
     this.loadConfig();
+    this.loadData();
   }
 
   private loadConfig(): void {
@@ -146,11 +158,91 @@ export class RequestStore {
   private saveConfig(): void {
     if (!this.configPath) return;
     try {
-      mkdirSync(dirname(this.configPath), { recursive: true });
+      mkdirSync(dirname(this.configPath), { recursive: true, mode: 0o700 });
       writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
     } catch {
       // 写入失败不中断主流程
     }
+  }
+
+  private loadData(): void {
+    if (!this.dataPath || !existsSync(this.dataPath)) return;
+    try {
+      const data = JSON.parse(readFileSync(this.dataPath, 'utf8')) as Partial<RequestsDataFile>;
+      if (typeof data.totalLogged === 'number' && data.totalLogged >= 0) {
+        this.totalLogged = data.totalLogged;
+      }
+      if (Array.isArray(data.items)) {
+        this.items = data.items.filter((item) => item && typeof item === 'object' && typeof item.id === 'string');
+        this.prune();
+        if (this.totalLogged < this.items.length) {
+          this.totalLogged = this.items.length;
+        }
+      }
+    } catch {
+      // 容错忽略损坏的文件
+    }
+  }
+
+  private saveData(): void {
+    if (!this.dataPath) return;
+    try {
+      mkdirSync(dirname(this.dataPath), { recursive: true, mode: 0o700 });
+      const tmp = `${this.dataPath}.tmp-${process.pid}`;
+      const data: RequestsDataFile = {
+        version: 1,
+        updatedAt: Date.now(),
+        totalLogged: this.totalLogged,
+        items: this.items,
+      };
+      writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+      try {
+        chmodSync(tmp, 0o600);
+      } catch {
+        /* Windows */
+      }
+      try {
+        renameSync(tmp, this.dataPath);
+      } catch {
+        try {
+          writeFileSync(this.dataPath, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+        } catch {}
+        try {
+          unlinkSync(tmp);
+        } catch {}
+      }
+    } catch {
+      // 写入失败不中断主流程
+    }
+  }
+
+  private scheduleSave(): void {
+    if (!this.dataPath) return;
+    const now = Date.now();
+    if (now - this.lastFlush >= 2000) {
+      this.lastFlush = now;
+      this.saveData();
+      return;
+    }
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.lastFlush = Date.now();
+      this.saveData();
+    }, 2000);
+    this.flushTimer.unref?.();
+  }
+
+  /**
+   * 立即将未写入的请求记录持久化至磁盘。
+   */
+  flush(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.lastFlush = Date.now();
+    this.saveData();
   }
 
   /**
@@ -160,6 +252,7 @@ export class RequestStore {
     this.totalLogged += 1;
     this.items.unshift(record); // 最新记录放前面
     this.prune();
+    this.scheduleSave();
   }
 
   /**
@@ -188,6 +281,7 @@ export class RequestStore {
    */
   clear(): void {
     this.items = [];
+    this.saveData();
   }
 
   /**
@@ -202,6 +296,7 @@ export class RequestStore {
     }
     this.saveConfig();
     this.prune();
+    this.scheduleSave();
     return { ...this.config };
   }
 

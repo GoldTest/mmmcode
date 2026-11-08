@@ -43,6 +43,7 @@ import {
   setAdminKey,
   SessionStore,
   verifyAdminKey,
+  SESSION_TTL_SECONDS,
 } from './admin.js';
 import { AccountStore, DEFAULT_ACCOUNT_NAME, resolveAccountDir, type PoolMode } from './accounts.js';
 import { AccountPool, type PoolAccount } from './pool.js';
@@ -123,7 +124,7 @@ function setSessionCookie(req: IncomingMessage, res: ServerResponse, token: stri
   const secure = (req.headers['x-forwarded-proto'] ?? '') === 'https' ? '; Secure' : '';
   res.setHeader(
     'set-cookie',
-    `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200${secure}`,
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}${secure}`,
   );
 }
 
@@ -172,12 +173,16 @@ function accountView(a: PoolAccount): Record<string, unknown> {
 export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res: ServerResponse) => Promise<boolean> {
   const store: AccountStore = ctx.pool.getAccountStore();
 
-  /** 当前请求是否已鉴权。 */
-  const authenticated = (req: IncomingMessage): boolean => {
+  /** 当前请求是否已鉴权。若携带合法会话 cookie，会自动重发 Set-Cookie 刷新有效期至 3 天。 */
+  const authenticated = (req: IncomingMessage, res?: ServerResponse): boolean => {
     const headerKey = req.headers['x-admin-key'];
     if (typeof headerKey === 'string' && verifyAdminKey(headerKey)) return true;
     const cookie = readCookie(req, SESSION_COOKIE);
-    return ctx.sessions.verify(cookie);
+    const valid = ctx.sessions.verify(cookie);
+    if (valid && cookie && res && !res.headersSent) {
+      setSessionCookie(req, res, cookie);
+    }
+    return valid;
   };
 
   /** 找账号（不存在 → 抛 404）。 */
@@ -199,7 +204,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
       if (method === 'GET') {
         const keyFile = ensureAdminKey();
         sendJson(res, 200, {
-          authenticated: authenticated(req),
+          authenticated: authenticated(req, res),
           adminKeyPath: keyFile.path,
           adminKeyConfigured: true,
           version: ctx.version,
@@ -229,7 +234,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
     }
 
     /* ── 以下全部要求鉴权 ── */
-    if (!authenticated(req)) {
+    if (!authenticated(req, res)) {
       sendJson(res, 401, { error: '未登录或会话已过期，请用管理密钥登录' });
       return true;
     }

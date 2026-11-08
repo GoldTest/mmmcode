@@ -89,7 +89,7 @@ describe('Admin API: 新增功能路由测试', () => {
       };
       if (options.body) headers['content-type'] = 'application/json';
 
-      return new Promise<{ status: number; body: any }>((resolve, reject) => {
+      return new Promise<{ status: number; body: any; headers: any }>((resolve, reject) => {
         const clientReq = httpRequest(
           {
             host: '127.0.0.1',
@@ -103,9 +103,9 @@ describe('Admin API: 新增功能路由测试', () => {
             res.on('data', (c) => (data += c));
             res.on('end', () => {
               try {
-                resolve({ status: res.statusCode ?? 0, body: data ? JSON.parse(data) : null });
+                resolve({ status: res.statusCode ?? 0, body: data ? JSON.parse(data) : null, headers: res.headers });
               } catch {
-                resolve({ status: res.statusCode ?? 0, body: data });
+                resolve({ status: res.statusCode ?? 0, body: data, headers: res.headers });
               }
             });
           },
@@ -304,6 +304,42 @@ describe('Admin API: 新增功能路由测试', () => {
       expect(res.body.results[0].account).toBe('a1');
       /* 没登录 → 取不到余额 → 标记失败（而不是抛错中断整个刷新）。 */
       expect(res.body.results[0].ok).toBe(false);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('POST /admin/api/session 登录下发 3 天有效期 Cookie，且带 Cookie 访问自动刷新', async () => {
+    const ctx = await setupServer();
+    try {
+      const login = await ctx.req('/admin/api/session', {
+        method: 'POST',
+        body: { adminKey: ctx.adminKey },
+        headers: { 'x-admin-key': '' },
+      });
+      expect(login.status).toBe(200);
+      const setCookie = login.headers['set-cookie'];
+      expect(setCookie).toBeDefined();
+      const cookieStr = Array.isArray(setCookie) ? setCookie[0] : String(setCookie);
+      expect(cookieStr).toContain('Max-Age=259200'); // 3 天 = 259200 秒
+
+      // 提取 cookie 值
+      const match = cookieStr.match(/mmcode_session=([^;]+)/);
+      expect(match).toBeTruthy();
+      const cookieHeader = `mmcode_session=${match![1]}`;
+
+      // 使用该 Cookie 发送 GET /admin/api/session
+      const check = await ctx.req('/admin/api/session', {
+        method: 'GET',
+        headers: { 'x-admin-key': '', cookie: cookieHeader },
+      });
+      expect(check.status).toBe(200);
+      expect(check.body.authenticated).toBe(true);
+      // 确认响应中刷新了 Cookie
+      const refreshCookie = check.headers['set-cookie'];
+      expect(refreshCookie).toBeDefined();
+      const refreshCookieStr = Array.isArray(refreshCookie) ? refreshCookie[0] : String(refreshCookie);
+      expect(refreshCookieStr).toContain('Max-Age=259200');
     } finally {
       await ctx.close();
     }

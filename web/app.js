@@ -396,20 +396,26 @@ $('#login-form').addEventListener('submit', async (e) => {
   }
 });
 
-$('#btn-logout').addEventListener('click', async () => {
-  await api('/admin/api/session', { method: 'DELETE' }).catch(() => {});
-  showLogin();
-});
+const btnLogout = $('#btn-logout');
+if (btnLogout) {
+  btnLogout.addEventListener('click', async () => {
+    await api('/admin/api/session', { method: 'DELETE' }).catch(() => {});
+    showLogin();
+  });
+}
 
 $('#btn-bottom-logout').addEventListener('click', async () => {
   await api('/admin/api/session', { method: 'DELETE' }).catch(() => {});
   showLogin();
 });
 
-$('#btn-top-refresh').addEventListener('click', async () => {
-  await refreshAll();
-  toast('所有数据已刷新', 'ok');
-});
+const btnTopRefresh = $('#btn-top-refresh');
+if (btnTopRefresh) {
+  btnTopRefresh.addEventListener('click', async () => {
+    await refreshAll();
+    toast('所有数据已刷新', 'ok');
+  });
+}
 
 /* ───────────────────────── Tab 页切换 ───────────────────────── */
 
@@ -483,8 +489,10 @@ function renderAccounts() {
   // 顶栏 Badge（冻结的账号不参与调度，算作不可用）
   const availableCount = state.accounts.filter((a) => a.enabled && a.loggedIn && !a.cooling && !a.frozen).length;
   const accBadge = $('#account-badge');
-  accBadge.textContent = `账号 ${availableCount}/${state.accounts.length} 就绪`;
-  accBadge.className = 'badge ' + (availableCount > 0 ? 'ok' : 'warn');
+  if (accBadge) {
+    accBadge.textContent = `账号 ${availableCount}/${state.accounts.length} 就绪`;
+    accBadge.className = 'badge ' + (availableCount > 0 ? 'ok' : 'warn');
+  }
 
   for (const a of state.accounts) {
     list.appendChild(renderAccountCard(a));
@@ -1202,10 +1210,13 @@ $('#btn-refresh-keys').addEventListener('click', async () => {
 async function loadConfig() {
   try {
     state.config = await api('/admin/api/config');
-    $('#upstream-label').textContent = state.config.proxy ? state.config.proxy.upstream : '';
+    const upstreamLabel = $('#upstream-label');
+    if (upstreamLabel) upstreamLabel.textContent = state.config.proxy ? state.config.proxy.upstream : '';
     const badge = $('#proxy-badge');
-    badge.textContent = `反代 :${state.config.proxy ? state.config.proxy.port : '—'}`;
-    badge.className = 'badge ok';
+    if (badge) {
+      badge.textContent = `反代 :${state.config.proxy ? state.config.proxy.port : '—'}`;
+      badge.className = 'badge ok';
+    }
     renderProxyDetails();
     renderClientSetup();
     renderSystemInfo();
@@ -1440,7 +1451,7 @@ async function loadRequests() {
 function renderRequestsTable() {
   const tbody = $('#requests-table-body');
   if (!state.requests || state.requests.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="11" class="muted">暂无请求记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无请求记录</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -1451,18 +1462,6 @@ function renderRequestsTable() {
     const isOk = item.status >= 200 && item.status < 300;
     const badgeCls = isOk ? 'ok' : item.status === 401 || item.status === 429 ? 'warn' : 'err';
     const statusBadge = `<span class="badge ${badgeCls}">${item.status}</span>`;
-
-    // 提取输入输出摘要
-    let snippet = '—';
-    if (item.input && item.input.messages && item.input.messages.length > 0) {
-      const lastMsg = item.input.messages[item.input.messages.length - 1];
-      const text = typeof lastMsg.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg.content);
-      snippet = text.slice(0, 50) + (text.length > 50 ? '…' : '');
-    } else if (item.input && item.input.prompt) {
-      snippet = item.input.prompt.slice(0, 50) + (item.input.prompt.length > 50 ? '…' : '');
-    } else if (item.output && item.output.text) {
-      snippet = item.output.text.slice(0, 50) + (item.output.text.length > 50 ? '…' : '');
-    }
 
     const usage = item.output && item.output.usage;
     const listHitRate = usage
@@ -1495,7 +1494,6 @@ function renderRequestsTable() {
       <td class="small">${escapeHtml(item.keyName || '默认')}</td>
       <td class="small" title="${escapeHtml(tokensTitle)}"><b>${tokensStr}</b></td>
       <td class="small" title="${escapeHtml(hitRateTitle)}"><b>${hitRateStr}</b></td>
-      <td class="small muted" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(snippet)}</td>
       <td></td>`;
 
     const tdAction = tr.querySelector('td:last-child');

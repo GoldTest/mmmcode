@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { RequestStore, type RequestRecord } from './requests.js';
 
 describe('RequestStore', () => {
@@ -96,5 +99,24 @@ describe('RequestStore', () => {
     expect(stats.successCount).toBe(1);
     expect(stats.errorCount).toBe(1);
     expect(stats.totalTokens.total).toBe(60);
+  });
+
+  it('请求记录持久化落盘与重新加载', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mmcode-req-test-'));
+    try {
+      const cfgPath = join(dir, 'requests-config.json');
+      const dataPath = join(dir, 'requests.json');
+      const store1 = new RequestStore(cfgPath, dataPath);
+      store1.add(createSample('req-persist-1', 0, 200));
+      store1.add(createSample('req-persist-2', 0, 200));
+      store1.flush();
+
+      const store2 = new RequestStore(cfgPath, dataPath);
+      expect(store2.list().total).toBe(2);
+      expect(store2.get('req-persist-1')?.id).toBe('req-persist-1');
+      expect(store2.stats().totalLogged).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

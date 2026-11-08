@@ -22,7 +22,7 @@
  * 两者互不替代，也互不通用。
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { waygateRoot } from './accounts.js';
@@ -44,6 +44,37 @@ export function generateAdminKey(): string {
 /** 管理密钥文件路径。 */
 export function adminKeyPath(): string {
   return join(waygateRoot(), 'mmcode', 'admin.json');
+}
+
+/** 会话持久化文件路径。 */
+export function sessionsFilePath(): string {
+  return join(waygateRoot(), 'mmcode', 'sessions.json');
+}
+
+/** 安全原子写 JSON 文件（0600，跨设备重命名失败自动回退）。 */
+function writeJsonAtomic(path: string, data: unknown): void {
+  mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  try {
+    chmodSync(tmp, 0o600);
+  } catch {
+    /* Windows 上 chmod 语义有限 */
+  }
+  try {
+    renameSync(tmp, path);
+  } catch {
+    try {
+      writeFileSync(path, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /** 常量时间比较（长度不等也算不匹配）。 */
@@ -72,16 +103,7 @@ export function readAdminKeyFile(): AdminKeyFile | null {
 }
 
 function writeAdminKeyFile(file: AdminKeyFile): void {
-  const path = adminKeyPath();
-  mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
-  const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
-  try {
-    chmodSync(tmp, 0o600);
-  } catch {
-    /* Windows 上 chmod 语义有限 */
-  }
-  renameSync(tmp, path);
+  writeJsonAtomic(adminKeyPath(), file);
 }
 
 export interface EnsureAdminKeyResult {
@@ -155,23 +177,61 @@ export function maskAdminKey(key: string): string {
 
 /* ─────────────────────── 会话 ─────────────────────── */
 
-/** 会话有效期（默认 12 小时）。 */
-export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+/** 会话有效期（3 天）。 */
+export const SESSION_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+export const SESSION_TTL_SECONDS = 3 * 24 * 60 * 60;
 
 /**
- * 内存会话表。
+ * 会话存储表。
  *
- * 为什么不用 JWT/签名 cookie：会话**只需在服务重启后失效**（重新输一次密钥即可），
- * 而「重启即失效」本身就是更安全的默认值 —— 密钥改了、进程重启了，旧会话自动作废。
- * 无状态签名反而会让旧密钥签发的会话在改密钥后继续可用。
+ * 持久化至 ~/.waygate/mmcode/sessions.json，容器重启或更新镜像不丢失登录态。
+ * 管理密钥修改时会主动清空所有已有会话。
  */
 export class SessionStore {
   private readonly sessions = new Map<string, number>();
+  private readonly filePath?: string;
+
+  constructor(filePath?: string) {
+    this.filePath = filePath ?? sessionsFilePath();
+    this.load();
+  }
+
+  private load(): void {
+    if (!this.filePath || !existsSync(this.filePath)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as {
+        sessions?: Record<string, number>;
+      };
+      if (parsed && typeof parsed.sessions === 'object') {
+        const now = Date.now();
+        for (const [token, exp] of Object.entries(parsed.sessions)) {
+          if (typeof exp === 'number' && exp > now) {
+            this.sessions.set(token, exp);
+          }
+        }
+      }
+    } catch {
+      /* 容错忽略损坏的会话文件 */
+    }
+  }
+
+  private save(): void {
+    if (!this.filePath) return;
+    const now = Date.now();
+    const obj: Record<string, number> = {};
+    for (const [token, exp] of this.sessions.entries()) {
+      if (exp > now) {
+        obj[token] = exp;
+      }
+    }
+    writeJsonAtomic(this.filePath, { version: 1, sessions: obj });
+  }
 
   /** 建会话，返回 token。 */
   create(ttlMs = SESSION_TTL_MS): string {
     const token = randomBytes(32).toString('base64url');
     this.sessions.set(token, Date.now() + ttlMs);
+    this.save();
     return token;
   }
 
@@ -182,20 +242,26 @@ export class SessionStore {
     if (exp === undefined) return false;
     if (Date.now() > exp) {
       this.sessions.delete(token);
+      this.save();
       return false;
     }
     /* 滑动续期：活跃用户不会半路被踢。 */
     this.sessions.set(token, Date.now() + SESSION_TTL_MS);
+    this.save();
     return true;
   }
 
   /** 作废一个会话（登出）。 */
   revoke(token: string | undefined | null): void {
-    if (token) this.sessions.delete(token);
+    if (token) {
+      this.sessions.delete(token);
+      this.save();
+    }
   }
 
   /** 清空全部会话（改密钥后调用 —— 旧密钥的会话必须立刻失效）。 */
   clear(): void {
     this.sessions.clear();
+    this.save();
   }
 }

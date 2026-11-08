@@ -100,12 +100,13 @@ code { background: var(--bg-soft); padding: 2px 6px; border-radius: 4px; font-si
 /* ───────── 导航 Tabs ───────── */
 .nav-tabs {
   display: flex;
+  justify-content: center;
   gap: 6px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
   padding: 0 24px;
   position: sticky;
-  top: 57px;
+  top: 0;
   z-index: 15;
   overflow-x: auto;
 }
@@ -550,6 +551,6 @@ pre.code-block {
   .cards { grid-template-columns: 1fr; }
   .kv { grid-template-columns: 1fr; gap: 4px 0; }
   .kv dd { margin-bottom: 8px; }
-  .nav-tabs { padding: 0 12px; }
+  .nav-tabs { padding: 0 12px; justify-content: center; }
   .tab-btn { padding: 10px 12px; font-size: 13px; }
 }

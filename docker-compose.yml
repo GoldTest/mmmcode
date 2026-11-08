@@ -20,14 +20,14 @@ services:
 
     # 以宿主用户身份运行 —— 绑定挂载的 ~/.waygate 归宿主机所有（uid 1000），
     # 容器内的默认用户（uid 100）写不进去。用 .env 里的 UID/GID 保持一致。
-    user: "${WAYGATE_UID}:${WAYGATE_GID}"
+    user: "${WAYGATE_UID:-1000}:${WAYGATE_GID:-1000}"
 
     ports:
       - "127.0.0.1:8789:8789"
 
     volumes:
       # ★ 状态：账号、令牌、管理密钥、注册表。宿主机与容器共用同一份。
-      - ${WAYGATE_STATE}:/data/.waygate
+      - ${WAYGATE_STATE:-~/.waygate}:/data/.waygate
 
     environment:
       TZ: Asia/Shanghai

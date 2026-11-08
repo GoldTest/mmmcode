@@ -113,7 +113,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
   const adminKey = ensureAdminKey();
 
   const stateDir = join(waygateRoot(), 'mmcode');
-  const requests = opts.requests ?? new RequestStore(join(stateDir, 'requests-config.json'));
+  const requests = opts.requests ?? new RequestStore(join(stateDir, 'requests-config.json'), join(stateDir, 'requests.json'));
   const scheduler =
     opts.scheduler ??
     new SchedulerService(opts.pool, {
@@ -264,6 +264,8 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     proxyPort: proxy.port,
     close: async () => {
       scheduler.stop();
+      requests.flush();
+      opts.insights?.flush();
       await proxy.close();
       await new Promise<void>((done) => {
         server.close(() => done());
