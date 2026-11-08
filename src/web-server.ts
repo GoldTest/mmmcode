@@ -33,6 +33,7 @@ import { createAdminApi } from './admin-api.js';
 import { adminKeyPath } from './admin.js';
 import { waygateRoot } from './accounts.js';
 import { createProxyForwarder, INTERNAL_KEY } from './proxy.js';
+import type { InsightsLedger } from './insights.js';
 import type { KeyRegistry } from './keys.js';
 import { RequestStore } from './requests.js';
 import { SchedulerService } from './scheduler.js';
@@ -49,6 +50,8 @@ export interface WebServerOptions {
   version: string;
   requests?: RequestStore;
   scheduler?: SchedulerService;
+  /** 用量台账（洞察面板数据源）。 */
+  insights?: InsightsLedger;
   log?: (line: string) => void;
   verbose?: boolean;
 }
@@ -134,6 +137,8 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     upstream: opts.adapter.upstreamLabel,
     accounts: opts.pool.all().length,
     available: opts.pool.available().length,
+    /** 当前调度模式（最大缓存 / 平衡）。 */
+    mode: opts.pool.mode(),
     baseUrl: `http://${opts.host === '0.0.0.0' ? '127.0.0.1' : opts.host}:${opts.port}`,
   });
 
@@ -148,6 +153,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     proxyStatus,
     requests,
     scheduler,
+    insights: opts.insights,
   });
 
   const webRoot = resolveWebRoot();

@@ -60,14 +60,43 @@ describe('AccountStore：注册与持久化', () => {
   it('注册表真的写到磁盘，新实例能读回来', () => {
     const store = new AccountStore();
     store.upsert('acct1', 'global');
-    store.setActive('acct1');
-    store.setStrategy('round-robin');
+    store.setMode('balanced');
+    store.setCreditsThreshold(250);
     expect(existsSync(accountsFilePath())).toBe(true);
 
     const reloaded = new AccountStore();
     expect(reloaded.get('acct1')?.region).toBe('global');
-    expect(reloaded.activeName()).toBe('acct1');
-    expect(reloaded.strategy()).toBe('round-robin');
+    expect(reloaded.mode()).toBe('balanced');
+    expect(reloaded.creditsThreshold()).toBe(250);
+  });
+
+  it('★ v1 文件（旧 active/strategy）自动迁移到 v2 并落盘', () => {
+    mkdirSync(join(root, 'mmcode'), { recursive: true });
+    writeFileSync(
+      accountsFilePath(),
+      JSON.stringify({
+        version: 1,
+        active: 'old',
+        strategy: 'round-robin',
+        accounts: [
+          { name: 'old', region: 'cn', enabled: true, createdAt: 1, updatedAt: 1, health: 'healthy' },
+          { name: 'new', region: 'global', enabled: true, createdAt: 2, updatedAt: 2, health: 'healthy' },
+        ],
+      }),
+    );
+
+    const store = new AccountStore();
+    /* 旧的两个概念整体消失；账号继承同一优先级（同层随机分配）。 */
+    expect(store.mode()).toBe('max-cache');
+    expect(store.list().map((a) => a.priority)).toEqual([0, 0]);
+    expect(store.get('old')?.region).toBe('cn');
+
+    /* 迁移结果立刻落盘 —— 旧字段不该留在文件里误导人。 */
+    const raw = JSON.parse(readFileSync(accountsFilePath(), 'utf8')) as Record<string, unknown>;
+    expect(raw.version).toBe(2);
+    expect(raw.active).toBeUndefined();
+    expect(raw.strategy).toBeUndefined();
+    expect(raw.mode).toBe('max-cache');
   });
 
   it('update 只改传入的字段', () => {
@@ -85,14 +114,13 @@ describe('AccountStore：注册与持久化', () => {
     expect(store.update('nope', { enabled: false })).toBeNull();
   });
 
-  it('remove 会把粘性指针让给别的账号', () => {
+  it('remove 移除账号条目（不牵连其它账号）', () => {
     const store = new AccountStore();
     store.upsert('a1');
     store.upsert('a2');
-    store.setActive('a1');
     store.remove('a1');
     expect(store.get('a1')).toBeNull();
-    expect(store.activeName()).toBe('a2');
+    expect(store.get('a2')).not.toBeNull();
   });
 
   it('重扫磁盘**不覆盖**已有状态（冷却/健康记录不能被抹掉）', () => {

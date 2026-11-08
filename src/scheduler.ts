@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { AccountPool, PoolAccount } from './pool.js';
 import { MinimaxActivity, type SigninResult } from './activity.js';
+import { refreshCreditsForAll, type CreditsRefreshResult } from './credits-refresh.js';
 
 export interface SchedulerConfig {
   autoCheckin: {
@@ -26,6 +27,16 @@ export interface SchedulerConfig {
     intervalMinutes: number;
     /** 提前刷新缓冲时间（分钟，默认 30 分钟） */
     marginMinutes: number;
+  };
+  /**
+   * 额度巡检：拉积分余额，低于阈值就**冻结**该账号（余额回到阈值以上自动解冻）。
+   *
+   * 上游不回报单次请求消耗 —— 「这个号还有多少额度」只能问账户级账本。
+   */
+  autoCredits: {
+    enabled: boolean;
+    /** 轮询检测间隔（分钟，默认 5 分钟） */
+    intervalMinutes: number;
   };
 }
 
@@ -60,6 +71,22 @@ export interface SchedulerStatus {
     lastRunAt: number | null;
     history: RefreshHistoryItem[];
   };
+  autoCredits: {
+    enabled: boolean;
+    intervalMinutes: number;
+    lastRunAt: number | null;
+    history: CreditsHistoryItem[];
+  };
+}
+
+/** 一次额度巡检的结果。 */
+export interface CreditsHistoryItem {
+  at: number;
+  account: string;
+  ok: boolean;
+  remaining: number | null;
+  frozen: boolean;
+  detail: string;
 }
 
 export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
@@ -72,6 +99,10 @@ export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
     enabled: true,
     intervalMinutes: 15,
     marginMinutes: 30,
+  },
+  autoCredits: {
+    enabled: true,
+    intervalMinutes: 5,
   },
 };
 
@@ -97,12 +128,15 @@ export class SchedulerService {
 
   private checkinTimer: NodeJS.Timeout | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
+  private creditsTimer: NodeJS.Timeout | null = null;
 
   private lastCheckinRun: number | null = null;
   private lastRefreshRun: number | null = null;
+  private lastCreditsRun: number | null = null;
 
   private checkinHistory: CheckinHistoryItem[] = [];
   private refreshHistory: RefreshHistoryItem[] = [];
+  private creditsHistory: CreditsHistoryItem[] = [];
 
   constructor(pool: AccountPool, opts: { configPath?: string; log?: (line: string) => void } = {}) {
     this.pool = pool;
@@ -126,6 +160,12 @@ export class SchedulerService {
         this.config.autoRefresh = {
           ...this.config.autoRefresh,
           ...data.autoRefresh,
+        };
+      }
+      if (data.autoCredits) {
+        this.config.autoCredits = {
+          ...this.config.autoCredits,
+          ...data.autoCredits,
         };
       }
     } catch {
@@ -163,10 +203,18 @@ export class SchedulerService {
     }, refreshIntervalMs);
     this.refreshTimer.unref?.();
 
+    // 启动额度巡检定时器（拉余额 → 冻结 / 解冻）
+    const creditsIntervalMs = Math.max(1, this.config.autoCredits.intervalMinutes) * 60 * 1000;
+    this.creditsTimer = setInterval(() => {
+      void this.checkAndRunAutoCredits();
+    }, creditsIntervalMs);
+    this.creditsTimer.unref?.();
+
     // 启动时延迟 3 秒执行初次检测
     setTimeout(() => {
       void this.checkAndRunAutoRefresh();
       void this.checkAndRunAutoCheckin();
+      void this.checkAndRunAutoCredits();
     }, 3000).unref?.();
   }
 
@@ -181,6 +229,10 @@ export class SchedulerService {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
+    }
+    if (this.creditsTimer) {
+      clearInterval(this.creditsTimer);
+      this.creditsTimer = null;
     }
   }
 
@@ -198,6 +250,12 @@ export class SchedulerService {
       this.config.autoRefresh = {
         ...this.config.autoRefresh,
         ...patch.autoRefresh,
+      };
+    }
+    if (patch.autoCredits) {
+      this.config.autoCredits = {
+        ...this.config.autoCredits,
+        ...patch.autoCredits,
       };
     }
     this.saveConfig();
@@ -225,7 +283,39 @@ export class SchedulerService {
         lastRunAt: this.lastRefreshRun,
         history: this.refreshHistory.slice(0, 30),
       },
+      autoCredits: {
+        enabled: this.config.autoCredits.enabled,
+        intervalMinutes: this.config.autoCredits.intervalMinutes,
+        lastRunAt: this.lastCreditsRun,
+        history: this.creditsHistory.slice(0, 30),
+      },
     };
+  }
+
+  /**
+   * 立即巡检所有账号的额度余额（并按阈值冻结 / 解冻）。
+   */
+  async checkCreditsAll(): Promise<CreditsRefreshResult[]> {
+    this.lastCreditsRun = Date.now();
+    const results = await refreshCreditsForAll(this.pool, this.log);
+    for (const r of results) {
+      this.creditsHistory.unshift({
+        at: Date.now(),
+        account: r.account,
+        ok: r.ok,
+        remaining: r.remaining,
+        frozen: r.frozen,
+        detail: r.detail,
+      });
+    }
+    if (this.creditsHistory.length > 50) this.creditsHistory.length = 50;
+    return results;
+  }
+
+  /** 后台额度巡检入口（定时器调用）。 */
+  async checkAndRunAutoCredits(): Promise<void> {
+    if (!this.config.autoCredits.enabled) return;
+    await this.checkCreditsAll();
   }
 
   /**

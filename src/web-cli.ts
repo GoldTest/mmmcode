@@ -15,6 +15,7 @@ import { startWebServer } from './web-server.js';
 import { startProxyServer } from './proxy.js';
 import { ensureAdminKey, maskAdminKey } from './admin.js';
 import { adminKeyPath } from './admin.js';
+import type { InsightsLedger } from './insights.js';
 import type { KeyRegistry } from './keys.js';
 
 /** `web` 的默认端口（`serve` 用 8788）。 */
@@ -25,6 +26,8 @@ export interface WebCliOptions {
   adapter: Adapter;
   pool: AccountPool;
   keys: KeyRegistry;
+  /** 用量台账（洞察面板数据源）。 */
+  insights?: InsightsLedger;
   version: string;
 }
 
@@ -111,6 +114,7 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
     keys: opts.keys,
     adapter: opts.adapter,
     pool: opts.pool,
+    insights: opts.insights,
     version: opts.version,
     verbose: args.verbose,
     log,

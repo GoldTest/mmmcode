@@ -58,6 +58,9 @@
     <button class="tab-btn" data-tab="tab-settings">
       <span>⚙️</span> 设置选项
     </button>
+    <button class="tab-btn" data-tab="tab-insights">
+      <span>🔍</span> 用量洞察
+    </button>
   </nav>
 
   <main>
@@ -69,18 +72,18 @@
           <h2><span>👥</span> 账号池管理</h2>
           <div class="panel-actions">
             <label class="field inline">
-              切换策略
-              <select id="strategy-select">
-                <option value="sticky">粘性优先 + 故障转移</option>
-                <option value="round-robin">严格轮询（均摊额度）</option>
+              调度模式
+              <select id="mode-select">
+                <option value="max-cache">最大缓存（会话不迁移）</option>
+                <option value="balanced">平衡（额度耗尽可滑动）</option>
               </select>
             </label>
             <label class="field inline">
-              粘性当前账号
-              <select id="active-account-select">
-                <option value="">自动首选</option>
-              </select>
+              最小可用积分
+              <input id="credits-threshold-input" type="number" min="0" step="10" value="100" style="width:96px;">
             </label>
+            <span class="small muted">最小可用积分：低于此值冻结该账号</span>
+            <button id="btn-refresh-credits" class="ghost sm">立即刷新额度</button>
             <button id="btn-add" class="primary sm">+ 新增账号</button>
             <button id="btn-refresh-accounts" class="ghost sm">刷新</button>
           </div>
@@ -182,7 +185,7 @@
         <div id="proxy-detail-kv" class="kv"></div>
       </section>
 
-      <!-- 2.2 多账号调度策略与故障冷却池 -->
+      <!-- 2.2 故障转移与冷却池监控 -->
       <section class="panel">
         <div class="panel-head">
           <h2><span>🛡️</span> 故障转移与冷却池监控</h2>
@@ -381,12 +384,13 @@
                 <th>调用账号</th>
                 <th>客户端密钥</th>
                 <th>Tokens (入/出)</th>
+                <th>缓存率</th>
                 <th>输入/输出摘要</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody id="requests-table-body">
-              <tr><td colspan="10" class="muted">暂无请求记录</td></tr>
+              <tr><td colspan="11" class="muted">暂无请求记录</td></tr>
             </tbody>
           </table>
         </div>
@@ -467,6 +471,89 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- ═══════════ Tab 5: 用量洞察 (第五栏) ═══════════ -->
+    <div id="tab-insights" class="tab-pane">
+      <!-- 5.1 用量总览 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>🔍</span> 用量洞察总览</h2>
+          <div class="panel-actions">
+            <span id="insight-mode-badge" class="badge">调度模式 —</span>
+            <button id="btn-insights-refresh" class="ghost sm">刷新</button>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-label">总请求数</span>
+            <span id="insight-stat-requests" class="stat-num">0</span>
+            <span class="stat-sub">覆盖 Session: <b id="insight-stat-sessions">0</b></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">总 Token</span>
+            <span id="insight-stat-total-tokens" class="stat-num">0</span>
+            <span class="stat-sub">精确值 <b id="insight-stat-total-tokens-exact">0</b></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">输入 Token</span>
+            <span id="insight-stat-prompt-tokens" class="stat-num">0</span>
+            <span class="stat-sub">精确值 <b id="insight-stat-prompt-tokens-exact">0</b></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">输出 Token</span>
+            <span id="insight-stat-completion-tokens" class="stat-num">0</span>
+            <span class="stat-sub">精确值 <b id="insight-stat-completion-tokens-exact">0</b></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">缓存命中 Token</span>
+            <span id="insight-stat-cached-tokens" class="stat-num">0</span>
+            <span class="stat-sub">精确值 <b id="insight-stat-cached-tokens-exact">0</b></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">缓存命中率</span>
+            <span id="insight-stat-cache-hit-rate" class="stat-num">0%</span>
+            <span class="stat-sub">命中 <b id="insight-stat-cache-hit-cached">0</b> / 输入 <b id="insight-stat-cache-hit-input">0</b></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">覆盖账号数</span>
+            <span id="insight-stat-accounts" class="stat-num">0</span>
+            <span class="stat-sub">有请求记录的账号</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5.2 各账号用量明细 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>📈</span> 各账号用量明细</h2>
+          <div class="panel-actions">
+            <button id="btn-insights-reset-all" class="ghost sm danger">清空统计</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="insight-table">
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>请求数</th>
+                <th>Session 数</th>
+                <th>输入</th>
+                <th>输出</th>
+                <th>缓存命中</th>
+                <th>命中率</th>
+                <th>总 Token</th>
+                <th>最近使用</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="insights-table-body">
+              <tr><td colspan="10" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p id="insights-empty" class="muted hidden pad">还没有任何用量记录。发一次请求后这里就会出现统计。</p>
+      </section>
     </div>
   </main>
 </div>

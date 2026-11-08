@@ -223,6 +223,81 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 .card-metrics b { color: var(--fg); font-weight: 500; }
 .card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
 
+/* 账号卡片上的优先级编辑行 */
+.card-priority {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+.card-priority .prio-input {
+  width: 68px;
+  padding: 4px 8px;
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ───────── 用量洞察面板 ───────── */
+.insight-table td { vertical-align: middle; }
+.insight-table .share-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 130px;
+}
+.insight-table .share-cell > span:first-child { font-weight: 600; }
+
+/* 纯 CSS 渐变横条（不引第三方库） */
+.mini-bar {
+  display: block;
+  height: 6px;
+  min-width: 70px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.mini-bar > i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+}
+.mini-bar.ok > i { background: linear-gradient(90deg, rgba(63,185,80,.45), var(--ok)); }
+.mini-bar.warn > i { background: linear-gradient(90deg, rgba(210,153,34,.45), var(--warn)); }
+.mini-bar.err > i { background: linear-gradient(90deg, rgba(248,81,73,.45), var(--err)); }
+
+/* 每个账号行下面展开的「按模型 / 按天」小节 */
+.insight-detail-row td {
+  background: var(--bg);
+  padding: 14px 18px 16px;
+}
+.insight-detail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 18px;
+}
+.insight-detail-col h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  font-weight: 600;
+}
+.sub-table {
+  font-size: 12px;
+  width: 100%;
+}
+.sub-table th {
+  padding: 6px 8px;
+  font-size: 11px;
+  background: transparent;
+}
+.sub-table td {
+  padding: 5px 8px;
+}
+.sub-table .bar-cell { width: 90px; }
+.sub-table .bar-cell .mini-bar { min-width: 60px; }
+
 /* ───────── 按钮与输入 ───────── */
 button {
   font: inherit;
@@ -331,7 +406,7 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   flex-direction: column;
   box-shadow: 0 10px 30px rgba(0,0,0,0.5);
 }
-.modal-card.large { max-width: 860px; }
+.modal-card.large { max-width: 1180px; }
 .modal-head {
   display: flex;
   align-items: center;
@@ -347,6 +422,48 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* ───────── 请求详情：横向三栏（请求 / 中转 / 输出） ───────── */
+.req-cols {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+}
+.req-col {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.req-col > h4 {
+  margin: 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  color: var(--fg-dim);
+}
+.req-col-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* 详情里的键值表（上游地址 / token 数 / 首字符时间 …） */
+.req-kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 10px;
+  font-size: 12px;
+}
+.req-kv dt { color: var(--fg-dim); white-space: nowrap; }
+.req-kv dd { margin: 0; word-break: break-all; }
+/* 窄屏（平板 / 手机）三栏塌成一栏 —— 横向滚动比挤成一团好读。 */
+@media (max-width: 980px) {
+  .req-cols { grid-template-columns: 1fr; }
 }
 
 .usercode {

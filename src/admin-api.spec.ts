@@ -10,6 +10,7 @@ import { KeyRegistry } from './keys.js';
 import { SessionStore, ensureAdminKey } from './admin.js';
 import { RequestStore } from './requests.js';
 import { SchedulerService } from './scheduler.js';
+import { InsightsLedger } from './insights.js';
 import type { Adapter } from 'waygate-core';
 
 let root = '';
@@ -36,6 +37,7 @@ describe('Admin API: 新增功能路由测试', () => {
     const sessions = new SessionStore();
     const requests = new RequestStore(join(root, 'requests.json'));
     const scheduler = new SchedulerService(pool, { configPath: join(root, 'scheduler.json') });
+    const insights = new InsightsLedger({ filePath: join(root, 'insights.json') });
 
     const adapter: Adapter = {
       command: 'mmcode',
@@ -66,6 +68,7 @@ describe('Admin API: 新增功能路由测试', () => {
       proxyStatus: () => ({ port: 8789, upstream: 'test', accounts: 0, available: 0 }),
       requests,
       scheduler,
+      insights,
     });
 
     const server = createServer(async (req, res) => {
@@ -118,6 +121,7 @@ describe('Admin API: 新增功能路由测试', () => {
       requests,
       scheduler,
       pool,
+      insights,
       req,
       close: () => new Promise<void>((done) => server.close(() => done())),
     };
@@ -205,6 +209,101 @@ describe('Admin API: 新增功能路由测试', () => {
       expect(models.status).toBe(200);
       expect(models.body.models.length).toBe(1);
       expect(models.body.models[0].id).toBe('MiniMax-M3');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('★ GET & POST /admin/api/config：调度模式与额度阈值', async () => {
+    const ctx = await setupServer();
+    try {
+      const before = await ctx.req('/admin/api/config');
+      expect(before.status).toBe(200);
+      expect(before.body.mode).toBe('max-cache');
+      expect(before.body.creditsThreshold).toBe(100);
+
+      const updated = await ctx.req('/admin/api/config', {
+        method: 'POST',
+        body: { mode: 'balanced', creditsThreshold: 250 },
+      });
+      expect(updated.status).toBe(200);
+      expect(updated.body.mode).toBe('balanced');
+      expect(updated.body.creditsThreshold).toBe(250);
+
+      const after = await ctx.req('/admin/api/config');
+      expect(after.body.mode).toBe('balanced');
+      expect(after.body.creditsThreshold).toBe(250);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('★ PATCH /admin/api/accounts/:name 改优先级与冻结', async () => {
+    const ctx = await setupServer();
+    try {
+      await ctx.req('/admin/api/accounts', { method: 'POST', body: { name: 'a1', region: 'cn' } });
+
+      const patched = await ctx.req('/admin/api/accounts/a1', {
+        method: 'PATCH',
+        body: { priority: 3 },
+      });
+      expect(patched.status).toBe(200);
+      expect(patched.body.account.priority).toBe(3);
+
+      const frozen = await ctx.req('/admin/api/accounts/a1', {
+        method: 'PATCH',
+        body: { frozen: true, frozenReason: '手动冻结' },
+      });
+      expect(frozen.body.account.frozen).toBe(true);
+
+      const thawed = await ctx.req('/admin/api/accounts/a1', {
+        method: 'PATCH',
+        body: { frozen: false },
+      });
+      expect(thawed.body.account.frozen).toBe(false);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('★ GET /admin/api/insights 给出各账号 token 用量', async () => {
+    const ctx = await setupServer();
+    try {
+      ctx.insights.record({
+        account: 'a1',
+        model: 'MiniMax-M3',
+        promptTokens: 100,
+        completionTokens: 20,
+        cachedTokens: 30,
+      });
+
+      const res = await ctx.req('/admin/api/insights');
+      expect(res.status).toBe(200);
+      expect(res.body.accounts.length).toBe(1);
+      expect(res.body.accounts[0].name).toBe('a1');
+      expect(res.body.accounts[0].totalTokens).toBe(120);
+      expect(res.body.totals.requests).toBe(1);
+
+      const reset = await ctx.req('/admin/api/insights/reset', { method: 'POST', body: {} });
+      expect(reset.status).toBe(200);
+      const after = await ctx.req('/admin/api/insights');
+      expect(after.body.accounts.length).toBe(0);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('POST /admin/api/credits/refresh 刷新余额（未登录账号标记失败但不影响整体）', async () => {
+    const ctx = await setupServer();
+    try {
+      await ctx.req('/admin/api/accounts', { method: 'POST', body: { name: 'a1', region: 'cn' } });
+      const res = await ctx.req('/admin/api/credits/refresh', { method: 'POST', body: {} });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(res.body.results.length).toBe(1);
+      expect(res.body.results[0].account).toBe('a1');
+      /* 没登录 → 取不到余额 → 标记失败（而不是抛错中断整个刷新）。 */
+      expect(res.body.results[0].ok).toBe(false);
     } finally {
       await ctx.close();
     }

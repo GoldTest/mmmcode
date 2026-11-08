@@ -62,13 +62,13 @@ function sseResponse(): Response {
 }
 
 /** 造一个带 N 个已登录账号的适配器。 */
-function makeAdapter(names: string[]) {
+function makeAdapter(names: string[], mode: 'max-cache' | 'balanced' = 'balanced') {
   const store = new AccountStore();
   for (const n of names) {
     seed(n);
     store.upsert(n, 'cn');
   }
-  store.setActive(names[0] ?? '');
+  store.setMode(mode);
   const pool = new AccountPool(store);
   const adapter = createMmcodeAdapter({ pool, log: () => {} });
   return { store, pool, adapter };
@@ -77,7 +77,7 @@ function makeAdapter(names: string[]) {
 const BODY = { model: 'MiniMax-M3', messages: [{ role: 'user' as const, content: 'hi' }] };
 
 describe('自动换号', () => {
-  it('★ 第一个号 401 → 自动换第二个号并成功返回', async () => {
+  it('★ 随机选中的号 401 → 自动换另一个号并成功返回', async () => {
     const { store, adapter } = makeAdapter(['a1', 'a2']);
     let calls = 0;
     vi.stubGlobal(
@@ -92,13 +92,14 @@ describe('自动换号', () => {
     expect(result.status).toBe(200);
     expect(calls).toBe(2);
 
-    /* 坏号被标记为 unauthorized 并进入冷却 —— 不会被反复撞。 */
-    const a1 = store.get('a1')!;
-    expect(a1.health).toBe('unauthorized');
-    expect(a1.disabledUntil).toBeGreaterThan(Date.now());
+    /* 恰好一个号被标记为 unauthorized 并进入冷却 —— 不会被反复撞。
+       （新模型里选号是**随机**的，不能假定一定是 a1 先被试。） */
+    const bad = ['a1', 'a2'].filter((n) => store.get(n)!.health === 'unauthorized');
+    expect(bad).toHaveLength(1);
+    expect(store.get(bad[0]!)!.disabledUntil).toBeGreaterThan(Date.now());
   });
 
-  it('429 → 换号', async () => {
+  it('429 → 换号，且该号额度被冻结', async () => {
     const { store, adapter } = makeAdapter(['a1', 'a2']);
     let calls = 0;
     vi.stubGlobal(
@@ -110,7 +111,10 @@ describe('自动换号', () => {
     );
     const result = await adapter.chat(BODY, new AbortController().signal);
     expect(result.status).toBe(200);
-    expect(store.get('a1')!.health).toBe('rate_limited');
+    const limited = ['a1', 'a2'].filter((n) => store.get(n)!.health === 'rate_limited');
+    expect(limited).toHaveLength(1);
+    /* 429 = 额度耗尽 → 冻结，不参与后续调度。 */
+    expect(store.get(limited[0]!)!.frozen).toBe(true);
   });
 
   it('★ 5xx 不换号（上游整体故障，换号只会把好号也标记掉）', async () => {
@@ -172,5 +176,21 @@ describe('自动换号', () => {
     );
     await expect(adapter.chat(BODY, ac.signal)).rejects.toThrow();
     expect(store.get('a1')!.health).not.toBe('error');
+  });
+
+  it('★ 最大缓存模式：账号 401 时**不迁移**，直接报错说清楚', async () => {
+    const { adapter } = makeAdapter(['a1', 'a2'], 'max-cache');
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls += 1;
+        return new Response('unauthorized', { status: 401 });
+      }),
+    );
+
+    await expect(adapter.chat(BODY, new AbortController().signal)).rejects.toThrow(/最大缓存|重新授权/);
+    /* 只试了绑定的那一个号 —— 没有换到第二个号。 */
+    expect(calls).toBe(1);
   });
 });

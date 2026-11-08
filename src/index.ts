@@ -14,6 +14,7 @@ import { createMmcodeAdapter } from './adapter.js';
 import { AccountStore } from './accounts.js';
 import { AccountPool } from './pool.js';
 import { KeyRegistry } from './keys.js';
+import { InsightsLedger } from './insights.js';
 import { DEFAULT_WEB_PORT, runServeCommand, runWebCommand } from './web-cli.js';
 
 /* 版本从 package.json 读 —— 硬编码会与 npm 发布版本漂移（已踩过：package 升 0.1.2 而 CLI 仍显示 0.1.0）。 */
@@ -37,14 +38,31 @@ const pool = new AccountPool(store, { log });
  */
 const keys = new KeyRegistry();
 
-const adapter = createMmcodeAdapter({ pool, keys, log });
+/**
+ * 用量台账 —— 洞察面板的数据源。
+ *
+ * 适配器在**响应流里**把 usage 摘出来记到这里（账号级真实消耗），
+ * 管理页通过 `/admin/api/insights` 读取。
+ */
+const insights = new InsightsLedger();
+
+/* 退出前把台账落盘 —— 落盘是节流的（2 秒），否则最后几条统计会丢。 */
+process.on('exit', () => {
+  try {
+    insights.flush();
+  } catch {
+    /* 退出阶段不再抛错。 */
+  }
+});
+
+const adapter = createMmcodeAdapter({ pool, keys, log, insights });
 
 const argv = process.argv.slice(2);
 
 /* `web` 是本仓自带的**统一服务**（反代 + 管理页 + 管理 API）——
    core 的 CLI 不认识它，所以在这里分流，不走 runCli。 */
 if (argv[0] === 'web') {
-  const code = await runWebCommand({ argv: argv.slice(1), adapter, pool, keys, version: VERSION });
+  const code = await runWebCommand({ argv: argv.slice(1), adapter, pool, keys, insights, version: VERSION });
   process.exit(code);
 }
 

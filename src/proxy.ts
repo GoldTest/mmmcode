@@ -21,6 +21,13 @@ import { startServer, toAnthropicErrorBody, type Adapter } from 'waygate-core';
 import { maskInboundKey, type KeyRegistry } from './keys.js';
 import type { RequestStore } from './requests.js';
 import type { AccountPool } from './pool.js';
+import {
+  CTX_FIELD,
+  encodeSentinel,
+  findExplicitSessionId,
+  type RequestContext,
+} from './session.js';
+import { cacheHitRate } from './protocol/usage.js';
 
 /** 内部密钥：只在本机环回端口上用。 */
 export const INTERNAL_KEY = randomBytes(32).toString('hex');
@@ -51,10 +58,37 @@ function sendAnthropicError(res: ServerResponse, status: number, message: string
   res.end(text);
 }
 
-/** 本请求是否走 Anthropic 出口（决定错误体形状）。 */
+/** 该请求是否走 Anthropic 出口（决定错误体形状）。 */
 function isAnthropicRoute(path: string): boolean {
   const route = path.startsWith('/v1/') ? path.slice(3) : path;
   return route === '/messages';
+}
+
+/** 该请求是否是**聊天**端点（只有聊天端点才需要注入 session 上下文）。 */
+function isChatRoute(path: string, method: string | undefined): boolean {
+  if (method !== 'POST') return false;
+  const route = path.startsWith('/v1/') ? path.slice(3) : path;
+  return route === '/chat/completions' || route === '/messages';
+}
+
+/**
+ * 把上下文塞进 Anthropic 请求的 `system`。
+ *
+ * core 的 Anthropic 入站归一会**丢弃未识别的顶层字段**，只认 `system` / `messages` /
+ * `tools` 等 —— 所以 Anthropic 路线只能借 `system` 传上下文。哨兵会在适配器侧被摘掉，
+ * 绝不会发到上游。
+ */
+function injectSystemSentinel(system: unknown, ctx: RequestContext): string {
+  const sentinel = encodeSentinel(ctx);
+  if (typeof system === 'string' && system.trim()) return `${sentinel}\n\n${system}`;
+  if (Array.isArray(system)) {
+    const text = system
+      .filter((b): b is { text: string } => !!b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string')
+      .map((b) => b.text)
+      .join('\n');
+    return text ? `${sentinel}\n\n${text}` : sentinel;
+  }
+  return sentinel;
 }
 
 /**
@@ -121,15 +155,19 @@ export function createProxyForwarder(
     }
     maybeMark(provided);
 
-    /* 缓冲请求体用于详情查看。 */
+    /* 缓冲请求体：既用于详情查看，也要往里注入 session 上下文。 */
     const reqChunks: Buffer[] = [];
     req.on('data', (chunk) => {
       reqChunks.push(chunk as Buffer);
     });
 
-    /* 转发到内部 core 服务器，并把鉴权头换成内部密钥。 */
+    /* 转发到内部 core 服务器，并把鉴权头换成内部密钥。
+       ⚠️ 删掉 content-length —— 注入上下文后长度会变，而 http.request 是在**创建时**
+       就把 headers 固化下来的。删掉后 Node 自动走 chunked 编码，内层照样收得全。 */
     const headers: Record<string, string | string[] | undefined> = { ...req.headers, host: `127.0.0.1:${innerPort}` };
     delete headers['x-api-key'];
+    delete headers['content-length'];
+    delete headers['transfer-encoding'];
     headers.authorization = `Bearer ${INTERNAL_KEY}`;
 
     const preq = httpRequest(
@@ -143,7 +181,10 @@ export function createProxyForwarder(
 
         const resChunks: Buffer[] = [];
         let resBytes = 0;
+        /** 首字节时刻 —— 用于算「首字符时间」。 */
+        let firstByteAt: number | null = null;
         pres.on('data', (chunk) => {
+          if (firstByteAt === null) firstByteAt = Date.now();
           if (resBytes < 4 * 1024 * 1024) {
             resChunks.push(chunk as Buffer);
             resBytes += chunk.length;
@@ -169,7 +210,15 @@ export function createProxyForwarder(
 
           let responseText = '';
           let finishReason: string | undefined;
-          let usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
+          let usage:
+            | {
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                total_tokens?: number;
+                cached_tokens?: number;
+                cache_hit_rate?: number;
+              }
+            | undefined;
           let toolCalls: unknown[] | undefined;
           let errorMsg: string | undefined;
 
@@ -226,7 +275,31 @@ export function createProxyForwarder(
             }
           }
 
-          const accountUsed = pool?.getLastUsedAccount() ?? null;
+          /* 缓存命中与命中率的**权威值**来自适配器（它看得到上游原始 usage）。
+             Anthropic 路线经 core 重编码成 Anthropic 事件帧时缓存字段会被丢掉 ——
+             只有适配器那一层还留着，所以这里用它补齐。 */
+          const recorded = pool?.getRequestUsage(reqId);
+          if (recorded) {
+            usage = {
+              prompt_tokens: recorded.promptTokens,
+              completion_tokens: recorded.completionTokens,
+              total_tokens: recorded.totalTokens,
+              cached_tokens: recorded.cachedTokens,
+              cache_hit_rate: cacheHitRate(recorded.cachedTokens, recorded.promptTokens),
+            };
+          } else if (usage) {
+            const details = (usage as unknown as { prompt_tokens_details?: { cached_tokens?: number } })
+              .prompt_tokens_details;
+            const cached = usage.cached_tokens ?? details?.cached_tokens ?? 0;
+            usage = {
+              ...usage,
+              cached_tokens: cached,
+              cache_hit_rate: cacheHitRate(cached, usage.prompt_tokens ?? 0),
+            };
+          }
+
+          /* 实际服务的账号：适配器按 reqId 记下的（并发下比「最近使用」准确）。 */
+          const accountUsed = pool?.getRequestAccount(reqId) ?? pool?.getLastUsedAccount() ?? null;
 
           requests.add({
             id: reqId,
@@ -241,6 +314,10 @@ export function createProxyForwarder(
             stream: isStream,
             status: statusCode,
             durationMs,
+            /** 首字符时间：收到请求 → 第一个响应字节。 */
+            firstByteMs: firstByteAt === null ? null : firstByteAt - startTime,
+            /** 中转：上游地址 / 账号 / 转译后实际发给上游的请求体。 */
+            transit: pool?.getRequestTransit(reqId) ?? null,
             account: accountUsed,
             input: parsedInput
               ? {
@@ -286,7 +363,7 @@ export function createProxyForwarder(
           stream: false,
           status: 502,
           durationMs: Date.now() - startTime,
-          account: pool?.getLastUsedAccount() ?? null,
+          account: pool?.getRequestAccount(reqId) ?? pool?.getLastUsedAccount() ?? null,
           error: `反代内部错误：${err.message}`,
         });
       }
@@ -306,7 +383,36 @@ export function createProxyForwarder(
       if (!res.writableEnded) preq.destroy();
     });
 
-    req.pipe(preq);
+    /* 请求体收齐后再转发 —— 中间要把 session 上下文注进去。
+       （不能边收边转：注入要改 body 长度，而 http.request 的 headers 已固化。） */
+    req.on('end', () => {
+      const raw = Buffer.concat(reqChunks);
+      let out = raw;
+      if (isChatRoute(path, req.method) && raw.length > 0) {
+        try {
+          const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const ctx: RequestContext = {
+              sessionId: findExplicitSessionId(req.headers, parsed),
+              keyId: keyId ?? undefined,
+              reqId,
+            };
+            if (isAnthropicRoute(path)) {
+              /* Anthropic 路线：走 system 哨兵（core 会丢弃未知顶层字段）。 */
+              parsed.system = injectSystemSentinel(parsed.system, ctx);
+            } else {
+              /* OpenAI 路线：core 保留未知顶层字段，直接塞字段即可。 */
+              parsed[CTX_FIELD] = ctx;
+            }
+            out = Buffer.from(JSON.stringify(parsed), 'utf8');
+          }
+        } catch {
+          /* 不是合法 JSON —— 原样转发，让内层去报错。 */
+        }
+      }
+      if (out.length > 0) preq.write(out);
+      preq.end();
+    });
   };
 }
 

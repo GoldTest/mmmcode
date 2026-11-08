@@ -21,6 +21,20 @@ export interface RequestRecord {
   stream: boolean;
   status: number;
   durationMs: number;
+  /**
+   * 首字符时间（ms）—— 从收到请求到**第一个响应字节**。
+   *
+   * 与 `durationMs`（整段耗时）的差别：流式响应里，客户端等的是「第一句话什么时候来」，
+   * 那才是体感上的快慢；总耗时还包含了把整段话吐完的时间。
+   * 非流式 / 没拿到响应体时为 null。
+   */
+  firstByteMs?: number | null;
+  /**
+   * 中转信息 —— 反代内部把入站请求**转译成上游协议**后的情况。
+   *
+   * 排查「为什么上游收到的东西和我发的不一样」时要看这里。
+   */
+  transit?: RequestTransit | null;
   account?: string | null;
   input?: {
     messages?: Array<{ role: string; content: unknown }>;
@@ -33,12 +47,37 @@ export interface RequestRecord {
   output?: {
     text?: string;
     toolCalls?: unknown[];
-    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      /** 缓存命中（读）的 token 数。 */
+      cached_tokens?: number;
+      /** 缓存命中率（0–1）= cached_tokens / prompt_tokens。 */
+      cache_hit_rate?: number;
+    };
     finish_reason?: string;
     error?: string;
     raw?: unknown;
   } | null;
   error?: string | null;
+}
+
+/**
+ * 中转信息 —— 反代内部把入站请求转译成**上游协议**后发出去的东西。
+ *
+ * 入站是 OpenAI 或 Anthropic 形状，出站统一是 Anthropic 兼容形状 —— 中间这层翻译
+ * 是最容易出「我发的和我以为的不一样」的地方，所以把它记下来给人看。
+ */
+export interface RequestTransit {
+  /** 上游地址（不含任何令牌）。 */
+  upstream: string;
+  /** 实际服务这次请求的账号。 */
+  account: string | null;
+  /** 出站协议（当前只有 Anthropic 兼容）。 */
+  protocol: string;
+  /** 转译后**实际发给上游**的请求体。 */
+  payload?: unknown;
 }
 
 export interface RequestStoreConfig {

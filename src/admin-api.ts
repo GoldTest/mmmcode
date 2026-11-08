@@ -23,8 +23,11 @@
  *   POST   /admin/api/accounts/:name/checkin  签到
  *   GET    /admin/api/accounts/:name/credits  积分账本
  *   GET    /admin/api/accounts/:name/doctor   单账号体检
- *   GET    /admin/api/config              总体配置（策略/粘性账号/入站密钥打码）
- *   POST   /admin/api/config              { strategy?, active? }
+ *   GET    /admin/api/config              总体配置（调度模式/优先级分层/额度阈值/入站密钥打码）
+ *   POST   /admin/api/config              { mode?, creditsThreshold? }
+ *   GET    /admin/api/insights             用量洞察：各账号 token 消耗（输入/输出/缓存命中）
+ *   POST   /admin/api/insights/reset      { name? } → 清空统计（不带 name = 全清）
+ *   POST   /admin/api/credits/refresh     立即刷新各账号余额（按阈值冻结/解冻）
  *   POST   /admin/api/admin-key           { currentKey, newKey } → 改管理密钥
  *   GET    /admin/api/proxy                反代运行状态
  */
@@ -41,9 +44,10 @@ import {
   SessionStore,
   verifyAdminKey,
 } from './admin.js';
-import { AccountStore, DEFAULT_ACCOUNT_NAME, resolveAccountDir, type PoolStrategy } from './accounts.js';
+import { AccountStore, DEFAULT_ACCOUNT_NAME, resolveAccountDir, type PoolMode } from './accounts.js';
 import { AccountPool, type PoolAccount } from './pool.js';
 import { maskInboundKey, type KeyRegistry } from './keys.js';
+import type { InsightsLedger } from './insights.js';
 import {
   credentialPath,
   loginStatePath,
@@ -53,6 +57,7 @@ import {
   type MinimaxRegion,
 } from './credential.js';
 import { MinimaxActivity } from './activity.js';
+import { refreshCreditsForAll } from './credits-refresh.js';
 import { CredentialError } from './errors.js';
 import type { RequestStore } from './requests.js';
 import type { SchedulerService } from './scheduler.js';
@@ -76,6 +81,8 @@ export interface AdminApiContext {
   proxyStatus: () => { port: number; upstream: string; accounts: number; available: number; baseUrl?: string };
   requests?: RequestStore;
   scheduler?: SchedulerService;
+  /** 用量台账（洞察面板的数据源）。 */
+  insights?: InsightsLedger;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -127,10 +134,17 @@ function clearSessionCookie(res: ServerResponse): void {
 /** 账号对外视图（**绝不回显令牌**）。 */
 function accountView(a: PoolAccount): Record<string, unknown> {
   const cooling = typeof a.record.disabledUntil === 'number' && a.record.disabledUntil > Date.now();
+  const frozen = a.record.frozen === true;
   return {
     name: a.record.name,
     region: a.record.region,
     enabled: a.record.enabled,
+    /** 优先级层（数字越小越优先）。 */
+    priority: a.record.priority,
+    /** 额度冻结中（不参与调度）。 */
+    frozen,
+    frozenReason: a.record.frozenReason ?? null,
+    frozenUntil: a.record.frozenUntil ?? null,
     loggedIn: a.credential !== null,
     account: a.credential?.account ?? null,
     tokenExpiresAt: a.credential?.expiresAt ?? null,
@@ -226,8 +240,8 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const accounts = ctx.pool.refresh().map(accountView);
         sendJson(res, 200, {
           accounts,
-          strategy: store.strategy(),
-          active: store.activeName(),
+          mode: store.mode(),
+          creditsThreshold: store.creditsThreshold(),
         });
         return true;
       }
@@ -319,13 +333,27 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const name = decodeURIComponent(accountMatch[1] ?? '');
         const action = accountMatch[2] ?? '';
 
-        /* 更新（启用/停用、备注、区域） */
+        /* 更新（启用/停用、备注、区域、优先级） */
         if (!action && method === 'PATCH') {
           const body = await readJsonBody(req);
           const patch: Record<string, unknown> = {};
           if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
           if (typeof body.notes === 'string') patch.notes = body.notes.slice(0, 500);
           if (body.region === 'global' || body.region === 'cn') patch.region = body.region;
+          /* 优先级层：数字越小越优先。 */
+          if (typeof body.priority === 'number' && Number.isFinite(body.priority)) {
+            patch.priority = Math.max(0, Math.min(99, Math.trunc(body.priority)));
+          }
+          /* 额度冻结可手动解除。 */
+          if (body.frozen === false) {
+            patch.frozen = false;
+            patch.frozenReason = undefined;
+            patch.frozenUntil = undefined;
+          } else if (body.frozen === true) {
+            patch.frozen = true;
+            patch.frozenReason = typeof body.frozenReason === 'string' ? body.frozenReason.slice(0, 300) : '手动冻结';
+            patch.frozenUntil = undefined;
+          }
           /* 账号可能已存在于磁盘但还没登记进注册表 —— 先 upsert 再改，
              否则「停用一个刚建好的账号」会 404（upsert 不覆盖已有状态）。 */
           store.upsert(name, body.region === 'global' || body.region === 'cn' ? body.region : undefined);
@@ -456,12 +484,15 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
       /* ── 总体配置 ── */
       if (route === 'config' && method === 'GET') {
         const accounts = ctx.pool.refresh();
+        const tiers = ctx.pool.tiers().map((tier) => tier.map((a) => a.record.name));
         sendJson(res, 200, {
-          strategy: store.strategy(),
-          active: store.activeName(),
+          mode: store.mode(),
+          creditsThreshold: store.creditsThreshold(),
+          tiers,
           apiKeyMasked: maskAdminKey(ctx.apiKey),
           accounts: accounts.length,
           available: ctx.pool.available().length,
+          sessions: Object.values(ctx.pool.sessionCounts()).reduce((s, n) => s + n, 0),
           adminKeyPath: adminKeyPath(),
           proxy: ctx.proxyStatus(),
           version: ctx.version,
@@ -478,17 +509,17 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
 
       if (route === 'config' && method === 'POST') {
         const body = await readJsonBody(req);
-        if (body.strategy === 'sticky' || body.strategy === 'round-robin') {
-          store.setStrategy(body.strategy as PoolStrategy);
+        if (body.mode === 'max-cache' || body.mode === 'balanced') {
+          store.setMode(body.mode as PoolMode);
         }
-        if (typeof body.active === 'string' && body.active) {
-          if (!ctx.pool.get(body.active)) {
-            sendJson(res, 404, { error: `没有账号 [${body.active}]` });
-            return true;
-          }
-          store.setActive(body.active);
+        if (typeof body.creditsThreshold === 'number' && Number.isFinite(body.creditsThreshold)) {
+          store.setCreditsThreshold(body.creditsThreshold);
         }
-        sendJson(res, 200, { ok: true, strategy: store.strategy(), active: store.activeName() });
+        sendJson(res, 200, {
+          ok: true,
+          mode: store.mode(),
+          creditsThreshold: store.creditsThreshold(),
+        });
         return true;
       }
 
@@ -597,6 +628,51 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           search,
         });
         sendJson(res, 200, data);
+        return true;
+      }
+
+      /* ── 洞察：各账号 token 用量台账 ── */
+      if (route === 'insights' && method === 'GET') {
+        const ledger = ctx.insights;
+        sendJson(res, 200, {
+          accounts: ledger ? ledger.snapshot() : [],
+          totals: ledger
+            ? ledger.totals()
+            : {
+                accounts: 0,
+                requests: 0,
+                sessions: 0,
+                promptTokens: 0,
+                completionTokens: 0,
+                cachedTokens: 0,
+                totalTokens: 0,
+              },
+          /* 当前各账号绑定的 session 数（调度侧视角）。 */
+          sessions: ctx.pool.sessionCounts(),
+          mode: store.mode(),
+          creditsThreshold: store.creditsThreshold(),
+        });
+        return true;
+      }
+
+      /* ── 洞察：清空统计 ── */
+      if (route === 'insights/reset' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const name = typeof body.name === 'string' ? body.name : '';
+        if (!ctx.insights) {
+          sendJson(res, 200, { ok: true, note: '台账未启用' });
+          return true;
+        }
+        if (name) ctx.insights.resetAccount(name);
+        else ctx.insights.resetAll();
+        sendJson(res, 200, { ok: true });
+        return true;
+      }
+
+      /* ── 额度：立即刷新所有账号余额（并按阈值冻结/解冻） ── */
+      if (route === 'credits/refresh' && method === 'POST') {
+        const results = await refreshCreditsForAll(ctx.pool, ctx.log);
+        sendJson(res, 200, { ok: true, results });
         return true;
       }
 

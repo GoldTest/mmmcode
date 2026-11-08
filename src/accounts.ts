@@ -64,6 +64,24 @@ export interface AccountRecord {
   region: MinimaxRegion;
   /** 是否参与自动切换（关掉 = 保留账号但不参与反代轮换）。 */
   enabled: boolean;
+  /**
+   * 优先级层 —— **数字越小越优先**（0 = 最高层）。
+   *
+   * 新 session 只在「最高层里还有可用账号」时分配到那一层；该层全被冻结 / 冷却
+   * 了才下沉到下一层。**同层之内没有先后顺序** —— 可用账号之间随机分配。
+   */
+  priority: number;
+  /**
+   * 额度冻结 —— 余额低于阈值时置位，该账号**不参与调度**。
+   *
+   * 与 `disabledUntil`（冷却）是两回事：冷却是「暂时别碰我」，冻结是
+   * 「我真没额度了」。冻结由余额刷新（达标即解冻）或 429 触发。
+   */
+  frozen?: boolean;
+  /** 冻结原因（人话，展示用）。 */
+  frozenReason?: string;
+  /** 冻结自愈时刻 —— 有值则到点自动回池；为空 = 无限期冻结（等余额刷新解冻）。 */
+  frozenUntil?: number;
   createdAt: number;
   updatedAt: number;
   health: AccountHealth;
@@ -80,18 +98,29 @@ export interface AccountRecord {
   notes?: string;
 }
 
-/** 账号切换策略。 */
-export type PoolStrategy = 'sticky' | 'round-robin';
+/**
+ * 调度模式（全局一个开关，所有优先级层统一生效）。
+ *
+ *   · `max-cache`（最大缓存）：session 一旦绑定某账号就**永不迁移** ——
+ *     最大化上游提示词缓存命中（同账号才有缓存）。
+ *   · `balanced`（平衡）：绑定期间行为同 max-cache；但当该账号额度耗尽 /
+ *     不可用时，session **无缝滑到**别的可用账号上。
+ */
+export type PoolMode = 'max-cache' | 'balanced';
 
 export interface AccountsFile {
   version: number;
-  /** 粘性策略下的当前账号。 */
-  active: string | null;
-  strategy: PoolStrategy;
+  /** 全局调度模式。 */
+  mode: PoolMode;
+  /** 最小可用积分 —— 余额低于它就把账号**冻结**（不参与调度）。 */
+  creditsThreshold: number;
   accounts: AccountRecord[];
 }
 
-const FILE_VERSION = 1;
+const FILE_VERSION = 2;
+
+/** 默认最小可用积分（余额低于它即冻结）。 */
+export const DEFAULT_CREDITS_THRESHOLD = 100;
 
 /* ─────────────────────── 路径 ─────────────────────── */
 
@@ -175,26 +204,45 @@ export class AccountStore {
   }
 
   private load(): AccountsFile {
-    const empty: AccountsFile = { version: FILE_VERSION, active: null, strategy: 'sticky', accounts: [] };
+    const empty: AccountsFile = {
+      version: FILE_VERSION,
+      mode: 'max-cache',
+      creditsThreshold: DEFAULT_CREDITS_THRESHOLD,
+      accounts: [],
+    };
     if (!existsSync(this.filePath)) {
       /* 首次：把磁盘上已有的账号目录**自动登记**进来 —— 用户此前用 mmmcode.sh
          建的账号不该因为换了注册表就「消失」。 */
       const discovered = this.discoverOnDisk();
       const seeded: AccountsFile = { ...empty, accounts: discovered };
       if (discovered.length > 0) {
-        seeded.active = discovered[0]?.name ?? null;
         this.writeFile(seeded);
       }
       return seeded;
     }
     try {
-      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as AccountsFile;
-      return {
-        version: parsed.version ?? FILE_VERSION,
-        active: typeof parsed.active === 'string' ? parsed.active : null,
-        strategy: parsed.strategy === 'round-robin' ? 'round-robin' : 'sticky',
-        accounts: Array.isArray(parsed.accounts) ? parsed.accounts.filter((a) => a && typeof a.name === 'string') : [],
+      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as Partial<AccountsFile> & {
+        active?: unknown;
+        strategy?: unknown;
       };
+      const accounts = Array.isArray(parsed.accounts)
+        ? parsed.accounts
+            .filter((a) => a && typeof a.name === 'string')
+            .map((a) => this.normalizeRecord(a))
+        : [];
+      const migrated: AccountsFile = {
+        version: FILE_VERSION,
+        mode: parsed.mode === 'balanced' ? 'balanced' : 'max-cache',
+        creditsThreshold:
+          typeof parsed.creditsThreshold === 'number' && Number.isFinite(parsed.creditsThreshold) && parsed.creditsThreshold >= 0
+            ? parsed.creditsThreshold
+            : DEFAULT_CREDITS_THRESHOLD,
+        accounts,
+      };
+      /* v1 → v2 的迁移**立刻落盘** —— 否则下次启动又要重新迁一遍，
+         而旧文件里的 active/strategy 会一直躺在那儿误导人。 */
+      if (parsed.version !== FILE_VERSION) this.writeFile(migrated);
+      return migrated;
     } catch {
       /* 坏文件不吞掉整站：备份后从空表起步，并**立刻写一份干净的** ——
          否则下次启动又会撞上「文件不存在 → 走首次发现分支」的另一条路径，
@@ -207,6 +255,24 @@ export class AccountStore {
       this.writeFile(empty);
       return empty;
     }
+  }
+
+  /**
+   * 把一条落盘记录规整到 v2 形状。
+   *
+   * v1 → v2 的迁移要点：v1 有 `active`（粘性当前账号）与 `strategy`
+   * （sticky / round-robin）—— 这两个概念在新模型里**整体消失**
+   * （「没有当前账号概念，只有优先级概念」）。迁移时把它们**丢弃**，
+   * 原有账号一律继承同一优先级（0），即「同层随机分配」——
+   * 这比按旧粘性顺序排优先级更贴近新模型的本意。
+   */
+  private normalizeRecord(raw: AccountRecord): AccountRecord {
+    return {
+      ...raw,
+      priority: typeof raw.priority === 'number' && Number.isFinite(raw.priority) ? raw.priority : 0,
+      frozen: raw.frozen === true,
+      frozenReason: typeof raw.frozenReason === 'string' ? raw.frozenReason : undefined,
+    };
   }
 
   /** 扫描磁盘上已存在的账号目录，自动登记 —— 用户此前用 mmmcode.sh 建的账号
@@ -247,6 +313,7 @@ export class AccountStore {
       name,
       region,
       enabled: true,
+      priority: 0,
       createdAt: now,
       updatedAt: now,
       health: 'unknown',
@@ -326,32 +393,30 @@ export class AccountStore {
     const idx = this.data.accounts.findIndex((a) => a.name === name);
     if (idx < 0) return false;
     this.data.accounts.splice(idx, 1);
-    if (this.data.active === name) {
-      this.data.active = this.data.accounts[0]?.name ?? null;
-    }
     this.save();
     return true;
   }
 
-  /** 当前粘性账号名。 */
-  activeName(): string | null {
-    return this.data.active;
+  /** 全局调度模式。 */
+  mode(): PoolMode {
+    return this.data.mode;
   }
 
-  /** 设置粘性账号。 */
-  setActive(name: string | null): void {
-    this.data.active = name;
+  /** 设置全局调度模式。 */
+  setMode(mode: PoolMode): void {
+    this.data.mode = mode;
     this.save();
   }
 
-  /** 切换策略。 */
-  strategy(): PoolStrategy {
-    return this.data.strategy;
+  /** 最小可用积分阈值（低于它冻结账号）。 */
+  creditsThreshold(): number {
+    return this.data.creditsThreshold;
   }
 
-  /** 设置切换策略。 */
-  setStrategy(strategy: PoolStrategy): void {
-    this.data.strategy = strategy;
+  /** 设置最小可用积分阈值。 */
+  setCreditsThreshold(value: number): void {
+    if (!Number.isFinite(value) || value < 0) return;
+    this.data.creditsThreshold = value;
     this.save();
   }
 }

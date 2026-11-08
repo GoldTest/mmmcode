@@ -2,18 +2,22 @@
  * MiniMax Code 本地反代 —— 管理端交互逻辑。
  *
  * 纯原生 JS 实现无构建步骤。
- * 支持 4 个 Tab 页布局：
+ * 支持 5 个 Tab 页布局：
  *   Tab 1: 账号与凭证（账号池、自动签到、自动令牌刷新、客户端密钥管理）
- *   Tab 2: 反代服务管理（拓扑、调度策略、冷却池、端点与模型速查、在线测试）
+ *   Tab 2: 反代服务管理（拓扑、调度模式、冷却池、端点与模型速查、在线测试）
  *   Tab 3: 请求详情与监控（实时监控、缓存管理、请求列表、输入输出对话详情）
- *   Tab 4: 设置选项（管理密钥、自动任务计划、客户端接入配置、系统信息）
+ *   Tab 4: 用量洞察（各账号 token 用量台账）
+ *   Tab 5: 设置选项（管理密钥、自动任务计划、客户端接入配置、系统信息）
  */
 'use strict';
 
 const state = {
   accounts: [],
-  strategy: 'sticky',
-  active: null,
+  mode: 'max-cache',
+  creditsThreshold: 100,
+  insights: null,
+  insightsTotals: null,
+  insightsMode: 'max-cache',
   config: null,
   keys: [],
   models: [],
@@ -180,7 +184,7 @@ function openRequestModal(record) {
   $('#req-modal-title').textContent = `请求详情 · ${record.id}`;
 
   const isSuccess = record.status >= 200 && record.status < 300;
-  const statusBadge = `<span class="badge ${isSuccess ? 'ok' : 'err'}">HTTP ${record.status}</span>`;
+  const statusBadge = `<span class="badge ${isSuccess ? 'ok' : 'err'}">${record.status}</span>`;
 
   // 格式化输入信息
   let inputHtml = '';
@@ -231,14 +235,57 @@ function openRequestModal(record) {
   }
 
   const usage = record.output && record.output.usage;
+  /* 缓存命中与命中率：权威值由适配器记录（上游原始 usage），这里只做展示。 */
+  const cachedTokens = usage ? usage.cached_tokens ?? 0 : 0;
+  const hitRate = usage
+    ? typeof usage.cache_hit_rate === 'number'
+      ? usage.cache_hit_rate
+      : usage.prompt_tokens
+        ? cachedTokens / usage.prompt_tokens
+        : 0
+    : 0;
   const usageStr = usage
-    ? `输入: <b>${usage.prompt_tokens ?? 0}</b> | 输出: <b>${usage.completion_tokens ?? 0}</b> | 总计: <b>${usage.total_tokens ?? 0}</b>`
+    ? `输入: <b>${fmtInt(usage.prompt_tokens ?? 0)}</b> | 输出: <b>${fmtInt(usage.completion_tokens ?? 0)}</b> | 总计: <b>${fmtInt(usage.total_tokens ?? 0)}</b> | 缓存命中: <b>${fmtInt(cachedTokens)}</b>`
     : '—';
+
+  /* 首字符时间：收到请求 → 第一个响应字节（流式体感速度，与总耗时不是一回事）。 */
+  const firstByteStr = typeof record.firstByteMs === 'number' ? `${record.firstByteMs} ms` : '—';
+
+  /* ── 中转栏 ──
+     入站是 OpenAI / Anthropic 形状，出站统一是 Anthropic 兼容形状 ——
+     这一层翻译最容易出「我发的和上游收到的不一样」，所以把上游实际收到的请求摆出来。 */
+  const transit = record.transit;
+  const transitHtml = transit
+    ? `
+      <dl class="req-kv">
+        <dt>上游地址</dt><dd>${escapeHtml(transit.upstream)}</dd>
+        <dt>服务账号</dt><dd>${escapeHtml(transit.account || '—')}</dd>
+        <dt>出站协议</dt><dd>${escapeHtml(transit.protocol || '—')}</dd>
+      </dl>
+      <details open>
+        <summary class="small muted" style="cursor:pointer;">转译后实际发给上游的请求</summary>
+        <pre class="code-block">${escapeHtml(JSON.stringify(transit.payload ?? null, null, 2))}</pre>
+      </details>`
+    : '<p class="muted small">本次请求没有中转记录 —— 可能未到达上游。</p>';
+
+  /* ── 输出详情 ── */
+  const outDetailRows = [
+    ['结束原因', record.output && record.output.finish_reason ? record.output.finish_reason : '—'],
+    ['输入 token', usage ? fmtInt(usage.prompt_tokens ?? 0) : '—'],
+    ['输出 token', usage ? fmtInt(usage.completion_tokens ?? 0) : '—'],
+    ['缓存命中', usage ? `${fmtInt(cachedTokens)}（命中率 ${(hitRate * 100).toFixed(1)}%）` : '—'],
+    ['首字符时间', firstByteStr],
+    ['总耗时', `${record.durationMs} ms`],
+  ];
+  const outDetailHtml = `<dl class="req-kv">${outDetailRows
+    .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`)
+    .join('')}</dl>`;
 
   const bodyHtml = `
     <!-- 基本指标 -->
     <div class="card-metrics" style="background:var(--bg-soft);padding:12px;border-radius:8px;border:1px solid var(--line);">
       <div>请求状态 <b>${statusBadge}</b></div>
+      <div>首字符时间 <b>${firstByteStr}</b></div>
       <div>响应耗时 <b>${record.durationMs} ms</b></div>
       <div>请求端点 <b>${escapeHtml(record.method)} ${escapeHtml(record.path)}</b></div>
       <div>请求模型 <b>${escapeHtml(record.model || '默认')}</b></div>
@@ -247,27 +294,41 @@ function openRequestModal(record) {
       <div>来源 IP <b>${escapeHtml(record.clientIp || '—')}</b></div>
       <div>流式模式 <b>${record.stream ? 'SSE 流式' : '单次返回'}</b></div>
       <div style="grid-column: span 2;">Token 用量 ${usageStr}</div>
+      <div>缓存命中率 <b>${(hitRate * 100).toFixed(1)}%</b></div>
       <div style="grid-column: span 2;">请求时间 <b>${fmtTime(record.timestamp)}</b></div>
     </div>
 
-    <!-- 输入内容 -->
-    <div>
-      <h4 style="margin:6px 0 8px;font-size:14px;color:var(--fg);">入站请求与输入内容</h4>
-      ${inputHtml}
-      <details style="margin-top:6px;">
-        <summary class="small muted" style="cursor:pointer;">查看完整输入 JSON</summary>
-        <pre class="code-block">${escapeHtml(JSON.stringify(record.input, null, 2))}</pre>
-      </details>
-    </div>
+    <!-- 横向三栏：请求 / 中转 / 输出 -->
+    <div class="req-cols">
+      <section class="req-col">
+        <h4>请求</h4>
+        <div class="req-col-body">
+          ${inputHtml}
+          <details>
+            <summary class="small muted" style="cursor:pointer;">查看完整入站 JSON</summary>
+            <pre class="code-block">${escapeHtml(JSON.stringify(record.input, null, 2))}</pre>
+          </details>
+        </div>
+      </section>
 
-    <!-- 输出内容 -->
-    <div>
-      <h4 style="margin:6px 0 8px;font-size:14px;color:var(--fg);">模型输出内容</h4>
-      ${outputHtml}
-      <details style="margin-top:6px;">
-        <summary class="small muted" style="cursor:pointer;">查看完整输出 JSON</summary>
-        <pre class="code-block">${escapeHtml(JSON.stringify(record.output, null, 2))}</pre>
-      </details>
+      <section class="req-col">
+        <h4>中转</h4>
+        <div class="req-col-body">
+          ${transitHtml}
+        </div>
+      </section>
+
+      <section class="req-col">
+        <h4>输出</h4>
+        <div class="req-col-body">
+          ${outputHtml}
+          ${outDetailHtml}
+          <details>
+            <summary class="small muted" style="cursor:pointer;">查看完整输出 JSON</summary>
+            <pre class="code-block">${escapeHtml(JSON.stringify(record.output, null, 2))}</pre>
+          </details>
+        </div>
+      </section>
     </div>`;
 
   $('#req-modal-body').innerHTML = bodyHtml;
@@ -373,6 +434,8 @@ $$('.tab-btn').forEach((btn) => {
     } else if (target === 'tab-proxy') {
       loadProxyDetails();
       loadModels();
+    } else if (target === 'tab-insights') {
+      loadInsights();
     }
   });
 });
@@ -389,6 +452,7 @@ async function refreshAll() {
     loadModels(),
     loadRequestStats(),
     loadRequests(),
+    loadInsights(),
   ]);
 }
 
@@ -398,8 +462,8 @@ async function loadAccounts() {
   try {
     const data = await api('/admin/api/accounts');
     state.accounts = data.accounts || [];
-    state.strategy = data.strategy || 'sticky';
-    state.active = data.active;
+    state.mode = data.mode || 'max-cache';
+    state.creditsThreshold = typeof data.creditsThreshold === 'number' ? data.creditsThreshold : 100;
     renderAccounts();
     renderCheckinTable();
     renderTokensTable();
@@ -413,21 +477,11 @@ function renderAccounts() {
   const list = $('#account-list');
   list.innerHTML = '';
   $('#accounts-empty').classList.toggle('hidden', state.accounts.length > 0);
-  $('#strategy-select').value = state.strategy;
+  $('#mode-select').value = state.mode;
+  $('#credits-threshold-input').value = String(state.creditsThreshold);
 
-  // 刷新当前粘性选择框
-  const activeSel = $('#active-account-select');
-  activeSel.innerHTML = '<option value="">自动首选</option>';
-  for (const a of state.accounts) {
-    const opt = document.createElement('option');
-    opt.value = a.name;
-    opt.textContent = a.name + (a.name === state.active ? '（当前激活）' : '');
-    if (a.name === state.active) opt.selected = true;
-    activeSel.appendChild(opt);
-  }
-
-  // 顶栏 Badge
-  const availableCount = state.accounts.filter((a) => a.enabled && a.loggedIn && !a.cooling).length;
+  // 顶栏 Badge（冻结的账号不参与调度，算作不可用）
+  const availableCount = state.accounts.filter((a) => a.enabled && a.loggedIn && !a.cooling && !a.frozen).length;
   const accBadge = $('#account-badge');
   accBadge.textContent = `账号 ${availableCount}/${state.accounts.length} 就绪`;
   accBadge.className = 'badge ' + (availableCount > 0 ? 'ok' : 'warn');
@@ -473,6 +527,49 @@ function renderAccountCard(a) {
     <div>上次签到 <b>${a.lastCheckin ? escapeHtml(a.lastCheckin.outcome) : '—'}</b></div>
     <div>剩余积分 <b>${a.lastCredits ? a.lastCredits.remaining : '—'}</b></div>`;
   card.appendChild(metrics);
+
+  // 优先级编辑（数字越小越优先，0 为最高层）
+  const prioRow = document.createElement('div');
+  prioRow.className = 'card-priority';
+  const prioLabel = document.createElement('span');
+  prioLabel.className = 'small muted';
+  prioLabel.textContent = '优先级';
+  const prioInput = document.createElement('input');
+  prioInput.type = 'number';
+  prioInput.min = '0';
+  prioInput.max = '99';
+  prioInput.step = '1';
+  prioInput.className = 'prio-input';
+  prioInput.value = String(a.priority ?? 0);
+  prioInput.title = '数字越小越优先（0 为最高层），修改后回车或失焦即生效';
+  prioInput.addEventListener('change', async () => {
+    const next = Math.max(0, Math.min(99, Math.trunc(Number(prioInput.value) || 0)));
+    if (next === (a.priority ?? 0)) {
+      prioInput.value = String(a.priority ?? 0);
+      return;
+    }
+    prioInput.disabled = true;
+    try {
+      await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
+        method: 'PATCH',
+        body: { priority: next },
+      });
+      toast(`账号 ${a.name} 优先级已设为 P${next}`, 'ok');
+      await loadAccounts();
+    } catch (err) {
+      toast('设置优先级失败：' + err.message, 'err');
+      prioInput.value = String(a.priority ?? 0);
+    } finally {
+      prioInput.disabled = false;
+    }
+  });
+  prioRow.appendChild(prioLabel);
+  prioRow.appendChild(prioInput);
+  const prioHint = document.createElement('span');
+  prioHint.className = 'small muted';
+  prioHint.textContent = '数字越小越优先（0 最高层），回车或失焦生效';
+  prioRow.appendChild(prioHint);
+  card.appendChild(prioRow);
 
   const actions = document.createElement('div');
   actions.className = 'card-actions';
@@ -530,13 +627,22 @@ function renderAccountCard(a) {
     }
   }));
 
-  if (state.active !== a.name) {
-    actions.appendChild(mkBtn('设为当前', 'ghost sm', async () => {
-      await api('/admin/api/config', { method: 'POST', body: { active: a.name } });
-      toast(`已把 ${a.name} 设为粘性账号`, 'ok');
+  // 冻结 / 解冻（额度冻结后不参与调度）
+  actions.appendChild(mkBtn(a.frozen ? '解冻' : '冻结', a.frozen ? 'ghost sm' : 'ghost sm danger', async (btn) => {
+    btn.disabled = true;
+    try {
+      await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
+        method: 'PATCH',
+        body: a.frozen ? { frozen: false } : { frozen: true, frozenReason: '手动冻结' },
+      });
+      toast(`账号 ${a.name} 已${a.frozen ? '解冻' : '冻结'}`, 'ok');
       await loadAccounts();
-    }));
-  }
+    } catch (err) {
+      toast((a.frozen ? '解冻' : '冻结') + '失败：' + err.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  }));
 
   actions.appendChild(mkBtn('删除', 'danger sm', async () => {
     if (!confirm(`确定删除账号「${a.name}」？\n其令牌文件将一并删除。`)) return;
@@ -565,7 +671,8 @@ function renderAccountCard(a) {
     else if (a.health === 'unauthorized') t('凭证失效', 'err');
     else if (a.health === 'rate_limited') t('限流中', 'warn');
     else if (a.health === 'error') t('异常', 'err');
-    if (state.active === a.name) t('当前活跃', 'info');
+    t(`优先级 P${a.priority ?? 0}`, 'info');
+    if (a.frozen) t(`额度冻结${a.frozenReason ? '：' + a.frozenReason : ''}`, 'warn');
     if (a.pendingLogin) t('授权中', 'info');
     if (!a.enabled) t('已停用', '');
   }
@@ -580,26 +687,48 @@ function mkBtn(text, cls, onClick) {
   return b;
 }
 
-// 策略与粘性账号选择
-$('#strategy-select').addEventListener('change', async (e) => {
-  const strategy = e.target.value;
+// 调度模式与最小可用积分
+$('#mode-select').addEventListener('change', async (e) => {
+  const mode = e.target.value;
   try {
-    await api('/admin/api/config', { method: 'POST', body: { strategy } });
-    toast('调度策略已切换', 'ok');
+    await api('/admin/api/config', { method: 'POST', body: { mode } });
+    toast('调度模式已切换', 'ok');
     await loadAccounts();
   } catch (err) {
     toast('切换失败：' + err.message, 'err');
+    await loadAccounts();
   }
 });
 
-$('#active-account-select').addEventListener('change', async (e) => {
-  const active = e.target.value;
+$('#credits-threshold-input').addEventListener('change', async (e) => {
+  const threshold = Math.max(0, Math.trunc(Number(e.target.value) || 0));
   try {
-    await api('/admin/api/config', { method: 'POST', body: { active } });
-    toast('当前粘性账号已更新', 'ok');
+    await api('/admin/api/config', { method: 'POST', body: { creditsThreshold: threshold } });
+    toast(`最小可用积分已设为 ${threshold}`, 'ok');
     await loadAccounts();
   } catch (err) {
-    toast('设置失败：' + err.message, 'err');
+    toast('设置最小可用积分失败：' + err.message, 'err');
+    await loadAccounts();
+  }
+});
+
+// 立即刷新所有账号额度（按阈值冻结/解冻）
+$('#btn-refresh-credits').addEventListener('click', async (btn) => {
+  btn.disabled = true;
+  btn.textContent = '刷新中…';
+  try {
+    const res = await api('/admin/api/credits/refresh', { method: 'POST' });
+    const results = res.results || [];
+    const okCount = results.filter((r) => r.ok).length;
+    const failCount = results.length - okCount;
+    toast(`额度刷新完成：成功 ${okCount} 个，失败 ${failCount} 个`, failCount > 0 ? 'err' : 'ok');
+    await loadAccounts();
+    await loadInsights();
+  } catch (err) {
+    toast('额度刷新失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '立即刷新额度';
   }
 });
 
@@ -1093,14 +1222,31 @@ function renderProxyDetails() {
   const c = state.config;
   if (!c) return;
   const p = c.proxy || {};
+  const modeText = c.mode === 'balanced' ? '平衡模式（额度耗尽可无缝滑动）' : '最大缓存模式（会话不迁移）';
   $('#proxy-detail-kv').innerHTML = `
     <dt>公开监听 Base URL</dt><dd><code>${escapeHtml(p.baseUrl || '—')}</code></dd>
     <dt>外部服务端口</dt><dd><b>${escapeHtml(p.port || '—')}</b></dd>
     <dt>上游端点与描述</dt><dd>${escapeHtml(p.upstream || '—')}</dd>
-    <dt>多账号调度策略</dt><dd>${c.strategy === 'round-robin' ? '严格轮询（均摊额度）' : '粘性优先 + 故障转移'}</dd>
-    <dt>当前激活账号</dt><dd><b>${escapeHtml(c.active || '（自动首选）')}</b></dd>
+    <dt>调度模式</dt><dd><b>${escapeHtml(modeText)}</b></dd>
+    <dt>最小可用积分</dt><dd><b>${escapeHtml(String(c.creditsThreshold ?? '—'))}</b>（低于此值冻结账号）</dd>
+    <dt>优先级分层</dt><dd>${renderTiers(c.tiers)}</dd>
     <dt>入站鉴权模式</dt><dd>多密钥注册表隔离，支持单独吊销</dd>
     <dt>内部安全环回</dt><dd>127.0.0.1 随机密钥桥接，零协议损耗</dd>`;
+}
+
+/** 把优先级分层数组拼成「P0: a1、a2 ｜ P1: b1」这样的一行。 */
+function renderTiers(tiers) {
+  if (!Array.isArray(tiers) || tiers.length === 0) return '<span class="muted">暂无可用账号分层</span>';
+  const prioOf = new Map(state.accounts.map((a) => [a.name, a.priority ?? 0]));
+  const parts = tiers.map((tier, i) => {
+    const list = Array.isArray(tier) ? tier : [];
+    const names = list.map((n) => escapeHtml(n)).join('、');
+    /* 优先用账号真实优先级，回退到分层序号。 */
+    const first = list.find((n) => prioOf.has(n));
+    const level = first != null ? prioOf.get(first) : i;
+    return `<span class="tag info">P${escapeHtml(String(level))}</span> ${names || '<span class="muted">—</span>'}`;
+  });
+  return parts.join(' <span class="muted">｜</span> ');
 }
 
 function renderCooldownTable() {
@@ -1294,7 +1440,7 @@ async function loadRequests() {
 function renderRequestsTable() {
   const tbody = $('#requests-table-body');
   if (!state.requests || state.requests.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无请求记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="muted">暂无请求记录</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -1304,7 +1450,7 @@ function renderRequestsTable() {
 
     const isOk = item.status >= 200 && item.status < 300;
     const badgeCls = isOk ? 'ok' : item.status === 401 || item.status === 429 ? 'warn' : 'err';
-    const statusBadge = `<span class="badge ${badgeCls}">HTTP ${item.status}</span>`;
+    const statusBadge = `<span class="badge ${badgeCls}">${item.status}</span>`;
 
     // 提取输入输出摘要
     let snippet = '—';
@@ -1319,7 +1465,25 @@ function renderRequestsTable() {
     }
 
     const usage = item.output && item.output.usage;
-    const tokensStr = usage ? `${usage.prompt_tokens ?? 0} / ${usage.completion_tokens ?? 0}` : '—';
+    const listHitRate = usage
+      ? typeof usage.cache_hit_rate === 'number'
+        ? usage.cache_hit_rate
+        : usage.prompt_tokens
+          ? (usage.cached_tokens ?? 0) / usage.prompt_tokens
+          : 0
+      : 0;
+    /* token 统计用 k 缩写（请求列表要能一眼扫过去）；精确值放 title。 */
+    const tokensStr = usage
+      ? `${fmtK(usage.prompt_tokens ?? 0)} / ${fmtK(usage.completion_tokens ?? 0)}`
+      : '—';
+    const tokensTitle = usage
+      ? `输入 ${fmtInt(usage.prompt_tokens ?? 0)} / 输出 ${fmtInt(usage.completion_tokens ?? 0)}`
+      : '';
+    /* 单次请求的缓存命中率（上游没报缓存字段时是 0%，不是猜的值）。 */
+    const hitRateStr = usage ? `${(listHitRate * 100).toFixed(0)}%` : '—';
+    const hitRateTitle = usage
+      ? `缓存命中 ${fmtInt(usage.cached_tokens ?? 0)} / 输入 ${fmtInt(usage.prompt_tokens ?? 0)}`
+      : '';
 
     tr.innerHTML = `
       <td class="small muted">${fmtTimeShort(item.timestamp)}</td>
@@ -1329,7 +1493,8 @@ function renderRequestsTable() {
       <td><span class="tag">${escapeHtml(item.model || '—')}</span></td>
       <td><b>${escapeHtml(item.account || '—')}</b></td>
       <td class="small">${escapeHtml(item.keyName || '默认')}</td>
-      <td class="small"><b>${tokensStr}</b></td>
+      <td class="small" title="${escapeHtml(tokensTitle)}"><b>${tokensStr}</b></td>
+      <td class="small" title="${escapeHtml(hitRateTitle)}"><b>${hitRateStr}</b></td>
       <td class="small muted" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(snippet)}</td>
       <td></td>`;
 
@@ -1507,6 +1672,237 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeModal();
     closeRequestModal();
+  }
+});
+
+/* ───────────────────────── Tab 5: 用量洞察 ───────────────────────── */
+
+/** 千分位整数。 */
+function fmtInt(n) {
+  return Number(n || 0).toLocaleString('zh-CN');
+}
+
+/**
+ * token 数量的 k 缩写：1234 → 1.2k，12345 → 12k，999 → 999。
+ *
+ * 请求列表用它 —— 一眼能扫过去；精确值放在 title 里。
+ */
+function fmtK(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return '0';
+  if (v < 1000) return String(Math.round(v));
+  const k = v / 1000;
+  return `${k >= 10 ? Math.round(k) : k.toFixed(1).replace(/\.0$/, '')}k`;
+}
+
+/** Token 易读格式：超过 1 万显示「万」，超过 1 亿显示「亿」，title 里放精确值。 */
+function fmtTokens(n) {
+  const v = Number(n || 0);
+  if (v >= 100000000) return `${(v / 100000000).toFixed(2)} 亿`;
+  if (v >= 10000) return `${(v / 10000).toFixed(1)} 万`;
+  return fmtInt(v);
+}
+
+/** 纯 CSS 横条（渐变背景，不引第三方库）。 */
+function barHtml(ratio, cls) {
+  const pct = Math.max(0, Math.min(100, Number(ratio) || 0));
+  return `<span class="mini-bar${cls ? ' ' + cls : ''}"><i style="width:${pct.toFixed(2)}%"></i></span>`;
+}
+
+async function loadInsights() {
+  try {
+    const data = await api('/admin/api/insights');
+    state.insights = data.accounts || [];
+    state.insightsTotals = data.totals || null;
+    state.insightsMode = data.mode || 'max-cache';
+    renderInsights();
+  } catch (err) {
+    toast('加载用量洞察失败：' + err.message, 'err');
+  }
+}
+
+function renderInsights() {
+  const list = state.insights || [];
+  const totals = state.insightsTotals || {
+    accounts: 0,
+    requests: 0,
+    sessions: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+  };
+
+  // 概览数字
+  const modeBadge = $('#insight-mode-badge');
+  modeBadge.textContent = state.insightsMode === 'balanced' ? '平衡模式' : '最大缓存模式';
+  modeBadge.className = 'badge ' + (state.insightsMode === 'balanced' ? 'info' : 'ok');
+
+  $('#insight-stat-requests').textContent = fmtInt(totals.requests);
+  $('#insight-stat-sessions').textContent = fmtInt(totals.sessions);
+  $('#insight-stat-accounts').textContent = fmtInt(totals.accounts);
+
+  const totalTokens = totals.totalTokens || 0;
+  const promptTokens = totals.promptTokens || 0;
+  const completionTokens = totals.completionTokens || 0;
+  const cachedTokens = totals.cachedTokens || 0;
+  /* 缓存命中率 = 缓存命中 token / 输入 token（后端给了就用后端的，自己兜底算）。 */
+  const totalHitRate =
+    typeof totals.cacheHitRate === 'number'
+      ? totals.cacheHitRate
+      : promptTokens
+        ? cachedTokens / promptTokens
+        : 0;
+
+  $('#insight-stat-total-tokens').textContent = fmtTokens(totalTokens);
+  $('#insight-stat-total-tokens').title = fmtInt(totalTokens);
+  $('#insight-stat-total-tokens-exact').textContent = fmtInt(totalTokens);
+
+  $('#insight-stat-prompt-tokens').textContent = fmtTokens(promptTokens);
+  $('#insight-stat-prompt-tokens').title = fmtInt(promptTokens);
+  $('#insight-stat-prompt-tokens-exact').textContent = fmtInt(promptTokens);
+
+  $('#insight-stat-completion-tokens').textContent = fmtTokens(completionTokens);
+  $('#insight-stat-completion-tokens').title = fmtInt(completionTokens);
+  $('#insight-stat-completion-tokens-exact').textContent = fmtInt(completionTokens);
+
+  $('#insight-stat-cached-tokens').textContent = fmtTokens(cachedTokens);
+  $('#insight-stat-cached-tokens').title = fmtInt(cachedTokens);
+  $('#insight-stat-cached-tokens-exact').textContent = fmtInt(cachedTokens);
+
+  $('#insight-stat-cache-hit-rate').textContent = `${(totalHitRate * 100).toFixed(1)}%`;
+  $('#insight-stat-cache-hit-rate').title = `缓存命中 ${fmtInt(cachedTokens)} / 输入 ${fmtInt(promptTokens)}`;
+  $('#insight-stat-cache-hit-cached').textContent = fmtInt(cachedTokens);
+  $('#insight-stat-cache-hit-input').textContent = fmtInt(promptTokens);
+
+  // 表格
+  const tbody = $('#insights-table-body');
+  tbody.innerHTML = '';
+  $('#insights-empty').classList.toggle('hidden', list.length > 0);
+  if (list.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无用量记录</td></tr>';
+    return;
+  }
+
+  for (const acc of list) {
+    const accTotal = acc.totalTokens || 0;
+    const share = totalTokens > 0 ? (accTotal / totalTokens) * 100 : 0;
+    /* 单账号的缓存命中率。 */
+    const accHitRate =
+      typeof acc.cacheHitRate === 'number'
+        ? acc.cacheHitRate
+        : acc.promptTokens
+          ? (acc.cachedTokens || 0) / acc.promptTokens
+          : 0;
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><b>${escapeHtml(acc.name)}</b></td>
+      <td>${fmtInt(acc.requests)}</td>
+      <td>${fmtInt(acc.sessions)}</td>
+      <td title="${fmtInt(acc.promptTokens)}">${fmtTokens(acc.promptTokens)}</td>
+      <td title="${fmtInt(acc.completionTokens)}">${fmtTokens(acc.completionTokens)}</td>
+      <td title="${fmtInt(acc.cachedTokens)}">${fmtTokens(acc.cachedTokens)}</td>
+      <td title="缓存命中 ${fmtInt(acc.cachedTokens)} / 输入 ${fmtInt(acc.promptTokens)}"><b>${(accHitRate * 100).toFixed(1)}%</b></td>
+      <td>
+        <div class="share-cell">
+          <span title="${fmtInt(accTotal)}">${fmtTokens(accTotal)}</span>
+          <span class="small muted">${share.toFixed(1)}%</span>
+          ${barHtml(share)}
+        </div>
+      </td>
+      <td class="small muted">${acc.lastUsedAt ? fmtTime(acc.lastUsedAt) : '—'}</td>
+      <td></td>`;
+
+    const tdAction = tr.querySelector('td:last-child');
+    tdAction.appendChild(mkBtn('清除该账号', 'ghost sm', async (btn) => {
+      btn.disabled = true;
+      try {
+        await api('/admin/api/insights/reset', { method: 'POST', body: { name: acc.name } });
+        toast(`已清除账号 ${acc.name} 的用量统计`, 'ok');
+        await loadInsights();
+      } catch (err) {
+        toast('清除失败：' + err.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    }));
+    tbody.appendChild(tr);
+
+    // 每行下面展开「按模型」「按天」小节
+    tbody.appendChild(renderInsightDetailRow(acc));
+  }
+}
+
+/** 账号明细下方的展开行：按模型 + 按天。 */
+function renderInsightDetailRow(acc) {
+  const tr = document.createElement('tr');
+  tr.className = 'insight-detail-row';
+  const td = document.createElement('td');
+  td.colSpan = 10;
+
+  /* 按模型 */
+  const models = Object.entries(acc.byModel || {}).sort((a, b) => b[1].totalTokens - a[1].totalTokens);
+  const modelMax = models.length > 0 ? models[0][1].totalTokens : 0;
+  const modelHtml = models.length === 0
+    ? '<p class="muted small" style="margin:0;">暂无模型维度数据</p>'
+    : `<table class="sub-table">
+        <thead><tr><th>模型</th><th>请求数</th><th>总 Token</th><th>占比</th></tr></thead>
+        <tbody>${models.map(([name, m]) => `
+          <tr>
+            <td><code>${escapeHtml(name)}</code></td>
+            <td>${fmtInt(m.requests)}</td>
+            <td title="${fmtInt(m.totalTokens)}">${fmtTokens(m.totalTokens)}</td>
+            <td class="bar-cell">${barHtml(modelMax > 0 ? (m.totalTokens / modelMax) * 100 : 0)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`;
+
+  /* 按天：只显示最近 14 天 */
+  const days = Object.entries(acc.byDay || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1)).slice(-14);
+  const dayMax = days.length > 0 ? days.reduce((m, d) => Math.max(m, d[1].totalTokens || 0), 0) : 0;
+  const dayHtml = days.length === 0
+    ? '<p class="muted small" style="margin:0;">暂无按天数据</p>'
+    : `<table class="sub-table">
+        <thead><tr><th>日期</th><th>请求数</th><th>总 Token</th><th>占比</th></tr></thead>
+        <tbody>${days.map(([day, d]) => `
+          <tr>
+            <td>${escapeHtml(day)}</td>
+            <td>${fmtInt(d.requests)}</td>
+            <td title="${fmtInt(d.totalTokens)}">${fmtTokens(d.totalTokens)}</td>
+            <td class="bar-cell">${barHtml(dayMax > 0 ? (d.totalTokens / dayMax) * 100 : 0, 'ok')}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`;
+
+  td.innerHTML = `
+    <div class="insight-detail">
+      <div class="insight-detail-col">
+        <h4>按模型</h4>
+        ${modelHtml}
+      </div>
+      <div class="insight-detail-col">
+        <h4>按天（最近 14 天）</h4>
+        ${dayHtml}
+      </div>
+    </div>`;
+  tr.appendChild(td);
+  return tr;
+}
+
+$('#btn-insights-refresh').addEventListener('click', async () => {
+  await loadInsights();
+  toast('用量洞察已刷新', 'ok');
+});
+
+$('#btn-insights-reset-all').addEventListener('click', async () => {
+  if (!confirm('确定清空所有账号的用量统计？该操作不可恢复。')) return;
+  try {
+    await api('/admin/api/insights/reset', { method: 'POST', body: {} });
+    toast('已清空全部用量统计', 'ok');
+    await loadInsights();
+  } catch (err) {
+    toast('清空失败：' + err.message, 'err');
   }
 });
 

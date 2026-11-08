@@ -7,12 +7,17 @@
  *   · 协议：上游是 **Anthropic 兼容**（`/mavis/api/v1/llm/v1/messages`），不是自研签名；
  *   · ⚠️ 有**凭证互斥**问题（见 README），必须给用户明确告警。
  *
- * ## 多账号与自动切换（本文件的核心）
+ * ## 多账号与调度（本文件的核心）
  * MiniMax **同一账号只能有一个有效会话** —— 上游 401 通常意味着「这个号在别处登过」，
  * 光重试没用。所以反代必须**手上有多个号**：
- *   · `AccountPool` 负责选号（粘性优先，失败自动换号）；
- *   · 本文件的 `chat()` 负责「换号重试」的执行：401/403/429 → 标记该号 → 换下一个；
+ *   · `AccountPool` 负责选号（**按优先级分层 + 同层随机 + 额度冻结**）；
+ *   · 本文件的 `chat()` 负责按 **session** 选号并执行失败重试：
+ *     401/403/429 → 标记该号 → 换下一个（受调度模式约束）；
  *   · 每个账号**各自持有**令牌管理器（各自缓存、各自刷新、各自写回），互不干扰。
+ *
+ * ## 两种模式（由 `AccountPool.mode()` 决定，全局生效）
+ *   · `max-cache`（最大缓存）：session 绑定某账号后**永不迁移** —— 保住上游缓存；
+ *   · `balanced`（平衡）：绑定账号额度耗尽 / 不可用时，session **无缝滑到**别的账号。
  *
  * ⚠️ **区域随账号走**：cn 与 global 是两套完全不同的域名，
  *    切号时 base URL 必须跟着换 —— 否则国内号会被打到海外端点上（401/404）。
@@ -41,9 +46,12 @@ import {
 import { CredentialError, UpstreamError } from './errors.js';
 import { MinimaxActivity, renderCheckin, renderCredits } from './activity.js';
 import { anthropicToOpenAiSse } from './protocol/stream-decode.js';
+import { collectUsage } from './protocol/usage.js';
 import { toAnthropicRequest } from './protocol/translate.js';
 import { AccountStore, DEFAULT_ACCOUNT_NAME } from './accounts.js';
-import { AccountPool, type PoolAccount } from './pool.js';
+import { AccountPool, classifyFailure, type PoolAccount } from './pool.js';
+import { extractRequestContext, resolveSessionKey } from './session.js';
+import type { InsightsLedger } from './insights.js';
 import { maskInboundKey, type KeyRegistry } from './keys.js';
 
 export const DEFAULT_MMCODE_BASE_URL = 'https://agent.minimax.cn';
@@ -160,6 +168,8 @@ export interface MmcodeAdapterOptions {
   pool?: AccountPool;
   /** 入站密钥注册表（提供后才有 `mmcode keys` 子命令）。 */
   keys?: KeyRegistry;
+  /** 用量台账（提供后按账号统计 token —— 洞察面板用）。 */
+  insights?: InsightsLedger;
   /** 日志回调。 */
   log?: (line: string) => void;
 }
@@ -178,13 +188,13 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     return getAgentBase(region);
   };
 
-  /** 当前（粘性）账号；没有则 null。 */
-  const currentAccount = (): PoolAccount | null => {
-    const activeName = pool.getAccountStore().activeName();
-    if (activeName) {
-      const found = pool.get(activeName);
-      if (found) return found;
-    }
+  /**
+   * 兜底账号 —— **仅供 CLI / 体检这类「要一个账号去问上游」的场景**。
+   *
+   * 新模型里**没有「当前账号」概念**：调度只看优先级与额度。这里取「第一个可用账号」，
+   * 没有可用就退到「第一个已登记账号」（只为把 base URL / 区域推给用户看）。
+   */
+  const fallbackAccount = (): PoolAccount | null => {
     return pool.available()[0] ?? pool.all()[0] ?? null;
   };
 
@@ -195,14 +205,14 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       () => account.credential?.region ?? account.record.region,
     );
 
-  /** 取账号：指定名字优先；否则当前粘性账号；再否则第一个可用账号。 */
+  /** 取账号：指定名字优先；否则用兜底账号。 */
   const pickAccount = (name?: string): PoolAccount | null => {
     if (name) {
       const found = pool.get(name);
       if (found) return found;
       throw new CredentialError(`没有账号 [${name}] —— 先用 \`mmcode accounts\` 看有哪些`);
     }
-    return currentAccount();
+    return fallbackAccount();
   };
 
   return {
@@ -210,14 +220,14 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     displayName: 'MiniMax Code',
     defaultPort: 8788,
     get upstreamLabel(): string {
-      const account = currentAccount();
+      const account = fallbackAccount();
       const r = account?.credential?.region ?? account?.record.region ?? resolveRegion(opts.region);
       const tag = r === 'global' ? ' (海外 Global)' : ' (国内 China)';
       const total = pool.all().length;
       const usable = pool.available().length;
-      const who = account ? account.record.name : '未登录';
+      const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
       const base = opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(r);
-      return `${base}${tag}  (Anthropic 兼容)  账号 ${who}（可用 ${usable}/${total}）`;
+      return `${base}${tag}  (Anthropic 兼容)  可用账号 ${usable}/${total} · ${modeTag}`;
     },
     // 模型清单走公开的 /mavis/api/v1/models（无需登录）；这里说明的是**聊天**所需凭证。
     loginHint: '登录（官方 OAuth 设备授权；按提示在浏览器完成授权）',
@@ -253,18 +263,22 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       },
       {
         name: 'accounts',
-        summary: '列出所有已配置账号及其状态（区域 / 健康 / 冷却 / 签到）',
+        summary: '列出所有已配置账号及其状态（优先级 / 额度 / 健康 / 冷却 / 签到）',
         usage: 'accounts',        async run({ json }) {
           const list = pool.refresh().map((a) => ({
             name: a.record.name,
             region: a.record.region,
             enabled: a.record.enabled,
+            priority: a.record.priority,
+            frozen: a.record.frozen === true,
+            frozenReason: a.record.frozenReason ?? null,
             loggedIn: a.credential !== null,
             health: a.record.health,
             healthDetail: a.record.healthDetail ?? null,
             disabledUntil: a.record.disabledUntil ?? null,
             lastUsedAt: a.record.lastUsedAt ?? null,
             lastCheckin: a.record.lastCheckin ?? null,
+            creditsRemaining: a.record.lastCredits?.remaining ?? null,
             account: a.credential?.account ?? null,
             tokenExpiresAt: a.credential?.expiresAt ?? null,
           }));
@@ -278,12 +292,20 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
               a.disabledUntil && a.disabledUntil > Date.now()
                 ? ` 冷却至 ${new Date(a.disabledUntil).toLocaleString('zh-CN')}`
                 : '';
+            const frozen = a.frozen ? ` ❄冻结${a.frozenReason ? '（' + a.frozenReason + '）' : ''}` : '';
             const checkin = a.lastCheckin ? ` 签到:${a.lastCheckin.outcome}` : '';
+            const credits =
+              a.creditsRemaining !== null ? ` 余额:${a.creditsRemaining}` : '';
             lines.push(
-              ` ${mark} ${a.name}  [${regionTag}]  ${a.loggedIn ? '已登录' : '未登录'}  健康:${a.health}${cooling}${checkin}`,
+              ` ${mark} ${a.name}  [${regionTag}]  优先级 ${a.priority}  ${a.loggedIn ? '已登录' : '未登录'}  健康:${a.health}${cooling}${frozen}${checkin}${credits}`,
             );
           }
-          lines.push('', `策略：${pool.getAccountStore().strategy()}（可用 ${pool.available().length}/${list.length}）`);
+          const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
+          lines.push(
+            '',
+            `模式：${modeTag}（可用 ${pool.available().length}/${list.length}）  最小可用积分：${pool.getAccountStore().creditsThreshold()}`,
+          );
+          lines.push('优先级数字越小越优先；同层账号随机分配。');
           return lines.join('\n');
         },
       },
@@ -383,19 +405,20 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
         };
       }
       const usable = pool.available();
-      const active = currentAccount();
+      const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
       const parts = accounts.map((a) => {
         const regionTag = a.record.region === 'global' ? '海外' : '国内';
         const state = a.credential
-          ? a.record.disabledUntil && a.record.disabledUntil > Date.now()
-            ? '冷却中'
-            : '就绪'
+          ? a.record.frozen === true
+            ? '额度冻结'
+            : a.record.disabledUntil && a.record.disabledUntil > Date.now()
+              ? '冷却中'
+              : '就绪'
           : '未登录';
-        return `${a.record.name}[${regionTag}]${state}`;
+        return `${a.record.name}[${regionTag}]P${a.record.priority}·${state}`;
       });
       const detail =
-        `账号 ${parts.length} 个（可用 ${usable.length}）：${parts.join('、')}` +
-        (active ? `；当前 ${active.record.name}` : '');
+        `账号 ${parts.length} 个（可用 ${usable.length}，${modeTag}）：${parts.join('、')}`;
       return {
         ok: usable.length > 0,
         detail,
@@ -412,8 +435,8 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
      * 改用 `mmcode login-poll` 续跑（设备码本身有效期 5 分钟）。
      */
     async login(): Promise<void> {
-      /* 登录进「当前账号」；一个号都没注册时用默认账号目录（老行为）。 */
-      const account = currentAccount();
+      /* 登录进「兜底账号」；一个号都没注册时用默认账号目录（老行为）。 */
+      const account = fallbackAccount();
       const dir = account?.dir;
       const region = account?.record.region ?? resolveRegion(opts.region);
       const state = await startDeviceLogin(region, dir);
@@ -447,7 +470,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     async listModels(): Promise<ModelEntry[]> {
       /* v0.3.5：真拉取 /mavis/api/v1/models（无需鉴权），失败回落内置清单。
          此前返回硬编码常量 —— 上游新增模型时必须发版才能跟上。 */
-      const account = currentAccount();
+      const account = fallbackAccount();
       const baseUrl = account
         ? baseUrlFor(account)
         : opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(resolveRegion(opts.region));
@@ -456,7 +479,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
 
     async doctorChecks() {
       const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
-      const account = currentAccount();
+      const account = fallbackAccount();
       const baseUrl = account
         ? baseUrlFor(account)
         : opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(resolveRegion(opts.region));
@@ -494,23 +517,47 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
             detail: cooling.map((a) => a.record.name).join('、') + ' 暂时不可用（已自动跳过）',
           });
         }
+        const frozen = pool.all().filter((a) => a.record.frozen === true);
+        if (frozen.length > 0) {
+          checks.push({
+            name: '额度冻结',
+            ok: true,
+            detail:
+              frozen.map((a) => `${a.record.name}（${a.record.frozenReason ?? '余额不足'}）`).join('、') +
+              ` 额度冻结，不参与调度（阈值 ${pool.getAccountStore().creditsThreshold()} 积分）`,
+          });
+        }
+        const modeTag = pool.mode() === 'balanced' ? '平衡模式（额度耗尽可无缝滑动）' : '最大缓存模式（会话不迁移）';
+        checks.push({ name: '调度模式', ok: true, detail: modeTag });
       }
       return checks;
     },
 
     /**
-     * 聊天 —— **带自动换号重试**。
+     * 聊天 —— **按 session 选号 + 模式感知的换号重试**。
+     *
+     * 选号由 `AccountPool.acquireForSession` 决定：
+     *   · 新 session → 最高可用优先级层，**层内随机**；
+     *   · 已有 session → 回到**绑定账号**（保住上游提示词缓存）。
+     *
+     * 失败后的重试受**模式**约束：
+     *   · `max-cache`：绑定账号不可用 ⇒ **不迁移**，直接报错（缓存语义优先）；
+     *   · `balanced`：绑定账号额度耗尽 / 不可用 ⇒ **无缝滑到**别的可用账号。
      *
      * 换号触发条件（且仅这些）：
-     *   401 / 403 → 凭证被别处登录顶掉（换号才有意义）；
-     *   429      → 限流（换号避让）；
+     *   401 / 403 → 凭证被别处登录顶掉；
+     *   429      → 限流 / 额度耗尽（同时冻结该号的额度）；
      *   令牌拿不到（refresh token 失效）→ 换号。
      *
      * ⚠️ 其它错误（5xx / 网络抖动）**不换号** —— 那是上游或网络整体的问题，
      *    换号只会把所有号都标记成故障，反而降低可用性。
      */
     async chat(body: ChatRequestBody, signal: AbortSignal): Promise<UpstreamCallResult> {
-      const payload = JSON.stringify(toAnthropicRequest(body));
+      /* ① 摘出上下文（session / 入站密钥 / 请求 id），并把运输痕迹擦干净。 */
+      const { ctx, body: cleanBody } = extractRequestContext(body);
+      const sessionKey = resolveSessionKey(ctx, cleanBody);
+      const anthropicReq = toAnthropicRequest(cleanBody);
+      const payload = JSON.stringify(anthropicReq);
       const tried = new Set<string>();
       let lastError: Error | null = null;
 
@@ -518,19 +565,29 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       const maxAttempts = Math.max(1, Math.min(pool.all().length || 1, 4));
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        let account = await pool.acquire();
-        if (!account) break;
-        if (tried.has(account.record.name)) {
-          /* 池又给了同一个号（理论上冷却已排除，这里兜底）—— 找没试过的。 */
-          const next = pool.available().find((a) => !tried.has(a.record.name));
-          if (!next) break;
-          tried.add(next.record.name);
-          account = next;
-        } else {
-          tried.add(account.record.name);
+        /* ② 按 session 选号。 */
+        const acquired = pool.acquireForSession(sessionKey);
+        if (!acquired.ok) {
+          if (acquired.reason === 'pinned') {
+            /* 最大缓存模式：绑定账号不可用 —— 不迁移，报清楚为什么。 */
+            const pinned = acquired.pinnedAccount ? pool.get(acquired.pinnedAccount) : null;
+            const hint =
+              pinned?.record.health === 'unauthorized'
+                ? '该账号的凭证已被别处登录顶掉，请给它重新授权（管理页或 `mmcode login`）。'
+                : '可以给它补额度（签到）或切换到「平衡」模式让会话自动滑动。';
+            throw new CredentialError(`${acquired.detail} ${hint}`);
+          }
+          break; /* 没有可用账号 → 走下面的兜底报错 */
         }
 
-        /* ① 取令牌。取不到 = refresh token 已被顶掉/失效 → 换号。 */
+        const account = acquired.account;
+        if (tried.has(account.record.name)) {
+          /* 池又给了同一个号（理论上失败过的号已被冷却排除，这里兜底）。 */
+          break;
+        }
+        tried.add(account.record.name);
+
+        /* ③ 取令牌。取不到 = refresh token 已被顶掉/失效 → 换号。 */
         let token: string;
         try {
           token = await account.tokens.accessToken();
@@ -541,8 +598,17 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
           continue;
         }
 
-        /* ② 打上游。 */
+        /* ④ 打上游。 */
         const baseUrl = baseUrlFor(account);
+        /* 记下「中转」信息：上游地址 + **转译后实际发给上游的请求体** ——
+           入站是 OpenAI/Anthropic 形状，出站统一是 Anthropic 兼容形状，
+           这一层翻译最容易出「我发的和上游收到的不一样」，请求详情里要能查。 */
+        pool.recordRequestTransit(ctx.reqId ?? null, {
+          upstream: `${baseUrl}${chatPath}`,
+          account: account.record.name,
+          protocol: 'anthropic',
+          payload: anthropicReq,
+        });
         let res: Response;
         try {
           res = await fetch(`${baseUrl}${chatPath}`, {
@@ -565,15 +631,15 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
           continue;
         }
 
-        /* ③ 非 2xx：只有「换号有意义」的状态才继续往下走。 */
+        /* ⑤ 非 2xx：只有「换号有意义」的状态才继续往下走。 */
         if (!res.ok || !res.body) {
           const text = await res.text().catch(() => '');
           const detail = `上游 HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`;
           if (res.status === 401 || res.status === 403 || res.status === 429) {
-            pool.reportFailure(account, AccountPool.classify(res.status), detail);
+            pool.reportFailure(account, classifyFailure(res.status), detail);
             lastError =
               res.status === 429
-                ? new UpstreamError(`${detail}（已限流，自动换下一个账号重试）`)
+                ? new UpstreamError(`${detail}（已限流，账号额度已冻结，自动换下一个账号重试）`)
                 : new CredentialError(
                     `上游鉴权失败（HTTP ${res.status}）—— 账号 [${account.record.name}] 的凭证已被别处登录顶掉` +
                       '：请给该账号重新授权（管理页或 `mmcode login`）',
@@ -585,8 +651,30 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
         }
 
         pool.reportSuccess(account);
-        /* 上游 Anthropic 事件流 → OpenAI SSE（core 负责把流吐给客户端）。 */
-        return { stream: res.body.pipeThrough(anthropicToOpenAiSse()), status: 200 };
+        pool.recordRequestAccount(ctx.reqId ?? null, account.record.name);
+
+        /* ⑥ 上游 Anthropic 事件流 → OpenAI SSE（core 负责把流吐给客户端）。
+           顺带把 usage 摘出来记进台账 —— 洞察面板的 token 统计就来自这里。 */
+        const openAiStream = res.body.pipeThrough(anthropicToOpenAiSse());
+        const stream = collectUsage(openAiStream, (usage) => {
+          /* 权威用量（含缓存命中）：先按请求 id 存下来，供反代层写请求日志 ——
+             Anthropic 路线经 core 重编码后缓存字段会被丢掉，只有这一层拿得到。 */
+          pool.recordRequestUsage(ctx.reqId ?? null, {
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            cachedTokens: usage.cachedTokens,
+            totalTokens: usage.totalTokens,
+          });
+          opts.insights?.record({
+            account: account.record.name,
+            sessionKey,
+            model: cleanBody.model,
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            cachedTokens: usage.cachedTokens,
+          });
+        });
+        return { stream, status: 200 };
       }
 
       /* 所有账号都试过了。 */
