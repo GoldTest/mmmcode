@@ -15,6 +15,7 @@
  *   DELETE /admin/api/session            登出
  *   GET    /admin/api/accounts           账号列表（含状态）
  *   POST   /admin/api/accounts           { name, region } → 新增/登记账号
+ *   POST   /admin/api/accounts/reorder   { order: [name, ...] } → 调整账号展示顺序
  *   PATCH  /admin/api/accounts/:name     { enabled?, notes?, region? }
  *   DELETE /admin/api/accounts/:name     删除账号（含令牌文件）
  *   POST   /admin/api/accounts/:name/login    发起设备授权 → 返回短码与链接
@@ -263,6 +264,21 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const record = store.upsert(name, region);
         const found = ctx.pool.get(name);
         sendJson(res, 200, { ok: true, account: found ? accountView(found) : record });
+        return true;
+      }
+
+      /* ── 调整账号展示顺序 ──
+         注意：这里只改**注册表里的排列顺序**（管理页看到什么就是什么），
+         调度优先级仍由每个账号自己的 `priority` 字段决定。 */
+      if (route === 'accounts/reorder' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const raw = Array.isArray(body.order) ? body.order : [];
+        const order = raw.filter((n): n is string => typeof n === 'string' && n.length > 0);
+        const accounts = store.reorder(order).map((rec) => {
+          const found = ctx.pool.get(rec.name);
+          return found ? accountView(found) : rec;
+        });
+        sendJson(res, 200, { ok: true, accounts });
         return true;
       }
 

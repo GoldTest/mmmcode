@@ -379,6 +379,29 @@ export class AccountStore {
     return { ...record };
   }
 
+  /**
+   * 按给定顺序重排账号列表。
+   *
+   * 用于管理页的「调整顺序」—— 网页上看到的排列顺序即注册表里的顺序。
+   * 未出现在 `order` 里的账号保持相对次序，排在已列出的账号之后。
+   *
+   * 注意：**顺序只影响展示**，调度优先级仍由 `priority` 字段决定。
+   */
+  reorder(order: string[]): AccountRecord[] {
+    const rank = new Map<string, number>();
+    order.forEach((name, i) => {
+      if (!rank.has(name)) rank.set(name, i);
+    });
+    /* 未列出的账号排到后面，之间保持原有相对次序。 */
+    const tail = this.data.accounts.filter((a) => !rank.has(a.name));
+    const head = order
+      .map((name) => this.data.accounts.find((a) => a.name === name))
+      .filter((a): a is AccountRecord => Boolean(a));
+    this.data.accounts = [...head, ...tail];
+    this.save();
+    return this.list();
+  }
+
   /** 局部更新一个账号；返回更新后的副本（账号不存在返回 null）。 */
   update(name: string, patch: Partial<Omit<AccountRecord, 'name' | 'createdAt'>>): AccountRecord | null {
     const target = this.data.accounts.find((a) => a.name === name);

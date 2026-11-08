@@ -159,3 +159,43 @@ describe('AccountStore：注册与持久化', () => {
     expect(store.get('safe_name-1')).not.toBeNull();
   });
 });
+
+describe('AccountStore：调整顺序', () => {
+  it('reorder 按给定顺序重排账号', () => {
+    const store = new AccountStore();
+    store.upsert('a1');
+    store.upsert('a2');
+    store.upsert('a3');
+    store.reorder(['a3', 'a1', 'a2']);
+    expect(store.list().map((a) => a.name)).toEqual(['a3', 'a1', 'a2']);
+  });
+
+  it('reorder 后的顺序会落盘（新实例读得到）', () => {
+    const store = new AccountStore();
+    store.upsert('a1');
+    store.upsert('a2');
+    store.reorder(['a2', 'a1']);
+    const reopened = new AccountStore();
+    expect(reopened.list().map((a) => a.name)).toEqual(['a2', 'a1']);
+  });
+
+  it('reorder 未列出的账号保留在后面（不丢人）', () => {
+    const store = new AccountStore();
+    store.upsert('a1');
+    store.upsert('a2');
+    store.upsert('a3');
+    store.reorder(['a3']);
+    expect(store.list().map((a) => a.name)).toEqual(['a3', 'a1', 'a2']);
+  });
+
+  it('reorder 不影响优先级与其它状态字段', () => {
+    const store = new AccountStore();
+    store.upsert('a1');
+    store.upsert('a2');
+    store.update('a1', { priority: 5, health: 'unauthorized' });
+    store.reorder(['a2', 'a1']);
+    const rec = store.get('a1');
+    expect(rec?.priority).toBe(5);
+    expect(rec?.health).toBe('unauthorized');
+  });
+});

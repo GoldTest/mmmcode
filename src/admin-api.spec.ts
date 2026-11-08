@@ -266,6 +266,28 @@ describe('Admin API: 新增功能路由测试', () => {
     }
   });
 
+  it('★ POST /admin/api/accounts/reorder 调整账号展示顺序', async () => {
+    const ctx = await setupServer();
+    try {
+      await ctx.req('/admin/api/accounts', { method: 'POST', body: { name: 'a1', region: 'cn' } });
+      await ctx.req('/admin/api/accounts', { method: 'POST', body: { name: 'a2', region: 'cn' } });
+      await ctx.req('/admin/api/accounts', { method: 'POST', body: { name: 'a3', region: 'cn' } });
+
+      const res = await ctx.req('/admin/api/accounts/reorder', {
+        method: 'POST',
+        body: { order: ['a3', 'a1', 'a2'] },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.accounts.map((a: any) => a.name)).toEqual(['a3', 'a1', 'a2']);
+
+      /* 列表接口也要按新顺序返回。 */
+      const list = await ctx.req('/admin/api/accounts');
+      expect(list.body.accounts.map((a: any) => a.name)).toEqual(['a3', 'a1', 'a2']);
+    } finally {
+      await ctx.close();
+    }
+  });
+
   it('★ GET /admin/api/insights 给出各账号 token 用量', async () => {
     const ctx = await setupServer();
     try {

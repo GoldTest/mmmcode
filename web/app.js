@@ -501,11 +501,16 @@ function renderAccounts() {
 
 function renderAccountCard(a) {
   const card = document.createElement('div');
-  card.className = 'card' + (a.enabled ? '' : ' disabled');
+  card.className = 'card card-account' + (a.enabled ? '' : ' disabled');
+  card.dataset.name = a.name;
+
+  /* 令牌失效判定：健康态为 unauthorized，或令牌已过期 —— 这两种情况才需要重新授权。 */
+  const tokenDead = a.health === 'unauthorized' || (a.tokenExpiresAt != null && a.tokenExpiresAt <= Date.now());
 
   const top = document.createElement('div');
   top.className = 'card-top';
   const left = document.createElement('div');
+  left.className = 'card-head';
   left.innerHTML = `
     <div class="card-name">${escapeHtml(a.name)}${a.isDefault ? ' <span class="muted small">（默认）</span>' : ''}</div>
     <div class="card-sub">${escapeHtml(regionTag(a.region))}${a.account ? ' · 账号 ' + escapeHtml(a.account) + '…' : ''}</div>
@@ -549,7 +554,7 @@ function renderAccountCard(a) {
   prioInput.step = '1';
   prioInput.className = 'prio-input';
   prioInput.value = String(a.priority ?? 0);
-  prioInput.title = '数字越小越优先（0 为最高层），修改后回车或失焦即生效';
+  prioInput.title = '数字越小越优先（0 为最高层）';
   prioInput.addEventListener('change', async () => {
     const next = Math.max(0, Math.min(99, Math.trunc(Number(prioInput.value) || 0)));
     if (next === (a.priority ?? 0)) {
@@ -573,16 +578,17 @@ function renderAccountCard(a) {
   });
   prioRow.appendChild(prioLabel);
   prioRow.appendChild(prioInput);
-  const prioHint = document.createElement('span');
-  prioHint.className = 'small muted';
-  prioHint.textContent = '数字越小越优先（0 最高层），回车或失焦生效';
-  prioRow.appendChild(prioHint);
   card.appendChild(prioRow);
 
   const actions = document.createElement('div');
   actions.className = 'card-actions';
 
-  actions.appendChild(mkBtn(a.loggedIn ? '重新授权' : '登录授权', 'primary sm', () => startLogin(a.name, a.region)));
+  /* 未登录 → 首次登录授权；令牌失效 → 重新授权。令牌正常时不显示授权按钮。 */
+  if (!a.loggedIn) {
+    actions.appendChild(mkBtn('登录授权', 'primary sm', () => startLogin(a.name, a.region)));
+  } else if (tokenDead) {
+    actions.appendChild(mkBtn('重新授权', 'primary sm', () => startLogin(a.name, a.region)));
+  }
 
   actions.appendChild(mkBtn('体检', 'ghost sm', async (btn) => {
     btn.disabled = true;
@@ -652,6 +658,13 @@ function renderAccountCard(a) {
     }
   }));
 
+  /* 调整展示顺序 —— 只改卡片排列，不影响调度优先级。 */
+  const orderBtns = document.createElement('div');
+  orderBtns.className = 'card-order';
+  orderBtns.appendChild(mkBtn('↑', 'ghost sm icon-only', (btn) => moveAccount(a.name, -1, btn)));
+  orderBtns.appendChild(mkBtn('↓', 'ghost sm icon-only', (btn) => moveAccount(a.name, 1, btn)));
+  actions.appendChild(orderBtns);
+
   actions.appendChild(mkBtn('删除', 'danger sm', async () => {
     if (!confirm(`确定删除账号「${a.name}」？\n其令牌文件将一并删除。`)) return;
     try {
@@ -685,6 +698,27 @@ function renderAccountCard(a) {
     if (!a.enabled) t('已停用', '');
   }
   return card;
+}
+
+/**
+ * 把某个账号往上/往下挪一位（仅调整展示顺序，不改调度优先级）。
+ *
+ * 顺序以服务端返回的账号列表为准，整体重排后一次性提交。
+ */
+async function moveAccount(name, delta, btn) {
+  const names = state.accounts.map((a) => a.name);
+  const idx = names.indexOf(name);
+  const target = idx + delta;
+  if (idx < 0 || target < 0 || target >= names.length) return;
+  names.splice(target, 0, names.splice(idx, 1)[0]);
+  if (btn) btn.disabled = true;
+  try {
+    await api('/admin/api/accounts/reorder', { method: 'POST', body: { order: names } });
+    await loadAccounts();
+  } catch (err) {
+    toast('调整顺序失败：' + err.message, 'err');
+    await loadAccounts();
+  }
 }
 
 function mkBtn(text, cls, onClick) {

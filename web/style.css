@@ -188,6 +188,8 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
   gap: 14px;
   padding: 18px;
 }
+/* 账号卡片：**横向占满一行** —— 一行一个账号，信息展开成横向条。 */
+.cards-account { grid-template-columns: 1fr; }
 .card {
   background: var(--bg-soft);
   border: 1px solid var(--line);
@@ -223,6 +225,25 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 }
 .card-metrics b { color: var(--fg); font-weight: 500; }
 .card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
+
+/* ───────── 账号卡片（横向一行） ───────── */
+.card-account {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.1fr) minmax(260px, 1.4fr) auto;
+  grid-template-areas:
+    "head metrics actions"
+    "prio metrics actions";
+  align-items: start;
+  column-gap: 18px;
+  row-gap: 8px;
+}
+.card-account .card-top { grid-area: head; align-items: flex-start; }
+.card-account .card-head { min-width: 0; }
+.card-account .card-metrics { grid-area: metrics; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; }
+.card-account .card-priority { grid-area: prio; align-self: end; }
+.card-account .card-actions { grid-area: actions; align-self: center; justify-content: flex-end; }
+.card-account .card-order { display: inline-flex; gap: 4px; margin-right: 2px; }
+.card-account button.icon-only { padding: 4px 8px; font-size: 13px; line-height: 1; }
 
 /* 账号卡片上的优先级编辑行 */
 .card-priority {
@@ -549,6 +570,16 @@ pre.code-block {
 @media (max-width: 768px) {
   main { padding: 12px; }
   .cards { grid-template-columns: 1fr; }
+  /* 账号卡片在窄屏下堆叠成单列。 */
+  .card-account {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "head"
+      "metrics"
+      "prio"
+      "actions";
+  }
+  .card-account .card-actions { justify-content: flex-start; }
   .kv { grid-template-columns: 1fr; gap: 4px 0; }
   .kv dd { margin-bottom: 8px; }
   .nav-tabs { padding: 0 12px; justify-content: center; }
