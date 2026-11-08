@@ -282,7 +282,7 @@ function renderCard(a) {
   const actions = document.createElement('div');
   actions.className = 'card-actions';
 
-  actions.appendChild(mkBtn(a.loggedIn ? '重新授权' : '登录', 'primary sm', () => startLogin(a.name)));
+  actions.appendChild(mkBtn(a.loggedIn ? '重新授权' : '登录', 'primary sm', () => startLogin(a.name, a.region)));
   actions.appendChild(mkBtn('签到', 'ghost sm', async (btn) => {
     btn.disabled = true;
     btn.textContent = '签到中…';
@@ -557,19 +557,26 @@ $('#btn-add').addEventListener('click', () => {
 
 /* ───────────────────────── OAuth 设备授权 ───────────────────────── */
 
-async function startLogin(name) {
+async function startLogin(name, region) {
   let res;
   try {
-    res = await api(`/admin/api/accounts/${encodeURIComponent(name)}/login`, { method: 'POST' });
+    const payload = region ? { region } : {};
+    res = await api(`/admin/api/accounts/${encodeURIComponent(name)}/login`, {
+      method: 'POST',
+      body: payload,
+    });
   } catch (err) {
     toast('发起授权失败：' + err.message, 'err');
     return;
   }
+  const isGlobal = region === 'global' || (res.verificationUriComplete && res.verificationUriComplete.includes('.minimax.io'));
+  const regionLabel = isGlobal ? '海外 Global' : '国内 China';
   openModal(
-    `授权登录 · ${name}`,
-    `<p class="muted">请在浏览器打开下面的链接，用你的 MiniMax 账号完成授权。授权后本页会自动继续。</p>
+    `授权登录 · ${name} (${regionLabel})`,
+    `<p class="muted">请在浏览器打开下面的链接，登录你的 MiniMax <b>${regionLabel}</b> 账号完成授权。授权后本页会自动继续。<br>
+     <span class="small" style="opacity:0.85;">说明：链接已内嵌授权码，在打开的网页上直接登录海外账号即可自动完成授权，无需手动输码。</span></p>
      <div class="usercode">${escapeHtml(res.userCode)}</div>
-     <p style="text-align:center"><a href="${escapeHtml(res.verificationUriComplete)}" target="_blank" rel="noopener">打开授权页面 ↗</a></p>
+     <p style="text-align:center"><a href="${escapeHtml(res.verificationUriComplete)}" target="_blank" rel="noopener">打开 ${regionLabel} 授权页面 ↗</a></p>
      <div class="progress"><i></i></div>
      <p id="login-status" class="muted small" style="text-align:center">等待授权中…</p>`,
     '<button class="ghost" data-close>关闭</button>',

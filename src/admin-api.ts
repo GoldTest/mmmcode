@@ -354,9 +354,10 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         /* 发起设备授权 */
         if (action === 'login' && method === 'POST') {
           const body = await readJsonBody(req);
-          const region: MinimaxRegion = body.region === 'global' ? 'global' : 'cn';
           const found = mustFind(name);
-          if (region !== found.record.region) store.update(name, { region });
+          const explicitRegion = body.region === 'global' ? 'global' : body.region === 'cn' ? 'cn' : undefined;
+          const region: MinimaxRegion = explicitRegion ?? found.record.region ?? 'cn';
+          if (explicitRegion && explicitRegion !== found.record.region) store.update(name, { region: explicitRegion });
           const state = await startDeviceLogin(region, found.dir);
           sendJson(res, 200, {
             ok: true,

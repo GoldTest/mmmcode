@@ -184,11 +184,16 @@ export async function startDeviceLogin(region?: MinimaxRegion | string | null, d
 
   const deviceCode = typeof body.device_code === 'string' ? body.device_code : '';
   const userCode = typeof body.user_code === 'string' ? body.user_code : '';
-  const uri = typeof body.verification_uri_complete === 'string' && body.verification_uri_complete
+  let uri = typeof body.verification_uri_complete === 'string' && body.verification_uri_complete
     ? body.verification_uri_complete
     : typeof body.verification_uri === 'string'
       ? body.verification_uri
       : '';
+  if (resolvedRegion === 'global' && uri.includes('account.minimax.cn')) {
+    uri = uri.replace('account.minimax.cn', 'account.minimax.io');
+  } else if (resolvedRegion === 'cn' && uri.includes('account.minimax.io')) {
+    uri = uri.replace('account.minimax.io', 'account.minimax.cn');
+  }
   if (!deviceCode || !userCode || !uri) {
     throw new UpstreamError('设备码响应缺少 device_code / user_code / verification_uri');
   }

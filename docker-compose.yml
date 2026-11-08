@@ -14,8 +14,7 @@
 
 services:
   mmcode:
-    build: .
-    image: waygate-mmcode:latest
+    image: ghcr.io/goldtest/mmmcode:latest
     container_name: waygate-mmcode
     restart: unless-stopped
 
