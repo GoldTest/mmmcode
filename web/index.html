@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MiniMax Code 账号管理</title>
+<title>MiniMax Code 本地反代管理</title>
 <link rel="stylesheet" href="./style.css">
 <link rel="stylesheet" href="./keys.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔑</text></svg>">
@@ -13,75 +13,465 @@
 <!-- ─────────── 登录 ─────────── -->
 <div id="login-view" class="login-wrap hidden">
   <form id="login-form" class="login-card">
-    <h1>MiniMax Code 账号管理</h1>
+    <h1>MiniMax Code 反代管理</h1>
     <p class="muted">请输入管理密钥以继续。</p>
     <input id="login-key" type="password" placeholder="管理密钥" autocomplete="current-password" autofocus>
-    <button type="submit" class="primary">进入</button>
+    <button type="submit" class="primary" style="width:100%;margin-top:4px;">进入管理页</button>
     <p id="login-error" class="error hidden"></p>
+    <details class="hint">
+      <summary>不知道管理密钥？</summary>
+      <p>管理密钥由服务首次启动时自动生成，保存在本地：<br><code id="login-admin-path">~/.waygate/mmcode/admin.json</code></p>
+    </details>
   </form>
 </div>
 
 <!-- ─────────── 主界面 ─────────── -->
 <div id="app-view" class="hidden">
+  <!-- 顶栏 -->
   <header class="topbar">
     <div class="brand">
       <span class="logo">◈</span>
       <div>
-        <h1>MiniMax Code 账号管理</h1>
+        <h1>MiniMax Code 本地反代</h1>
         <p id="upstream-label" class="muted small">加载中…</p>
       </div>
     </div>
     <div class="topbar-actions">
       <span id="proxy-badge" class="badge">反代 —</span>
-      <button id="btn-settings" class="ghost">设置</button>
-      <button id="btn-logout" class="ghost">退出</button>
+      <span id="account-badge" class="badge">账号 —</span>
+      <button id="btn-top-refresh" class="ghost sm">刷新数据</button>
+      <button id="btn-logout" class="ghost sm danger">退出</button>
     </div>
   </header>
 
+  <!-- Tab 导航 -->
+  <nav class="nav-tabs" id="nav-tabs">
+    <button class="tab-btn active" data-tab="tab-accounts">
+      <span>🗂️</span> 账号与凭证
+    </button>
+    <button class="tab-btn" data-tab="tab-proxy">
+      <span>⚡</span> 反代服务管理
+    </button>
+    <button class="tab-btn" data-tab="tab-requests">
+      <span>📊</span> 请求详情与监控
+    </button>
+    <button class="tab-btn" data-tab="tab-settings">
+      <span>⚙️</span> 设置选项
+    </button>
+  </nav>
+
   <main>
-    <!-- 账号池 -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2>账号池</h2>
-        <div class="panel-actions">
-          <label class="field inline">
-            切换策略
-            <select id="strategy-select">
-              <option value="sticky">粘性优先 + 故障转移</option>
-              <option value="round-robin">严格轮询（均摊额度）</option>
+    <!-- ═══════════ Tab 1: 账号与凭证 (第一栏) ═══════════ -->
+    <div id="tab-accounts" class="tab-pane active">
+      <!-- 1.1 账号池 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>👥</span> 账号池管理</h2>
+          <div class="panel-actions">
+            <label class="field inline">
+              切换策略
+              <select id="strategy-select">
+                <option value="sticky">粘性优先 + 故障转移</option>
+                <option value="round-robin">严格轮询（均摊额度）</option>
+              </select>
+            </label>
+            <label class="field inline">
+              粘性当前账号
+              <select id="active-account-select">
+                <option value="">自动首选</option>
+              </select>
+            </label>
+            <button id="btn-add" class="primary sm">+ 新增账号</button>
+            <button id="btn-refresh-accounts" class="ghost sm">刷新</button>
+          </div>
+        </div>
+        <div id="account-list" class="cards"></div>
+        <p id="accounts-empty" class="muted hidden pad">还没有账号。点「新增账号」登记一个，再在浏览器完成授权登录。</p>
+      </section>
+
+      <!-- 1.2 自动签到 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>
+            <span>📅</span> 自动签到
+            <span id="checkin-status-badge" class="badge ok">后台已开启</span>
+          </h2>
+          <div class="panel-actions">
+            <span id="checkin-next-time" class="small muted">每天定时 08:00</span>
+            <button id="btn-checkin-all" class="primary sm">立即全员签到</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>账号名</th>
+                <th>区域</th>
+                <th>今日签到状态</th>
+                <th>连续签到</th>
+                <th>今日奖励</th>
+                <th>最近签到时间</th>
+                <th>积分账本 (剩余/总计)</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="checkin-table-body">
+              <tr><td colspan="8" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 1.3 自动令牌刷新 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>
+            <span>🔄</span> 自动令牌刷新
+            <span id="refresh-status-badge" class="badge ok">后台自动巡检中</span>
+          </h2>
+          <div class="panel-actions">
+            <span id="refresh-interval-label" class="small muted">每 15 分钟巡检 (余量 < 30m 自动续期)</span>
+            <button id="btn-refresh-tokens-all" class="ghost sm">立即巡检刷新全部</button>
+            <button id="btn-force-refresh-tokens" class="ghost sm">强制重新签发</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>账号名</th>
+                <th>Access Token 状态</th>
+                <th>到期时刻</th>
+                <th>剩余有效时间</th>
+                <th>健康检查状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tokens-table-body">
+              <tr><td colspan="6" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 1.4 客户端密钥管理 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>🔑</span> 客户端密钥管理</h2>
+          <div class="panel-actions">
+            <button id="btn-new-key" class="primary sm">+ 生成新密钥</button>
+            <button id="btn-refresh-keys" class="ghost sm">刷新</button>
+          </div>
+        </div>
+        <div id="client-setup" class="setup"></div>
+        <div id="key-list" class="keys"></div>
+        <p id="keys-empty" class="muted hidden pad">还没有客户端密钥。点「生成新密钥」创建一把，配置到 Claude Code 或 Cursor 等客户端中。</p>
+      </section>
+    </div>
+
+    <!-- ═══════════ Tab 2: 反代服务详细管理 (第二栏) ═══════════ -->
+    <div id="tab-proxy" class="tab-pane">
+      <!-- 2.1 运行概览与拓扑 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>🌐</span> 反代运行拓扑与状态</h2>
+          <div class="panel-actions">
+            <button id="btn-ping-upstream" class="ghost sm">Ping 测试上游</button>
+          </div>
+        </div>
+        <div id="proxy-detail-kv" class="kv"></div>
+      </section>
+
+      <!-- 2.2 多账号调度策略与故障冷却池 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>🛡️</span> 故障转移与冷却池监控</h2>
+          <div class="panel-actions">
+            <button id="btn-clear-cooldowns" class="ghost sm danger">解除所有账号冷却</button>
+          </div>
+        </div>
+        <div style="padding: 18px;">
+          <div id="cooldown-summary" class="muted small" style="margin-bottom:12px;"></div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>健康状态</th>
+                  <th>冷却截止时间</th>
+                  <th>冷却倒计时</th>
+                  <th>触发原因与详情</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="cooldown-table-body">
+                <tr><td colspan="6" class="muted">无账号处于冷却中</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2.3 支持的端点与模型速查 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>📋</span> 可用模型与端点速查</h2>
+          <div class="panel-actions">
+            <button id="btn-reload-models" class="ghost sm">从上游刷新模型</button>
+          </div>
+        </div>
+        <div style="padding: 18px;">
+          <h3 style="margin:0 0 10px;font-size:13px;color:var(--fg-dim);">兼容路由端点</h3>
+          <div class="cards" style="padding:0 0 18px;grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
+            <div class="card" style="padding:12px;">
+              <b>OpenAI 兼容端点</b>
+              <code>POST /v1/chat/completions</code>
+              <p class="muted small" style="margin:0;">供 Cursor、NextChat 等客户端使用，支持流式 SSE。</p>
+            </div>
+            <div class="card" style="padding:12px;">
+              <b>Anthropic 兼容端点</b>
+              <code>POST /v1/messages</code>
+              <p class="muted small" style="margin:0;">供 Claude Code 等客户端使用，自动协议转义。</p>
+            </div>
+            <div class="card" style="padding:12px;">
+              <b>模型列表端点</b>
+              <code>GET /v1/models</code>
+              <p class="muted small" style="margin:0;">返回 OpenAI 格式的模型清单与权限。</p>
+            </div>
+          </div>
+
+          <h3 style="margin:0 0 10px;font-size:13px;color:var(--fg-dim);">当前支持的模型列表</h3>
+          <div id="proxy-models-list" class="tags"></div>
+        </div>
+      </section>
+
+      <!-- 2.4 在线快速调试与联通性验证 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>🧪</span> 反代在线测试与调试</h2>
+        </div>
+        <div style="padding: 18px; display:flex; flex-direction:column; gap:12px;">
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <label class="field inline">
+              选择模型
+              <select id="test-model-select"></select>
+            </label>
+            <input id="test-prompt-input" type="text" placeholder="输入测试提示词，如：你好，请做个自我介绍" style="flex:1;min-width:240px;">
+            <button id="btn-send-test" class="primary sm">发送测试请求</button>
+          </div>
+          <div id="test-result-box" class="hidden">
+            <p id="test-result-status" class="small muted" style="margin:4px 0;"></p>
+            <pre id="test-result-output" class="code-block"></pre>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ═══════════ Tab 3: 请求详情显示 (第三栏) ═══════════ -->
+    <div id="tab-requests" class="tab-pane">
+      <!-- 3.1 实时监控与统计指标 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>
+            <span><i id="live-dot" class="live-dot"></i></span> 实时请求监控
+          </h2>
+          <div class="panel-actions">
+            <label class="field inline">
+              <input type="checkbox" id="auto-refresh-toggle" checked>
+              实时自动轮询
+            </label>
+            <select id="auto-refresh-interval" class="sm">
+              <option value="1000">1 秒刷新</option>
+              <option value="2000" selected>2 秒刷新</option>
+              <option value="5000">5 秒刷新</option>
             </select>
-          </label>
-          <button id="btn-add" class="primary">新增账号</button>
-          <button id="btn-refresh" class="ghost">刷新</button>
+            <button id="btn-refresh-requests" class="ghost sm">立即刷新</button>
+          </div>
+        </div>
+        <!-- 指标总览 -->
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-label">总请求数</span>
+            <span id="stat-total-logged" class="stat-num">0</span>
+            <span class="stat-sub">当前缓存: <b id="stat-cached-count">0</b> 条</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">请求成功率</span>
+            <span id="stat-success-rate" class="stat-num">100%</span>
+            <span class="stat-sub"><span style="color:var(--ok)">✓ <span id="stat-success-count">0</span></span> / <span style="color:var(--err)">✕ <span id="stat-error-count">0</span></span></span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">平均响应耗时</span>
+            <span id="stat-avg-duration" class="stat-num">0 ms</span>
+            <span class="stat-sub">包含端到端网络往返</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">消耗总 Token</span>
+            <span id="stat-total-tokens" class="stat-num">0</span>
+            <span class="stat-sub">输入: <span id="stat-prompt-tokens">0</span> | 输出: <span id="stat-completion-tokens">0</span></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3.2 缓存与存储管理 (存储多久/多少管理) -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>💾</span> 缓存存储管理（保留条数 / 保留时长）</h2>
+          <div class="panel-actions">
+            <button id="btn-export-requests" class="ghost sm">导出 JSON 日志</button>
+            <button id="btn-clear-requests" class="ghost sm danger">清空所有请求缓存</button>
+          </div>
+        </div>
+        <div style="padding: 16px 18px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+          <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+            <label class="field inline">
+              最大存储条数上限
+              <select id="cache-max-items">
+                <option value="50">50 条</option>
+                <option value="100">100 条</option>
+                <option value="200" selected>200 条 (默认)</option>
+                <option value="500">500 条</option>
+                <option value="1000">1000 条</option>
+              </select>
+            </label>
+            <label class="field inline">
+              缓存保留时长
+              <select id="cache-retention-time">
+                <option value="3600000">1 小时</option>
+                <option value="21600000">6 小时</option>
+                <option value="86400000" selected>24 小时 (默认)</option>
+                <option value="259200000">3 天</option>
+                <option value="604800000">7 天</option>
+                <option value="0">永久保留 (仅按条数上限淘汰)</option>
+              </select>
+            </label>
+            <button id="btn-save-cache-config" class="primary sm">保存缓存规则</button>
+          </div>
+          <div class="muted small">
+            内存占用预估：<span id="cache-memory-estimate">0 KB</span> | 最早记录：<span id="cache-oldest-time">—</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3.3 请求列表与筛选 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2><span>📑</span> 入站请求历史</h2>
+          <div class="panel-actions">
+            <label class="field inline">
+              状态
+              <select id="req-filter-status" class="sm">
+                <option value="all">全部</option>
+                <option value="success">成功 2xx</option>
+                <option value="error">异常 4xx/5xx</option>
+              </select>
+            </label>
+            <input id="req-search-input" type="text" placeholder="搜索 ID / 提示词 / 回复 / 模型..." class="sm" style="width:220px;">
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>状态</th>
+                <th>耗时</th>
+                <th>路由与端点</th>
+                <th>请求模型</th>
+                <th>调用账号</th>
+                <th>客户端密钥</th>
+                <th>Tokens (入/出)</th>
+                <th>输入/输出摘要</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="requests-table-body">
+              <tr><td colspan="10" class="muted">暂无请求记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- ═══════════ Tab 4: 设置选项 (第四栏) ═══════════ -->
+    <div id="tab-settings" class="tab-pane">
+      <div class="form-grid">
+        <!-- 4.1 管理密钥修改 -->
+        <div class="form-box">
+          <h3><span>🔒</span> 修改管理密钥</h3>
+          <p class="muted small">更新进本管理界面的管理密钥，修改后需要用新密钥重新登录。</p>
+          <form id="admin-key-form" style="display:flex; flex-direction:column; gap:10px;">
+            <label class="field">
+              新管理密钥（至少 6 位字符）
+              <input id="new-admin-key" type="password" placeholder="输入新密钥" required minlength="6">
+            </label>
+            <label class="field">
+              确认新管理密钥
+              <input id="new-admin-key-confirm" type="password" placeholder="再次输入新密钥" required minlength="6">
+            </label>
+            <button type="submit" class="primary sm" style="align-self:flex-start;">更新管理密钥</button>
+          </form>
+        </div>
+
+        <!-- 4.2 后台自动任务调度设置 -->
+        <div class="form-box">
+          <h3><span>⏱️</span> 自动签到与自动刷新调度</h3>
+          <form id="scheduler-form" style="display:flex; flex-direction:column; gap:10px;">
+            <label class="field inline">
+              <input type="checkbox" id="setting-checkin-enabled" checked>
+              启用每日自动签到
+            </label>
+            <label class="field inline">
+              每日签到时间
+              <input type="text" id="setting-checkin-time" value="08:00" placeholder="08:00" style="width:90px;">
+            </label>
+            <hr style="border:none;border-top:1px solid var(--line);margin:4px 0;">
+            <label class="field inline">
+              <input type="checkbox" id="setting-refresh-enabled" checked>
+              启用令牌后台自动刷新
+            </label>
+            <label class="field inline">
+              巡检周期（分钟）
+              <input type="number" id="setting-refresh-interval" value="15" min="1" max="1440" style="width:90px;">
+            </label>
+            <label class="field inline">
+              提前刷新余量（分钟）
+              <input type="number" id="setting-refresh-margin" value="30" min="5" max="300" style="width:90px;">
+            </label>
+            <button type="submit" class="primary sm" style="align-self:flex-start;">保存调度设置</button>
+          </form>
+        </div>
+
+        <!-- 4.3 客户端接入指南与环境配置 -->
+        <div class="form-box">
+          <h3><span>💻</span> 客户端快速接入代码</h3>
+          <p class="muted small">复制并粘贴至对应客户端的终端或设置中。</p>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div>
+              <span class="small" style="font-weight:600;">Claude Code:</span>
+              <pre id="snippet-claude" class="code-block"></pre>
+            </div>
+            <div>
+              <span class="small" style="font-weight:600;">Cursor / OpenAI 兼容:</span>
+              <pre id="snippet-cursor" class="code-block"></pre>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4.4 系统环境与配置路径 -->
+        <div class="form-box">
+          <h3><span>ℹ️</span> 系统运行环境信息</h3>
+          <div id="system-info-kv" class="kv" style="padding:0; grid-template-columns:120px 1fr; font-size:12px;"></div>
+          <div style="margin-top:12px;">
+            <button id="btn-bottom-logout" class="danger sm">退出管理登录</button>
+          </div>
         </div>
       </div>
-      <div id="account-list" class="cards"></div>
-      <p id="accounts-empty" class="muted hidden">还没有账号。点「新增账号」登记一个，再到 MiniMax 官网授权登录。</p>
-    </section>
-
-    <!-- 客户端密钥 -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2>客户端密钥</h2>
-        <div class="panel-actions">
-          <button id="btn-new-key" class="primary">生成新密钥</button>
-          <button id="btn-refresh-keys" class="ghost">刷新</button>
-        </div>
-      </div>
-      <div id="client-setup" class="setup"></div>
-      <div id="key-list" class="keys"></div>
-      <p id="keys-empty" class="muted hidden pad">还没有客户端密钥。点「生成新密钥」创建一把，填进 Claude Code / Cursor 等客户端。</p>
-    </section>
-
-    <!-- 服务 -->
-    <section class="panel">
-      <div class="panel-head"><h2>服务</h2></div>
-      <div id="service-info" class="kv"></div>
-    </section>
+    </div>
   </main>
 </div>
 
-<!-- ─────────── 弹窗 ─────────── -->
+<!-- ─────────── 通用弹窗 ─────────── -->
 <div id="modal" class="modal hidden">
   <div class="modal-card">
     <div class="modal-head">
@@ -90,6 +480,21 @@
     </div>
     <div id="modal-body" class="modal-body"></div>
     <div id="modal-foot" class="modal-foot"></div>
+  </div>
+</div>
+
+<!-- ─────────── 请求详情大型弹窗 ─────────── -->
+<div id="request-detail-modal" class="modal hidden">
+  <div class="modal-card large">
+    <div class="modal-head">
+      <h3 id="req-modal-title">请求详情</h3>
+      <button id="req-modal-close" class="icon-btn" aria-label="关闭">✕</button>
+    </div>
+    <div id="req-modal-body" class="modal-body"></div>
+    <div class="modal-foot">
+      <button id="btn-copy-req-json" class="ghost sm">复制完整 JSON</button>
+      <button id="req-modal-btn-close" class="primary sm">关闭</button>
+    </div>
   </div>
 </div>
 

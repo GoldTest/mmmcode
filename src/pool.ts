@@ -61,6 +61,7 @@ export class AccountPool {
   private readonly log: (line: string) => void;
   private readonly managers = new Map<string, MinimaxTokenManager>();
   private roundRobinCursor = 0;
+  private _lastUsedAccount: string | null = null;
 
   constructor(store: AccountStore, opts: AccountPoolOptions = {}) {
     this.store = store;
@@ -164,8 +165,34 @@ export class AccountPool {
     return first ?? null;
   }
 
+  /** 获取最近调用的账号名。 */
+  getLastUsedAccount(): string | null {
+    return this._lastUsedAccount;
+  }
+
+  /** 设置最近调用的账号名。 */
+  setLastUsedAccount(name: string | null): void {
+    this._lastUsedAccount = name;
+  }
+
+  /** 解除单个或全部账号的冷却状态。 */
+  resetCooldown(name?: string): void {
+    if (name) {
+      this.store.update(name, { disabledUntil: undefined, health: 'healthy', healthDetail: undefined });
+      this.log(`手动解除账号 [${name}] 的冷却状态`);
+    } else {
+      for (const a of this.all()) {
+        if ((a.record.disabledUntil ?? 0) > Date.now()) {
+          this.store.update(a.record.name, { disabledUntil: undefined, health: 'healthy', healthDetail: undefined });
+          this.log(`手动解除账号 [${a.record.name}] 的冷却状态`);
+        }
+      }
+    }
+  }
+
   /** 请求成功：清冷却、标健康、记使用时间。 */
   reportSuccess(account: PoolAccount): void {
+    this._lastUsedAccount = account.record.name;
     this.store.update(account.record.name, {
       health: 'healthy',
       healthDetail: undefined,
@@ -176,6 +203,7 @@ export class AccountPool {
 
   /** 请求失败：按类型标记 + 冷却。 */
   reportFailure(account: PoolAccount, kind: FailureKind, detail: string): void {
+    this._lastUsedAccount = account.record.name;
     const now = Date.now();
     const health: AccountHealth =
       kind === 'unauthorized' ? 'unauthorized' : kind === 'rate_limited' ? 'rate_limited' : 'error';

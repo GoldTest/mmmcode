@@ -31,8 +31,11 @@ import { AccountPool } from './pool.js';
 import { SessionStore, ensureAdminKey, maskAdminKey } from './admin.js';
 import { createAdminApi } from './admin-api.js';
 import { adminKeyPath } from './admin.js';
+import { waygateRoot } from './accounts.js';
 import { createProxyForwarder, INTERNAL_KEY } from './proxy.js';
 import type { KeyRegistry } from './keys.js';
+import { RequestStore } from './requests.js';
+import { SchedulerService } from './scheduler.js';
 
 export interface WebServerOptions {
   host: string;
@@ -44,6 +47,8 @@ export interface WebServerOptions {
   adapter: Adapter;
   pool: AccountPool;
   version: string;
+  requests?: RequestStore;
+  scheduler?: SchedulerService;
   log?: (line: string) => void;
   verbose?: boolean;
 }
@@ -104,6 +109,16 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
   /* 管理密钥：不存在就生成一个（首次启动会把明文打到日志里）。 */
   const adminKey = ensureAdminKey();
 
+  const stateDir = join(waygateRoot(), 'mmcode');
+  const requests = opts.requests ?? new RequestStore(join(stateDir, 'requests-config.json'));
+  const scheduler =
+    opts.scheduler ??
+    new SchedulerService(opts.pool, {
+      configPath: join(stateDir, 'scheduler-config.json'),
+      log,
+    });
+  scheduler.start();
+
   /* ① 内部反代（环回）+ 鉴权转发器。 */
   const proxy = await startServer(opts.adapter, {
     host: '127.0.0.1',
@@ -112,7 +127,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     verbose: opts.verbose,
     log: (line) => log(line),
   });
-  const forwardProxy = createProxyForwarder(proxy.port, opts.keys, log);
+  const forwardProxy = createProxyForwarder(proxy.port, opts.keys, log, requests, opts.pool);
 
   const proxyStatus = () => ({
     port: proxy.port,
@@ -131,6 +146,8 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     version: opts.version,
     log,
     proxyStatus,
+    requests,
+    scheduler,
   });
 
   const webRoot = resolveWebRoot();
@@ -240,6 +257,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     port: publicPort,
     proxyPort: proxy.port,
     close: async () => {
+      scheduler.stop();
       await proxy.close();
       await new Promise<void>((done) => {
         server.close(() => done());

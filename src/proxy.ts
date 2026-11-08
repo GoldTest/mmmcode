@@ -18,7 +18,9 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { startServer, toAnthropicErrorBody, type Adapter } from 'waygate-core';
-import type { KeyRegistry } from './keys.js';
+import { maskInboundKey, type KeyRegistry } from './keys.js';
+import type { RequestStore } from './requests.js';
+import type { AccountPool } from './pool.js';
 
 /** 内部密钥：只在本机环回端口上用。 */
 export const INTERNAL_KEY = randomBytes(32).toString('hex');
@@ -64,6 +66,8 @@ export function createProxyForwarder(
   innerPort: number,
   keys: KeyRegistry,
   log: (line: string) => void,
+  requests?: RequestStore,
+  pool?: AccountPool,
 ): (req: IncomingMessage, res: ServerResponse) => void {
   /** 使用记录写盘有开销 —— 60 秒内不重复写。 */
   let lastMark = 0;
@@ -75,18 +79,53 @@ export function createProxyForwarder(
   };
 
   return function forward(req: IncomingMessage, res: ServerResponse): void {
+    const startTime = Date.now();
+    const reqId = 'req_' + startTime.toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     const path = (req.url ?? '/').split('?')[0] ?? '/';
     const provided = extractInboundKey(req);
+    const clientIp =
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.socket.remoteAddress ||
+      '127.0.0.1';
+
+    const keyEntry = provided ? keys.get(provided) : null;
+    const keyId = keyEntry?.id ?? null;
+    const keyName = keyEntry?.name ?? (provided ? '默认' : null);
+    const keyMasked = provided ? maskInboundKey(provided) : null;
 
     if (!keys.accepts(provided)) {
       const message = isAnthropicRoute(path)
         ? '入站密钥缺失或不正确（x-api-key 或 Authorization: Bearer <key>）'
         : '入站密钥缺失或不正确（Authorization: Bearer <key> 或 x-api-key）';
+
+      if (requests) {
+        requests.add({
+          id: reqId,
+          timestamp: startTime,
+          method: req.method ?? 'GET',
+          path,
+          clientIp,
+          keyId,
+          keyName,
+          keyMasked,
+          stream: false,
+          status: 401,
+          durationMs: Date.now() - startTime,
+          error: message,
+        });
+      }
+
       if (isAnthropicRoute(path)) sendAnthropicError(res, 401, message);
       else sendOpenAiError(res, 401, message, 'invalid_api_key');
       return;
     }
     maybeMark(provided);
+
+    /* 缓冲请求体用于详情查看。 */
+    const reqChunks: Buffer[] = [];
+    req.on('data', (chunk) => {
+      reqChunks.push(chunk as Buffer);
+    });
 
     /* 转发到内部 core 服务器，并把鉴权头换成内部密钥。 */
     const headers: Record<string, string | string[] | undefined> = { ...req.headers, host: `127.0.0.1:${innerPort}` };
@@ -96,13 +135,162 @@ export function createProxyForwarder(
     const preq = httpRequest(
       { host: '127.0.0.1', port: innerPort, method: req.method, path: req.url, headers },
       (pres) => {
-        res.writeHead(pres.statusCode ?? 502, pres.headers);
+        const statusCode = pres.statusCode ?? 502;
+        const contentType = pres.headers['content-type'] ?? '';
+        const isSse = contentType.includes('text/event-stream');
+
+        res.writeHead(statusCode, pres.headers);
+
+        const resChunks: Buffer[] = [];
+        let resBytes = 0;
+        pres.on('data', (chunk) => {
+          if (resBytes < 4 * 1024 * 1024) {
+            resChunks.push(chunk as Buffer);
+            resBytes += chunk.length;
+          }
+        });
+
+        pres.on('end', () => {
+          if (!requests) return;
+          const durationMs = Date.now() - startTime;
+          const reqBodyStr = Buffer.concat(reqChunks).toString('utf8');
+          const resBodyStr = Buffer.concat(resChunks).toString('utf8');
+
+          let parsedInput: any = null;
+          let modelName: string | null = null;
+          let isStream = isSse;
+          try {
+            parsedInput = JSON.parse(reqBodyStr);
+            modelName = parsedInput.model ?? null;
+            if (typeof parsedInput.stream === 'boolean') isStream = parsedInput.stream;
+          } catch {
+            // 非 JSON 体
+          }
+
+          let responseText = '';
+          let finishReason: string | undefined;
+          let usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
+          let toolCalls: unknown[] | undefined;
+          let errorMsg: string | undefined;
+
+          let parsedRawJson: unknown = undefined;
+          if (isSse) {
+            const lines = resBodyStr.split('\n');
+            const collectedTools: unknown[] = [];
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith('data:')) continue;
+              const dataPart = trimmed.slice(5).trim();
+              if (!dataPart || dataPart === '[DONE]') continue;
+              try {
+                const json = JSON.parse(dataPart);
+                const delta = json.choices?.[0]?.delta;
+                if (delta?.content) responseText += delta.content;
+                if (delta?.reasoning_content) responseText += delta.reasoning_content;
+                if (delta?.tool_calls) collectedTools.push(...delta.tool_calls);
+                if (json.choices?.[0]?.finish_reason) finishReason = json.choices[0].finish_reason;
+                if (json.usage) usage = json.usage;
+
+                if (json.type === 'content_block_delta' && json.delta?.text) {
+                  responseText += json.delta.text;
+                }
+                if (json.type === 'message_delta' && json.usage) {
+                  usage = {
+                    prompt_tokens: json.usage.input_tokens,
+                    completion_tokens: json.usage.output_tokens,
+                    total_tokens: (json.usage.input_tokens ?? 0) + (json.usage.output_tokens ?? 0),
+                  };
+                }
+              } catch {
+                // 忽略非完整分片
+              }
+            }
+            if (collectedTools.length > 0) toolCalls = collectedTools;
+          } else {
+            try {
+              const json = JSON.parse(resBodyStr);
+              parsedRawJson = json;
+              if (json.choices?.[0]?.message?.content) {
+                responseText = json.choices[0].message.content;
+                finishReason = json.choices[0].finish_reason;
+                if (json.choices[0].message.tool_calls) toolCalls = json.choices[0].message.tool_calls;
+              } else if (Array.isArray(json.content) && json.content[0]?.text) {
+                responseText = json.content[0].text;
+              }
+              if (json.usage) usage = json.usage;
+              if (json.error) {
+                errorMsg = typeof json.error === 'string' ? json.error : json.error.message ?? JSON.stringify(json.error);
+              }
+            } catch {
+              if (statusCode >= 400) errorMsg = resBodyStr.slice(0, 500);
+            }
+          }
+
+          const accountUsed = pool?.getLastUsedAccount() ?? null;
+
+          requests.add({
+            id: reqId,
+            timestamp: startTime,
+            method: req.method ?? 'POST',
+            path,
+            clientIp,
+            keyId,
+            keyName,
+            keyMasked,
+            model: modelName,
+            stream: isStream,
+            status: statusCode,
+            durationMs,
+            account: accountUsed,
+            input: parsedInput
+              ? {
+                  messages: parsedInput.messages,
+                  prompt: parsedInput.prompt,
+                  model: parsedInput.model,
+                  temperature: parsedInput.temperature,
+                  max_tokens: parsedInput.max_tokens,
+                  raw: parsedInput,
+                }
+              : reqBodyStr
+                ? { raw: reqBodyStr.slice(0, 4000) }
+                : null,
+            output: {
+              text: responseText || undefined,
+              toolCalls,
+              usage,
+              finish_reason: finishReason,
+              error: errorMsg,
+              raw: parsedRawJson,
+            },
+            error: errorMsg || (statusCode >= 400 ? `HTTP ${statusCode}` : undefined),
+          });
+        });
+
         pres.pipe(res);
         pres.on('error', () => res.destroy());
       },
     );
+
     preq.on('error', (err) => {
       log(`[反代错误] ${err.message}`);
+      if (requests) {
+        requests.add({
+          id: reqId,
+          timestamp: startTime,
+          method: req.method ?? 'POST',
+          path,
+          clientIp,
+          keyId,
+          keyName,
+          keyMasked,
+          stream: false,
+          status: 502,
+          durationMs: Date.now() - startTime,
+          account: pool?.getLastUsedAccount() ?? null,
+          error: `反代内部错误：${err.message}`,
+        });
+      }
+
       if (!res.headersSent) {
         const text = JSON.stringify({ error: { message: `反代内部错误：${err.message}`, type: 'waygate_error' } });
         res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
@@ -111,11 +299,13 @@ export function createProxyForwarder(
         res.destroy();
       }
     });
+
     res.on('close', () => {
       /* 客户端断连 → 打断内部请求（core 靠 req 的 close 事件中止上游调用，
          不传导就会留下孤儿请求继续烧额度）。 */
       if (!res.writableEnded) preq.destroy();
     });
+
     req.pipe(preq);
   };
 }
@@ -125,6 +315,8 @@ export interface ProxyServerOptions {
   port: number;
   adapter: Adapter;
   keys: KeyRegistry;
+  pool?: AccountPool;
+  requests?: RequestStore;
   log?: (line: string) => void;
   verbose?: boolean;
 }
@@ -152,7 +344,7 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
     log: (line) => log(line),
   });
 
-  const forward = createProxyForwarder(inner.port, opts.keys, log);
+  const forward = createProxyForwarder(inner.port, opts.keys, log, opts.requests, opts.pool);
   const server = createServer((req, res) => {
     void forward(req, res);
   });

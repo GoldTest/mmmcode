@@ -54,6 +54,7 @@ describe('管理密钥：自动生成', () => {
 
   it('落盘权限是 0600（只本机可读）', () => {
     ensureAdminKey();
+    if (process.platform === 'win32') return;
     const mode = statSync(adminKeyPath()).mode & 0o777;
     expect(mode).toBe(0o600);
   });

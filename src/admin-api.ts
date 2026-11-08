@@ -54,6 +54,8 @@ import {
 } from './credential.js';
 import { MinimaxActivity } from './activity.js';
 import { CredentialError } from './errors.js';
+import type { RequestStore } from './requests.js';
+import type { SchedulerService } from './scheduler.js';
 
 export const SESSION_COOKIE = 'mmcode_session';
 
@@ -72,6 +74,8 @@ export interface AdminApiContext {
   log: (line: string) => void;
   /** 反代运行状态。 */
   proxyStatus: () => { port: number; upstream: string; accounts: number; available: number; baseUrl?: string };
+  requests?: RequestStore;
+  scheduler?: SchedulerService;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -506,6 +510,167 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
       /* ── 反代状态 ── */
       if (route === 'proxy' && method === 'GET') {
         sendJson(res, 200, ctx.proxyStatus());
+        return true;
+      }
+
+      /* ── 反代：解除冷却 ── */
+      if (route === 'proxy/reset-cooldown' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const name = typeof body.name === 'string' && body.name ? body.name : undefined;
+        ctx.pool.resetCooldown(name);
+        sendJson(res, 200, { ok: true });
+        return true;
+      }
+
+      /* ── 反代：拉取模型列表 ── */
+      if (route === 'proxy/models' && method === 'GET') {
+        const models = (await ctx.adapter.listModels?.()) ?? [];
+        sendJson(res, 200, { models });
+        return true;
+      }
+
+      /* ── 反代：快速在线调试 ── */
+      if (route === 'proxy/test' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const model = typeof body.model === 'string' ? body.model : 'MiniMax-M3';
+        const prompt = typeof body.prompt === 'string' ? body.prompt : 'Hi, please say hello!';
+        const start = Date.now();
+        try {
+          const result = await ctx.adapter.chat(
+            {
+              model,
+              messages: [{ role: 'user', content: prompt }],
+              stream: false,
+            },
+            AbortSignal.timeout(30_000),
+          );
+          let responseText = '';
+          if (result.stream) {
+            const reader = result.stream.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              responseText += decoder.decode(value, { stream: true });
+            }
+          }
+          sendJson(res, 200, {
+            ok: true,
+            status: result.status,
+            durationMs: Date.now() - start,
+            response: responseText,
+            account: ctx.pool.getLastUsedAccount(),
+          });
+        } catch (err) {
+          sendJson(res, 200, {
+            ok: false,
+            durationMs: Date.now() - start,
+            error: (err as Error).message,
+            account: ctx.pool.getLastUsedAccount(),
+          });
+        }
+        return true;
+      }
+
+      /* ── 请求日志列表 ── */
+      if (route === 'requests' && method === 'GET') {
+        if (!ctx.requests) {
+          sendJson(res, 200, { items: [], total: 0 });
+          return true;
+        }
+        const parsedUrl = new URL(url, 'http://127.0.0.1');
+        const since = parsedUrl.searchParams.get('since') ? Number(parsedUrl.searchParams.get('since')) : undefined;
+        const limit = parsedUrl.searchParams.get('limit') ? Number(parsedUrl.searchParams.get('limit')) : undefined;
+        const offset = parsedUrl.searchParams.get('offset') ? Number(parsedUrl.searchParams.get('offset')) : undefined;
+        const status = parsedUrl.searchParams.get('status') as 'all' | 'success' | 'error' | null;
+        const model = parsedUrl.searchParams.get('model') || undefined;
+        const account = parsedUrl.searchParams.get('account') || undefined;
+        const search = parsedUrl.searchParams.get('search') || undefined;
+
+        const data = ctx.requests.list({
+          since,
+          limit,
+          offset,
+          status: status || undefined,
+          model,
+          account,
+          search,
+        });
+        sendJson(res, 200, data);
+        return true;
+      }
+
+      /* ── 清空请求日志 ── */
+      if (route === 'requests' && method === 'DELETE') {
+        ctx.requests?.clear();
+        sendJson(res, 200, { ok: true });
+        return true;
+      }
+
+      /* ── 请求统计 ── */
+      if (route === 'requests-stats' && method === 'GET') {
+        const stats = ctx.requests?.stats() ?? {
+          totalLogged: 0,
+          cachedCount: 0,
+          successCount: 0,
+          errorCount: 0,
+          avgDurationMs: 0,
+          totalTokens: { prompt: 0, completion: 0, total: 0 },
+          oldestTimestamp: null,
+          estimatedMemoryBytes: 0,
+          config: { maxItems: 200, retentionMs: 86400000 },
+        };
+        sendJson(res, 200, stats);
+        return true;
+      }
+
+      /* ── 请求存储与缓存配置 ── */
+      if (route === 'requests-config' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const config = ctx.requests?.updateConfig(body as any);
+        sendJson(res, 200, { ok: true, config });
+        return true;
+      }
+
+      /* ── 单条请求详情 ── */
+      const reqDetailMatch = /^requests\/([^/]+)$/.exec(route);
+      if (reqDetailMatch && method === 'GET') {
+        const id = decodeURIComponent(reqDetailMatch[1] ?? '');
+        const item = ctx.requests?.get(id);
+        if (!item) {
+          sendJson(res, 404, { error: `未找到请求记录 [${id}]` });
+          return true;
+        }
+        sendJson(res, 200, { ok: true, request: item });
+        return true;
+      }
+
+      /* ── 调度器状态 ── */
+      if (route === 'scheduler' && method === 'GET') {
+        sendJson(res, 200, ctx.scheduler?.getStatus() ?? {});
+        return true;
+      }
+
+      /* ── 调度器配置 ── */
+      if (route === 'scheduler/config' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const config = ctx.scheduler?.updateConfig(body as any);
+        sendJson(res, 200, { ok: true, config });
+        return true;
+      }
+
+      /* ── 调度器：立即全员签到 ── */
+      if (route === 'scheduler/checkin-all' && method === 'POST') {
+        const results = await ctx.scheduler?.checkinAll();
+        sendJson(res, 200, { ok: true, results: results ?? [] });
+        return true;
+      }
+
+      /* ── 调度器：立即全员刷新令牌 ── */
+      if (route === 'scheduler/refresh-all' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const results = await ctx.scheduler?.refreshAll(Boolean(body.force));
+        sendJson(res, 200, { ok: true, results: results ?? [] });
         return true;
       }
 
