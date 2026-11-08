@@ -18,6 +18,7 @@ import {
   generateAdminKey,
   maskAdminKey,
   readAdminKeyFile,
+  setAdminKey,
   SessionStore,
   verifyAdminKey,
 } from './admin.js';
@@ -87,25 +88,27 @@ describe('管理密钥：校验', () => {
   });
 });
 
-describe('管理密钥：修改', () => {
-  it('旧密钥不对 → 拒绝且不改文件', () => {
+describe('管理密钥：修改与持久化', () => {
+  it('★ 直接设置新密钥 → 成功落盘，旧密钥失效', () => {
     const { key } = ensureAdminKey();
-    expect(changeAdminKey('wrong-key', '0123456789abcdefXYZ')).toBeNull();
-    expect(readAdminKeyFile()?.key).toBe(key);
-  });
-
-  it('★ 旧密钥对 → 换成新密钥，旧密钥随即失效', () => {
-    const { key } = ensureAdminKey();
-    const next = changeAdminKey(key, '0123456789abcdefXYZ');
-    expect(next).toBe('0123456789abcdefXYZ');
+    const next = setAdminKey('my-new-secret-key-123');
+    expect(next).toBe('my-new-secret-key-123');
     expect(verifyAdminKey(key)).toBe(false);
-    expect(verifyAdminKey('0123456789abcdefXYZ')).toBe(true);
+    expect(verifyAdminKey('my-new-secret-key-123')).toBe(true);
+    expect(readAdminKeyFile()?.key).toBe('my-new-secret-key-123');
   });
 
-  it('新密钥太短（<16）拒绝', () => {
+  it('新密钥太短（<6）拒绝', () => {
     const { key } = ensureAdminKey();
-    expect(changeAdminKey(key, 'short')).toBeNull();
+    expect(setAdminKey('short')).toBeNull();
     expect(verifyAdminKey(key)).toBe(true);
+  });
+
+  it('changeAdminKey 向后兼容：免验旧密钥直接更新', () => {
+    const { key } = ensureAdminKey();
+    const next = changeAdminKey('', 'another-safe-key-456');
+    expect(next).toBe('another-safe-key-456');
+    expect(verifyAdminKey('another-safe-key-456')).toBe(true);
   });
 });
 

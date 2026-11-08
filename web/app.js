@@ -149,10 +149,6 @@ async function boot() {
       return;
     }
     showLogin();
-    if (session.adminKeyPath) {
-      $('#key-path-hint').innerHTML =
-        `首次启动服务时会自动生成，保存在 <code>${escapeHtml(session.adminKeyPath)}</code>（权限 0600）。`;
-    }
   } catch (err) {
     showLogin();
     $('#login-error').textContent = '无法连接服务：' + err.message;
@@ -634,14 +630,11 @@ $('#btn-settings').addEventListener('click', () => {
          ${state.accounts.map((a) => `<option value="${escapeHtml(a.name)}"${state.active === a.name ? ' selected' : ''}>${escapeHtml(a.name)}</option>`).join('')}
        </select>
      </label>
-     <hr style="border:none;border-top:1px solid var(--line);margin:4px 0">
-     <label class="field">当前管理密钥（验证用）
-       <input id="set-curkey" type="password" placeholder="当前管理密钥" autocomplete="off">
+     <hr style="border:none;border-top:1px solid var(--line);margin:8px 0">
+     <label class="field">修改管理密钥
+       <input id="set-newkey" type="password" placeholder="输入新管理密钥（至少 6 位）" autocomplete="new-password">
      </label>
-     <label class="field">新管理密钥（至少 16 位）
-       <input id="set-newkey" type="password" placeholder="新管理密钥" autocomplete="new-password">
-     </label>
-     <p class="muted small">修改密钥后，所有已登录会话会立刻失效，需要用新密钥重新登录。</p>`,
+     <p class="muted small">直接输入新密钥即可修改并持久化落盘。修改后所有旧会话会立刻失效，需使用新密钥登录。</p>`,
     `<button class="ghost" data-close>取消</button>
      <button class="ghost" id="do-change-key">修改密钥</button>
      <button class="primary" id="do-save">保存配置</button>`,
@@ -662,10 +655,17 @@ $('#btn-settings').addEventListener('click', () => {
   });
 
   $('#do-change-key').addEventListener('click', async () => {
-    const currentKey = $('#set-curkey').value;
-    const newKey = $('#set-newkey').value;
+    const newKey = $('#set-newkey').value.trim();
+    if (!newKey) {
+      toast('请输入新管理密钥', 'err');
+      return;
+    }
+    if (newKey.length < 6) {
+      toast('新管理密钥至少需 6 个字符', 'err');
+      return;
+    }
     try {
-      await api('/admin/api/admin-key', { method: 'POST', body: { currentKey, newKey } });
+      await api('/admin/api/admin-key', { method: 'POST', body: { newKey } });
       closeModal();
       toast('管理密钥已更新，请用新密钥重新登录', 'ok');
       setTimeout(showLogin, 800);

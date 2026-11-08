@@ -37,6 +37,7 @@ import {
   changeAdminKey,
   ensureAdminKey,
   maskAdminKey,
+  setAdminKey,
   SessionStore,
   verifyAdminKey,
 } from './admin.js';
@@ -490,18 +491,13 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
       /* ── 修改管理密钥 ── */
       if (route === 'admin-key' && method === 'POST') {
         const body = await readJsonBody(req);
-        const currentKey = typeof body.currentKey === 'string' ? body.currentKey : '';
         const newKey = typeof body.newKey === 'string' ? body.newKey : '';
-        if (!verifyAdminKey(currentKey)) {
-          sendJson(res, 403, { error: '当前管理密钥不正确' });
-          return true;
-        }
-        const changed = changeAdminKey(currentKey, newKey);
+        const changed = setAdminKey(newKey);
         if (!changed) {
-          sendJson(res, 400, { error: '新密钥不合法：至少 16 个字符' });
+          sendJson(res, 400, { error: '新管理密钥不合法：至少 6 个字符' });
           return true;
         }
-        /* 改密钥 ⇒ 所有旧会话立刻失效（用旧密钥换来的会话也作废）。 */
+        /* 改密钥 ⇒ 所有旧会话立刻失效。 */
         ctx.sessions.clear();
         sendJson(res, 200, { ok: true, key: changed, message: '管理密钥已更新，请用新密钥重新登录' });
         return true;

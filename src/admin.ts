@@ -121,18 +121,30 @@ export function verifyAdminKey(candidate: string | undefined | null): boolean {
 }
 
 /**
- * 修改管理密钥：必须提供**当前正确的旧密钥**。
+ * 直接设置新的管理密钥（无需输入旧密钥验证），原子写入并持久化至 admin.json。
  *
- * 返回新密钥；旧密钥错误返回 null（不改任何文件）。
+ * 长度至少 6 个字符。返回修改后的新密钥；不合法返回 null。
  */
-export function changeAdminKey(currentKey: string, newKey: string): string | null {
+export function setAdminKey(newKey: string): string | null {
   const file = readAdminKeyFile();
-  if (!file) return null;
-  if (!safeEqual(currentKey.trim(), file.key)) return null;
-  const trimmed = newKey.trim();
-  if (trimmed.length < 16) return null;
-  writeAdminKeyFile({ ...file, key: trimmed, updatedAt: Date.now() });
+  const trimmed = (newKey ?? '').trim();
+  if (trimmed.length < 6) return null;
+  const now = Date.now();
+  const updated: AdminKeyFile = {
+    version: file?.version ?? 1,
+    key: trimmed,
+    createdAt: file?.createdAt ?? now,
+    updatedAt: now,
+  };
+  writeAdminKeyFile(updated);
   return trimmed;
+}
+
+/**
+ * 修改管理密钥（向后兼容），直接重置为新密钥并持久化落盘。
+ */
+export function changeAdminKey(_currentKey: string, newKey: string): string | null {
+  return setAdminKey(newKey);
 }
 
 /** 打码（网页展示用，只留头尾）。 */
