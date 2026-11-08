@@ -11,7 +11,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { AccountPool, PoolAccount } from './pool.js';
 import { MinimaxActivity, type SigninResult } from './activity.js';
-import { refreshCreditsForAll, type CreditsRefreshResult } from './credits-refresh.js';
+import {
+  refreshCreditsForAll,
+  InMemoryCreditsBackoff,
+  type CreditsRefreshResult,
+} from './credits-refresh.js';
 
 export interface SchedulerConfig {
   autoCheckin: {
@@ -137,6 +141,20 @@ export class SchedulerService {
   private checkinHistory: CheckinHistoryItem[] = [];
   private refreshHistory: RefreshHistoryItem[] = [];
   private creditsHistory: CreditsHistoryItem[] = [];
+
+  /**
+   * 防重入标记 —— 上一轮还没跑完就**不启动新一轮**。
+   *
+   * ★ 这是内存问题的隐形放大器：`setInterval` 触发的是**异步**任务，JS 不会等它完成。
+   *   一轮额度巡检要打 N 次上游（每次最多 20s 超时 × 3 次重试），账号多时单轮可能
+   *   跑好几分钟 —— **超过轮询间隔**。于是下一轮又起一批，两三轮并发叠在一起：
+   *   每轮都持有完整的请求/响应体，内存 = 轮数 × N × 响应体大小，
+   *   而且上游看到的压力也在翻倍。
+   */
+  private running = { checkin: false, refresh: false, credits: false };
+
+  /** 额度刷新的退避表（按账号记录连续失败次数）。 */
+  private readonly creditsBackoff = new InMemoryCreditsBackoff();
 
   constructor(pool: AccountPool, opts: { configPath?: string; log?: (line: string) => void } = {}) {
     this.pool = pool;
@@ -294,22 +312,37 @@ export class SchedulerService {
 
   /**
    * 立即巡检所有账号的额度余额（并按阈值冻结 / 解冻）。
+   *
+   * ★ **防重入的唯一入口** —— 定时器与管理页的手动刷新都走这里，
+   *   所以「后台轮询撞上手动刷新」也不会并发叠加。
    */
   async checkCreditsAll(): Promise<CreditsRefreshResult[]> {
-    this.lastCreditsRun = Date.now();
-    const results = await refreshCreditsForAll(this.pool, this.log);
-    for (const r of results) {
-      this.creditsHistory.unshift({
-        at: Date.now(),
-        account: r.account,
-        ok: r.ok,
-        remaining: r.remaining,
-        frozen: r.frozen,
-        detail: r.detail,
-      });
+    if (this.running.credits) {
+      this.log('[额度巡检] 已有巡检在跑，本次跳过（防并发叠加）');
+      return [];
     }
-    if (this.creditsHistory.length > 50) this.creditsHistory.length = 50;
-    return results;
+    this.running.credits = true;
+    this.lastCreditsRun = Date.now();
+    try {
+      /* 带退避 + 错峰 —— 避免密集轮询打崩上游（也顺带压住内存）。 */
+      const results = await refreshCreditsForAll(this.pool, this.log, {
+        backoff: this.creditsBackoff,
+      });
+      for (const r of results) {
+        this.creditsHistory.unshift({
+          at: Date.now(),
+          account: r.account,
+          ok: r.ok,
+          remaining: r.remaining,
+          frozen: r.frozen,
+          detail: r.detail,
+        });
+      }
+      if (this.creditsHistory.length > 50) this.creditsHistory.length = 50;
+      return results;
+    } finally {
+      this.running.credits = false;
+    }
   }
 
   /** 后台额度巡检入口（定时器调用）。 */
@@ -379,7 +412,21 @@ export class SchedulerService {
    */
   async checkAndRunAutoCheckin(): Promise<void> {
     if (!this.config.autoCheckin.enabled) return;
+    /* 防重入：上一轮没跑完就跳过本轮（否则多轮并发，内存与上游压力都翻倍）。 */
+    if (this.running.checkin) {
+      this.log('[后台自动签到] 上一轮尚未结束，本轮跳过');
+      return;
+    }
+    this.running.checkin = true;
+    try {
+      await this.runAutoCheckin();
+    } finally {
+      this.running.checkin = false;
+    }
+  }
 
+  /** 自动签到的实际执行体（与防重入解耦，便于单测）。 */
+  private async runAutoCheckin(): Promise<void> {
     const now = Date.now();
     const accounts = this.pool.all().filter((a) => a.credential !== null && a.record.enabled);
 
@@ -469,7 +516,21 @@ export class SchedulerService {
    */
   async checkAndRunAutoRefresh(): Promise<void> {
     if (!this.config.autoRefresh.enabled) return;
+    /* 防重入：同上。 */
+    if (this.running.refresh) {
+      this.log('[后台自动刷新] 上一轮尚未结束，本轮跳过');
+      return;
+    }
+    this.running.refresh = true;
+    try {
+      await this.runAutoRefresh();
+    } finally {
+      this.running.refresh = false;
+    }
+  }
 
+  /** 自动令牌刷新的实际执行体（与防重入解耦，便于单测）。 */
+  private async runAutoRefresh(): Promise<void> {
     const now = Date.now();
     const marginMs = Math.max(1, this.config.autoRefresh.marginMinutes) * 60 * 1000;
     const accounts = this.pool.all().filter((a) => a.credential !== null);

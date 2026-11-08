@@ -676,8 +676,19 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
 
       /* ── 额度：立即刷新所有账号余额（并按阈值冻结/解冻） ── */
       if (route === 'credits/refresh' && method === 'POST') {
-        const results = await refreshCreditsForAll(ctx.pool, ctx.log);
-        sendJson(res, 200, { ok: true, results });
+        /* 走调度器的口径（带退避 + 防重入）—— 手动点也不该绕开退避，
+           否则连点几下就能把上游打爆。 */
+        const results = ctx.scheduler
+          ? await ctx.scheduler.checkCreditsAll()
+          : await refreshCreditsForAll(ctx.pool, ctx.log);
+        /* 空数组 = 已有巡检在跑（防重入挡下了）—— 说清楚，别让前端显示成「0 个账号」。 */
+        const busy = results.length === 0 && ctx.scheduler !== undefined;
+        sendJson(res, 200, {
+          ok: true,
+          busy,
+          note: busy ? '已有额度巡检在进行中，本次未重复执行' : undefined,
+          results,
+        });
         return true;
       }
 

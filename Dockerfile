@@ -30,6 +30,20 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# ── V8 堆上限（软闸）─────────────────────────────────────────────────
+# 为什么要有它：--max-old-space-size 让 V8 在**触及上限前**主动 GC，
+#   而不是任由堆无限膨胀直到进程被 OOM-kill。
+#   区别在于「主动 GC」是**优雅降级**（慢一点，但服务还在），
+#   「被 OOM-kill」是**硬重启**（客户端全部断连）。
+#
+# ⚠️ 数值必须与 compose 的 mem_limit 配套考虑：
+#   512m 的 cgroup 里，384m 的堆 + ~60m 的 Node 运行时/原生对象
+#   ≈ 444m，再留 ~68m 给**堆外**缓冲（Buffer、undici 连接缓冲）。
+#   这点余量不算宽裕 —— 所以下面的 NODE_OPTIONS 之外，
+#   代码里也必须给请求体/响应体缓冲**显式上限**（见 src/proxy.ts）。
+#   调大这个数很容易，调小 mem_limit 只会让 OOM-kill 来得更早。
+ENV NODE_OPTIONS=--max-old-space-size=384
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 

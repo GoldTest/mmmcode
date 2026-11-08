@@ -103,9 +103,13 @@ describe('MinimaxActivity.credits', () => {
     expect(l2.grants).toEqual([]);
   });
 
-  it('details 不是数组且非空值 → 抛错', async () => {
+  it('details 不是数组且非空值 → 抛错（**不**返回假 0，避免误冻结账号）', async () => {
     stub({ base_resp: { status_code: 0 }, details: 'nope' });
-    await expect(new MinimaxActivity(async () => 'tok').credits()).rejects.toThrow('缺少 details');
+    /* ★ 关键：形状变了 ≠ 余额为 0。
+       若这里返回 0，调度器会按阈值把账号**永久冻结**（0 < 100）——
+       上游一次抖动就能打死全部账号。必须抛错，让调用方跳过冻结判定。 */
+    await expect(new MinimaxActivity(async () => 'tok').credits()).rejects.toThrow('形状无法识别');
+    await expect(new MinimaxActivity(async () => 'tok').credits()).rejects.toThrow('不**按余额 0 处理');
   });
 
   it('HTTP 非 2xx → 抛错带上游状态', async () => {

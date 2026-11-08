@@ -187,6 +187,14 @@ export class MinimaxActivity {
   /**
    * 拉积分账本。
    * 三个金额任一缺失的批次**跳过**（宁可少算也不编）；全批次数不出来就抛错（不返回假 0）。
+   *
+   * ★ **「上游没给账本数据」≠「余额为 0」** —— 这两件事必须分开：
+   *   · 新账号 / 尚未产生积分的账号，上游确实会回 `details` 缺失或空数组 ⇒ 余额 **0**，
+   *     这是**真实余额**，照常返回（冻结与否由阈值决定，符合预期）；
+   *   · 上游**形状变了**（`details` 不是数组、字段改名）⇒ 我们**读不懂**它，
+   *     此时抛错，**绝不返回 0** —— 否则这一轮刷新会把「读不懂」当成「没钱」，
+   *     把好账号按阈值冻结（余额 0 < 阈值 100），且**永久**冻住（每轮都读不懂、
+   *     每轮都冻），10 个号能被一次上游抖动全部打死。
    */
   async credits(): Promise<CreditLedger> {
     const token = await this.token();
@@ -206,16 +214,22 @@ export class MinimaxActivity {
       details?: unknown;
     };
     assertOk(body);
-    if (body.details == null || (Array.isArray(body.details) && body.details.length === 0)) {
-      return {
-        granted: 0,
-        remaining: 0,
-        consumed: 0,
-        nextExpireAt: null,
-        grants: [],
-      };
+
+    /* ① details 缺失 / 为 null ⇒ 上游**明确表示没有账本条目** ⇒ 余额 0（真实值）。 */
+    if (body.details == null) {
+      return emptyLedger();
     }
-    if (!Array.isArray(body.details)) throw new UpstreamError('账本响应缺少 details 数组');
+    /* ② details 是空数组 ⇒ 同上，余额 0（真实值）。 */
+    if (Array.isArray(body.details) && body.details.length === 0) {
+      return emptyLedger();
+    }
+    /* ③ details 既不是数组也不是 null ⇒ **形状变了**，我们读不懂 ⇒ 抛错（不返回假 0）。 */
+    if (!Array.isArray(body.details)) {
+      throw new UpstreamError(
+        `账本响应形状无法识别（details 不是数组，而是 ${describeShape(body.details)}）—— ` +
+          '上游可能改了接口；本次**不**按余额 0 处理（避免误冻结账号）',
+      );
+    }
 
     const grants: CreditGrant[] = [];
     for (const raw of body.details) {
@@ -235,7 +249,10 @@ export class MinimaxActivity {
       });
     }
     if (grants.length === 0) {
-      throw new UpstreamError('账本里没有可识别的积分批次（响应形状变化？）');
+      throw new UpstreamError(
+        '账本里没有可识别的积分批次（响应形状变化？）—— ' +
+          '本次**不**按余额 0 处理（避免误冻结账号）',
+      );
     }
     const sum = (pick: (g: CreditGrant) => number): number => round2(grants.reduce((s, g) => s + pick(g), 0));
     const future = grants.filter((g) => g.expireAt > Date.now()).map((g) => g.expireAt);
@@ -247,6 +264,24 @@ export class MinimaxActivity {
       grants,
     };
   }
+}
+
+/** 空账本 —— 余额为 0（上游明确说没有账本条目时）。 */
+function emptyLedger(): CreditLedger {
+  return {
+    granted: 0,
+    remaining: 0,
+    consumed: 0,
+    nextExpireAt: null,
+    grants: [],
+  };
+}
+
+/** 描述一个值的形状（给错误文案用，不泄露内容）。 */
+function describeShape(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return '数组';
+  return typeof v;
 }
 
 /** 人读渲染：签到结果。 */

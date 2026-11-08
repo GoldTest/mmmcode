@@ -726,10 +726,21 @@ $('#btn-refresh-credits').addEventListener('click', async (btn) => {
   btn.textContent = '刷新中…';
   try {
     const res = await api('/admin/api/credits/refresh', { method: 'POST' });
+    if (res.busy) {
+      toast(res.note || '已有额度巡检在进行中', 'err');
+      await loadAccounts();
+      return;
+    }
     const results = res.results || [];
     const okCount = results.filter((r) => r.ok).length;
-    const failCount = results.length - okCount;
-    toast(`额度刷新完成：成功 ${okCount} 个，失败 ${failCount} 个`, failCount > 0 ? 'err' : 'ok');
+    /* 退避跳过的账号**不算失败** —— 它没被请求上游，只是在等退避窗口过去。 */
+    const skipCount = results.filter((r) => r.skipped).length;
+    const failCount = results.filter((r) => !r.ok && !r.skipped).length;
+    const skipTag = skipCount > 0 ? `，退避跳过 ${skipCount} 个` : '';
+    toast(
+      `额度刷新完成：成功 ${okCount} 个，失败 ${failCount} 个${skipTag}`,
+      failCount > 0 ? 'err' : 'ok',
+    );
     await loadAccounts();
     await loadInsights();
   } catch (err) {

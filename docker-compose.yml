@@ -34,6 +34,19 @@ services:
       MMCODE_HOME: /data/.waygate
       WAYGATE_HOME: /data/.waygate
 
+    # ── 内存兜底（cgroup 硬闸）─────────────────────────────────────────
+    # 为什么要它：Node 的堆上限（--max-old-space-size）是**软**的 ——
+    #   堆外内存（Buffer / 原生对象 / undici 的连接缓冲）**不受**它管，
+    #   一旦泄漏发生在堆外，V8 根本不会 GC，进程会一路涨到把宿主机拖垮。
+    # cgroup 的 mem_limit 是**硬**的：撞到上限，内核直接 OOM-kill 这个容器，
+    # 于是「泄漏再猛」也只会重启它自己，不会拖累整机。
+    #
+    # ★ memswap_limit 必须 ≥ mem_limit，否则容器启动即被拒。
+    #   1g swap 给的是「短暂峰值」的缓冲空间（避免瞬时抖动就重启），
+    #   但 swap 一旦用起来速度极慢 —— 它的作用是**别立刻死**，不是**随便涨**。
+    mem_limit: 512m
+    memswap_limit: 1g
+
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

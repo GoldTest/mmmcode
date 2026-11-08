@@ -181,6 +181,9 @@ export function maskAdminKey(key: string): string {
 export const SESSION_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 export const SESSION_TTL_SECONDS = 3 * 24 * 60 * 60;
 
+/** 续期写盘节流间隔（ms）—— 管理页每个请求都会 verify，不必每次都重写文件。 */
+const SESSION_SAVE_THROTTLE_MS = 60_000;
+
 /**
  * 会话存储表。
  *
@@ -190,6 +193,8 @@ export const SESSION_TTL_SECONDS = 3 * 24 * 60 * 60;
 export class SessionStore {
   private readonly sessions = new Map<string, number>();
   private readonly filePath?: string;
+  /** 上次落盘时刻（续期写盘节流用）。 */
+  private lastSaveAt = 0;
 
   constructor(filePath?: string) {
     this.filePath = filePath ?? sessionsFilePath();
@@ -218,6 +223,12 @@ export class SessionStore {
   private save(): void {
     if (!this.filePath) return;
     const now = Date.now();
+    /* ★ 过期会话必须**从内存里删掉** —— 之前只在写盘时过滤，内存 Map 一直留着，
+       每登录一次涨一条（虽然每个 token 会续期，但换浏览器/清 cookie 就多一条新的），
+       长期跑就是无界增长。 */
+    for (const [token, exp] of this.sessions) {
+      if (exp <= now) this.sessions.delete(token);
+    }
     const obj: Record<string, number> = {};
     for (const [token, exp] of this.sessions.entries()) {
       if (exp > now) {
@@ -225,6 +236,21 @@ export class SessionStore {
       }
     }
     writeJsonAtomic(this.filePath, { version: 1, sessions: obj });
+    this.lastSaveAt = now;
+  }
+
+  /** 清掉所有已过期的会话（内存 + 落盘）。 */
+  pruneExpired(): number {
+    const now = Date.now();
+    let removed = 0;
+    for (const [token, exp] of this.sessions) {
+      if (exp <= now) {
+        this.sessions.delete(token);
+        removed += 1;
+      }
+    }
+    if (removed > 0) this.save();
+    return removed;
   }
 
   /** 建会话，返回 token。 */
@@ -247,7 +273,13 @@ export class SessionStore {
     }
     /* 滑动续期：活跃用户不会半路被踢。 */
     this.sessions.set(token, Date.now() + SESSION_TTL_MS);
-    this.save();
+    /* 续期不必每次都落盘 —— 管理页每次请求都会 verify，
+       每次都重写整个 sessions.json 是纯粹的 IO 抖动。60 秒一次足够。 */
+    const now = Date.now();
+    if (now - this.lastSaveAt >= SESSION_SAVE_THROTTLE_MS) {
+      this.lastSaveAt = now;
+      this.save();
+    }
     return true;
   }
 

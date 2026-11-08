@@ -33,6 +33,7 @@
 
 import { MinimaxTokenManager, type MinimaxCredential } from './credential.js';
 import { readSavedCredential } from './credential.js';
+import { clipValue } from './clip.js';
 import type { RequestTransit } from './requests.js';
 import {
   AccountStore,
@@ -55,6 +56,24 @@ export const COOLDOWN_ERROR_MS = 30 * 1000;
  * （除非余额刷新确认它确实没额度）。
  */
 export const FREEZE_429_SELF_HEAL_MS = 5 * 60 * 1000;
+
+/**
+ * session 绑定表上限（LRU）。
+ *
+ * 客户端每开一个新会话就是一个新 session key，而**会话何时结束我们不知道** ——
+ * 所以只能封顶。5000 条足够覆盖活跃会话；淘汰最旧的只是让那个会话下次重新分配号。
+ */
+export const MAX_SESSION_BINDINGS = 5000;
+
+/** 轻量请求快照（账号名 / 用量）的保留条数。 */
+export const MAX_REQUEST_ENTRIES = 2000;
+
+/**
+ * 中转快照（含**转译后请求体**）的保留条数。
+ *
+ * 比轻量快照少一个数量级 —— 每条可能几 MB，2000 条就是几 GB。
+ */
+export const MAX_TRANSIT_ENTRIES = 200;
 
 export type FailureKind = 'unauthorized' | 'rate_limited' | 'error';
 
@@ -248,6 +267,9 @@ export class AccountPool {
       if (boundName) {
         const bound = this.get(boundName);
         if (bound && this.unavailableReason(bound) === null) {
+          /* 命中即刷新位置 —— 常用 session 永远留在热的这一端。 */
+          this.bindings.delete(sessionKey);
+          this.bindings.set(sessionKey, boundName);
           return { ok: true, account: bound, slid: false };
         }
         /* 绑定账号不可用了（被冻结 / 冷却 / 甚至被删掉了）。 */
@@ -265,7 +287,7 @@ export class AccountPool {
         /* 平衡模式：滑动到别的账号（优先最高可用层，该层空了就下沉）。 */
         const slid = this.pickRandom(this.tiers()[0] ?? []);
         if (slid) {
-          this.bindings.set(sessionKey, slid.record.name);
+          this.bindSession(sessionKey, slid.record.name);
           this.log(`会话 ${shortKey(sessionKey)} 的账号 [${boundName}] 不可用，已滑到 [${slid.record.name}]`);
           return { ok: true, account: slid, slid: true };
         }
@@ -283,8 +305,29 @@ export class AccountPool {
         detail: '没有可用账号 —— 先跑 `mmcode login` 登录一个（管理页也能加账号）。',
       };
     }
-    if (sessionKey) this.bindings.set(sessionKey, picked.record.name);
+    if (sessionKey) this.bindSession(sessionKey, picked.record.name);
     return { ok: true, account: picked, slid: false };
+  }
+
+  /**
+   * 记一次 session 绑定，并**封顶**绑定表。
+   *
+   * ⚠️ 这是本模块里**唯一真正无界增长**的 Map：session key 由「入站密钥 + 模型 +
+   *   首条用户消息」哈希推导而来 —— 客户端每开一个新会话就是一个新 key，
+   *   而会话结束的信号我们**收不到**。不封顶 ⇒ 跑上几天就是几十万个条目。
+   *
+   * 淘汰策略 = LRU：命中即移到队尾，满了从头丢最久没用的那个。
+   *   丢掉的只是「这个会话绑哪个号」—— 丢了的后果是下次重新分配（最多丢一次缓存），
+   *   远小于内存无限涨的代价。
+   */
+  private bindSession(sessionKey: string, accountName: string): void {
+    this.bindings.delete(sessionKey);
+    this.bindings.set(sessionKey, accountName);
+    while (this.bindings.size > MAX_SESSION_BINDINGS) {
+      const oldest = this.bindings.keys().next();
+      if (oldest.done) break;
+      this.bindings.delete(oldest.value);
+    }
   }
 
   /** 某个 session 当前绑定的账号名（洞察面板/调试用）。 */
@@ -330,8 +373,11 @@ export class AccountPool {
   /** 记下这次请求的中转信息（适配器打上游前调用）。 */
   recordRequestTransit(reqId: string | null, transit: RequestTransit): void {
     if (!reqId) return;
-    this.requestTransit.set(reqId, transit);
-    this.trimMap(this.requestTransit);
+    this.requestTransit.set(reqId, {
+      ...transit,
+      payload: clipValue(transit.payload),
+    });
+    this.trimMap(this.requestTransit, MAX_TRANSIT_ENTRIES);
   }
 
   /** 查这次请求的中转信息（请求详情里「中转」那一栏用）。 */
@@ -340,9 +386,9 @@ export class AccountPool {
     return this.requestTransit.get(reqId) ?? null;
   }
 
-  /** 请求级快照只留最近 2000 条 —— 防内存无限涨。 */
-  private trimMap(map: Map<string, unknown>): void {
-    if (map.size <= 2000) return;
+  /** 请求级快照只留最近若干条 —— 防内存无限涨。 */
+  private trimMap(map: Map<string, unknown>, limit: number = MAX_REQUEST_ENTRIES): void {
+    if (map.size <= limit) return;
     const oldest = map.keys().next();
     if (!oldest.done) map.delete(oldest.value);
   }

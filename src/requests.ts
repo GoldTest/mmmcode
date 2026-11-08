@@ -7,6 +7,7 @@
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { approxBytes, clipRecord } from './clip.js';
 
 export interface RequestRecord {
   id: string;
@@ -83,6 +84,14 @@ export interface RequestTransit {
 export interface RequestStoreConfig {
   maxItems: number;
   retentionMs: number; // 0 表示不按时间清除
+  /**
+   * 内存里的**总字节预算**（含裁剪后的记录）。
+   *
+   * 条数上限 alone 不够 —— 一条记录的大小由**客户端请求体**决定（Claude Code
+   * 一轮上下文可达数 MB）。200 条 × 数 MB = 数百 MB，容器直接被吃干。
+   * 所以再加一道**字节闸**：超预算就淘汰最旧的记录。
+   */
+  maxBytes: number;
 }
 
 export interface RequestStats {
@@ -113,6 +122,18 @@ export interface RequestListFilter {
 
 export const DEFAULT_MAX_ITEMS = 200;
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000; // 默认保留 24 小时
+/** 默认内存字节预算：64MB。配合单条裁剪（48KB）≈ 最多一千多条小记录或几百条大记录。 */
+export const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * 落盘节流间隔（ms）。
+ *
+ * ★ 之前是 2 秒 —— 而每次落盘都要把**整个** items 数组 `JSON.stringify` 一遍。
+ *   200 条 × 数十 KB = 每 2 秒生成一个几 MB 的临时字符串 → 纯粹的 GC 压力源
+ *   （它不是"泄漏"，但会持续推高 RSS 并触发频繁 GC）。
+ *   改到 10 秒：请求监控是**事后排查**用的工具，不差这几秒。
+ */
+const SAVE_THROTTLE_MS = 10_000;
 
 export interface RequestsDataFile {
   version: number;
@@ -124,9 +145,14 @@ export interface RequestsDataFile {
 export class RequestStore {
   private items: RequestRecord[] = [];
   private totalLogged = 0;
+  /** 每条记录的估算字节数（id → bytes）—— 避免每次淘汰都重新 stringify。 */
+  private readonly sizes = new Map<string, number>();
+  /** 当前留存记录的估算总字节数。 */
+  private bytes = 0;
   private config: RequestStoreConfig = {
     maxItems: DEFAULT_MAX_ITEMS,
     retentionMs: DEFAULT_RETENTION_MS,
+    maxBytes: DEFAULT_MAX_BYTES,
   };
   private readonly configPath?: string;
   private readonly dataPath?: string;
@@ -149,6 +175,9 @@ export class RequestStore {
       }
       if (typeof data.retentionMs === 'number' && data.retentionMs >= 0) {
         this.config.retentionMs = data.retentionMs;
+      }
+      if (typeof data.maxBytes === 'number' && data.maxBytes > 0) {
+        this.config.maxBytes = Math.min(Math.max(4 * 1024 * 1024, data.maxBytes), 512 * 1024 * 1024);
       }
     } catch {
       // 容错忽略损坏的配置文件
@@ -174,6 +203,12 @@ export class RequestStore {
       }
       if (Array.isArray(data.items)) {
         this.items = data.items.filter((item) => item && typeof item === 'object' && typeof item.id === 'string');
+        /* 载入的历史记录也要计字节 —— 否则字节闸会失准（以为自己是空的）。 */
+        for (const item of this.items) {
+          const bytes = approxBytes(item);
+          this.sizes.set(item.id, bytes);
+          this.bytes += bytes;
+        }
         this.prune();
         if (this.totalLogged < this.items.length) {
           this.totalLogged = this.items.length;
@@ -195,7 +230,9 @@ export class RequestStore {
         totalLogged: this.totalLogged,
         items: this.items,
       };
-      writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+      /* 只 stringify 一次 —— 之前两条路径各 stringify 一遍，白白翻倍瞬时内存。 */
+      const text = JSON.stringify(data, null, 2) + '\n';
+      writeFileSync(tmp, text, { mode: 0o600 });
       try {
         chmodSync(tmp, 0o600);
       } catch {
@@ -205,7 +242,7 @@ export class RequestStore {
         renameSync(tmp, this.dataPath);
       } catch {
         try {
-          writeFileSync(this.dataPath, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+          writeFileSync(this.dataPath, text, { mode: 0o600 });
         } catch {}
         try {
           unlinkSync(tmp);
@@ -219,7 +256,7 @@ export class RequestStore {
   private scheduleSave(): void {
     if (!this.dataPath) return;
     const now = Date.now();
-    if (now - this.lastFlush >= 2000) {
+    if (now - this.lastFlush >= SAVE_THROTTLE_MS) {
       this.lastFlush = now;
       this.saveData();
       return;
@@ -229,7 +266,7 @@ export class RequestStore {
       this.flushTimer = null;
       this.lastFlush = Date.now();
       this.saveData();
-    }, 2000);
+    }, SAVE_THROTTLE_MS);
     this.flushTimer.unref?.();
   }
 
@@ -247,26 +284,58 @@ export class RequestStore {
 
   /**
    * 添加一条请求记录并执行清理。
+   *
+   * ★ 记录在**入库前**先裁剪（`clipRecord`）—— 客户端的请求体大小不受我们控制，
+   *   不裁剪的话条数上限形同虚设。
    */
   add(record: RequestRecord): void {
     this.totalLogged += 1;
-    this.items.unshift(record); // 最新记录放前面
+    const { value, bytes } = clipRecord(record);
+    this.items.unshift(value); // 最新记录放前面
+    this.sizes.set(value.id, bytes);
+    this.bytes += bytes;
     this.prune();
     this.scheduleSave();
   }
 
   /**
    * 根据保留时长和数量上限清理过期缓存。
+   *
+   * 三道闸（任一触发就淘汰最旧的）：
+   *   ① 保留时长；② 条数上限；③ **字节预算**。
    */
   prune(): void {
     const now = Date.now();
     if (this.config.retentionMs > 0) {
       const cutoff = now - this.config.retentionMs;
-      this.items = this.items.filter((item) => item.timestamp >= cutoff);
+      const kept = this.items.filter((item) => item.timestamp >= cutoff);
+      if (kept.length !== this.items.length) {
+        for (const item of this.items) {
+          if (item.timestamp < cutoff) this.dropSize(item.id);
+        }
+        this.items = kept;
+      }
     }
-    if (this.items.length > this.config.maxItems) {
-      this.items.length = this.config.maxItems;
+    while (this.items.length > this.config.maxItems) {
+      const dropped = this.items.pop();
+      if (!dropped) break;
+      this.dropSize(dropped.id);
     }
+    /* 字节闸：超预算就丢最旧的（items[0] 最新，末尾最旧）。 */
+    while (this.bytes > this.config.maxBytes && this.items.length > 1) {
+      const dropped = this.items.pop();
+      if (!dropped) break;
+      this.dropSize(dropped.id);
+    }
+  }
+
+  /** 丢掉一条记录的字节记账。 */
+  private dropSize(id: string): void {
+    const size = this.sizes.get(id);
+    if (size === undefined) return;
+    this.sizes.delete(id);
+    this.bytes -= size;
+    if (this.bytes < 0) this.bytes = 0;
   }
 
   /**
@@ -281,6 +350,8 @@ export class RequestStore {
    */
   clear(): void {
     this.items = [];
+    this.sizes.clear();
+    this.bytes = 0;
     this.saveData();
   }
 
@@ -293,6 +364,9 @@ export class RequestStore {
     }
     if (typeof patch.retentionMs === 'number' && patch.retentionMs >= 0) {
       this.config.retentionMs = patch.retentionMs;
+    }
+    if (typeof patch.maxBytes === 'number' && patch.maxBytes > 0) {
+      this.config.maxBytes = Math.min(Math.max(4 * 1024 * 1024, patch.maxBytes), 512 * 1024 * 1024);
     }
     this.saveConfig();
     this.prune();
@@ -388,12 +462,8 @@ export class RequestStore {
       }
     }
 
-    // 粗略估算内存使用
-    const approxBytes = this.items.reduce((acc, item) => {
-      const inLen = item.input ? JSON.stringify(item.input).length : 0;
-      const outLen = item.output ? JSON.stringify(item.output).length : 0;
-      return acc + 300 + inLen + outLen;
-    }, 0);
+    // 粗略估算内存使用 —— 用记账的字节数，别再逐条 stringify（那会瞬时翻倍内存）。
+    const approxTotal = this.bytes;
 
     return {
       totalLogged: this.totalLogged,
@@ -407,7 +477,7 @@ export class RequestStore {
         total: totalTokens,
       },
       oldestTimestamp,
-      estimatedMemoryBytes: approxBytes,
+      estimatedMemoryBytes: approxTotal,
       config: { ...this.config },
     };
   }

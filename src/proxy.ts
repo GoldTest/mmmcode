@@ -32,6 +32,21 @@ import { cacheHitRate } from './protocol/usage.js';
 /** 内部密钥：只在本机环回端口上用。 */
 export const INTERNAL_KEY = randomBytes(32).toString('hex');
 
+/**
+ * 入站请求体上限（字节）。
+ *
+ * 与 core 内层的 `readJsonBody` 限制（8MB）对齐 —— 超了就在这一层直接拒，
+ * 不用把整个 body 缓冲进内存再让内层报错。
+ */
+export const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
+
+/**
+ * 响应体**采集**上限（字节）—— 只用于「请求详情」留痕，不影响转发。
+ *
+ * 转发的流是 `pres.pipe(res)`，完整送往客户端；这里只是**旁路**采一份用于排查。
+ */
+export const MAX_CAPTURE_BYTES = 1 * 1024 * 1024;
+
 /** 从请求头里取入站密钥（OpenAI 用 Bearer，Anthropic 用 x-api-key）。 */
 export function extractInboundKey(req: IncomingMessage): string | null {
   const auth = req.headers['authorization'];
@@ -155,10 +170,28 @@ export function createProxyForwarder(
     }
     maybeMark(provided);
 
-    /* 缓冲请求体：既用于详情查看，也要往里注入 session 上下文。 */
+    /* 缓冲请求体：既用于详情查看，也要往里注入 session 上下文。
+   ⚠️ 必须**有上限** —— 这个 Buffer 在**堆外**（不归 V8 管），而
+   --max-old-space-size 管不到它。没有上限时，一个超大请求体就能把容器吃穿。
+   上限与 core 内层的 8MB 限制对齐（core 那边超了会自己报错）。 */
     const reqChunks: Buffer[] = [];
+    let reqBytes = 0;
+    let reqTooLarge = false;
     req.on('data', (chunk) => {
-      reqChunks.push(chunk as Buffer);
+      if (reqTooLarge) return;
+      const buf = chunk as Buffer;
+      reqBytes += buf.length;
+      if (reqBytes > MAX_REQUEST_BODY_BYTES) {
+        reqTooLarge = true;
+        reqChunks.length = 0; // 立刻释放已缓冲的部分
+        log(`[反代] 请求体超过 ${MAX_REQUEST_BODY_BYTES} 字节，已拒绝：${req.url}`);
+        if (!res.headersSent) {
+          sendOpenAiError(res, 413, '请求体过大', 'payload_too_large');
+        }
+        req.destroy();
+        return;
+      }
+      reqChunks.push(buf);
     });
 
     /* 转发到内部 core 服务器，并把鉴权头换成内部密钥。
@@ -185,7 +218,9 @@ export function createProxyForwarder(
         let firstByteAt: number | null = null;
         pres.on('data', (chunk) => {
           if (firstByteAt === null) firstByteAt = Date.now();
-          if (resBytes < 4 * 1024 * 1024) {
+          /* 响应体采集有上限 —— 这些 Buffer 在**堆外**，并发请求多时
+             4MB × N 会直接顶穿 cgroup（V8 的堆上限管不到这里）。 */
+          if (resBytes < MAX_CAPTURE_BYTES) {
             resChunks.push(chunk as Buffer);
             resBytes += chunk.length;
           }
@@ -386,6 +421,11 @@ export function createProxyForwarder(
     /* 请求体收齐后再转发 —— 中间要把 session 上下文注进去。
        （不能边收边转：注入要改 body 长度，而 http.request 的 headers 已固化。） */
     req.on('end', () => {
+      /* 请求体超限 —— 已在 'data' 里拒绝并断开，这里直接收尾。 */
+      if (reqTooLarge) {
+        preq.destroy();
+        return;
+      }
       const raw = Buffer.concat(reqChunks);
       let out = raw;
       if (isChatRoute(path, req.method) && raw.length > 0) {
