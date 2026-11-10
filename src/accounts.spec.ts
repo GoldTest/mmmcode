@@ -107,6 +107,20 @@ describe('AccountStore：注册与持久化', () => {
     expect(rec?.notes).toBe('备注');
     expect(rec?.region).toBe('cn');
     expect(rec?.enabled).toBe(true);
+    expect(rec?.checkinEnabled).toBe(true);
+  });
+
+  it('支持修改与持久化 checkinEnabled（单独停用/启用自动签到）', () => {
+    const store = new AccountStore();
+    store.upsert('a1', 'cn');
+    expect(store.get('a1')?.checkinEnabled).toBe(true);
+
+    store.update('a1', { checkinEnabled: false });
+    expect(store.get('a1')?.checkinEnabled).toBe(false);
+
+    // 重建 store 验证落盘持久化
+    const reloaded = new AccountStore();
+    expect(reloaded.get('a1')?.checkinEnabled).toBe(false);
   });
 
   it('update 不存在的账号返回 null', () => {

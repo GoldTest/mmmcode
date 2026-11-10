@@ -16,7 +16,7 @@
  *   GET    /admin/api/accounts           账号列表（含状态）
  *   POST   /admin/api/accounts           { name, region } → 新增/登记账号
  *   POST   /admin/api/accounts/reorder   { order: [name, ...] } → 调整账号展示顺序
- *   PATCH  /admin/api/accounts/:name     { enabled?, notes?, region? }
+ *   PATCH  /admin/api/accounts/:name     { enabled?, checkinEnabled?, notes?, region?, priority? }
  *   DELETE /admin/api/accounts/:name     删除账号（含令牌文件）
  *   POST   /admin/api/accounts/:name/login    发起设备授权 → 返回短码与链接
  *   GET    /admin/api/accounts/:name/login    查授权进度（非阻塞单次轮询）
@@ -141,6 +141,7 @@ function accountView(a: PoolAccount): Record<string, unknown> {
     name: a.record.name,
     region: a.record.region,
     enabled: a.record.enabled,
+    checkinEnabled: a.record.checkinEnabled !== false,
     /** 优先级层（数字越小越优先）。 */
     priority: a.record.priority,
     /** 额度冻结中（不参与调度）。 */
@@ -359,6 +360,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           const body = await readJsonBody(req);
           const patch: Record<string, unknown> = {};
           if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+          if (typeof body.checkinEnabled === 'boolean') patch.checkinEnabled = body.checkinEnabled;
           if (typeof body.notes === 'string') patch.notes = body.notes.slice(0, 500);
           if (body.region === 'global' || body.region === 'cn') patch.region = body.region;
           /* 优先级层：数字越小越优先。 */

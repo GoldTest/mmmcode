@@ -696,6 +696,7 @@ function renderAccountCard(a) {
     if (a.frozen) t(`额度冻结${a.frozenReason ? '：' + a.frozenReason : ''}`, 'warn');
     if (a.pendingLogin) t('授权中', 'info');
     if (!a.enabled) t('已停用', '');
+    if (a.checkinEnabled === false) t('签到已停用', 'warn');
   }
   return card;
 }
@@ -915,7 +916,7 @@ async function loadScheduler() {
 function renderCheckinTable() {
   const tbody = $('#checkin-table-body');
   if (!state.accounts || state.accounts.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="muted">还没有账号</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="muted">还没有账号</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -930,10 +931,13 @@ function renderCheckinTable() {
     else if (outcome === 'error') outcomeBadge = '<span class="tag err">签到异常</span>';
 
     const credits = a.lastCredits ? `${a.lastCredits.remaining} / ${a.lastCredits.granted}` : '—';
+    const checkinOn = a.checkinEnabled !== false;
+    const checkinBadge = checkinOn ? '<span class="tag ok">已开启</span>' : '<span class="tag warn">已停用</span>';
 
     tr.innerHTML = `
       <td><b>${escapeHtml(a.name)}</b></td>
       <td><span class="tag">${escapeHtml(regionTag(a.region))}</span></td>
+      <td>${checkinBadge}</td>
       <td>${outcomeBadge}</td>
       <td><b>${last && last.streak != null ? last.streak + ' 天' : '—'}</b></td>
       <td>${last && last.points != null ? '+' + last.points : '—'}</td>
@@ -942,6 +946,28 @@ function renderCheckinTable() {
       <td></td>`;
 
     const tdAction = tr.querySelector('td:last-child');
+    tdAction.style.display = 'flex';
+    tdAction.style.gap = '6px';
+    tdAction.style.alignItems = 'center';
+
+    /* 停用/启用自动签到 */
+    tdAction.appendChild(mkBtn(checkinOn ? '停用签到' : '启用签到', 'ghost sm', async (btn) => {
+      btn.disabled = true;
+      try {
+        await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
+          method: 'PATCH',
+          body: { checkinEnabled: !checkinOn },
+        });
+        toast(`账号 [${a.name}] 自动签到已${checkinOn ? '停用' : '启用'}`, 'ok');
+        await loadAccounts();
+        await loadScheduler();
+      } catch (err) {
+        toast('操作失败：' + err.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    }));
+
     tdAction.appendChild(mkBtn('立即签到', 'ghost sm', async (btn) => {
       btn.disabled = true;
       try {

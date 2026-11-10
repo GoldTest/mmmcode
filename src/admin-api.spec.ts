@@ -261,6 +261,18 @@ describe('Admin API: 新增功能路由测试', () => {
         body: { frozen: false },
       });
       expect(thawed.body.account.frozen).toBe(false);
+
+      /* 停用/启用自动签到 */
+      const checkinDisabled = await ctx.req('/admin/api/accounts/a1', {
+        method: 'PATCH',
+        body: { checkinEnabled: false },
+      });
+      expect(checkinDisabled.status).toBe(200);
+      expect(checkinDisabled.body.account.checkinEnabled).toBe(false);
+
+      const accounts = await ctx.req('/admin/api/accounts');
+      const a1 = accounts.body.accounts.find((a: any) => a.name === 'a1');
+      expect(a1.checkinEnabled).toBe(false);
     } finally {
       await ctx.close();
     }

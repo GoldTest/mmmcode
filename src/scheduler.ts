@@ -356,7 +356,9 @@ export class SchedulerService {
    */
   async checkinAll(): Promise<Array<{ account: string; result: SigninResult }>> {
     this.lastCheckinRun = Date.now();
-    const accounts = this.pool.all().filter((a) => a.credential !== null && a.record.enabled);
+    const accounts = this.pool
+      .all()
+      .filter((a) => a.credential !== null && a.record.enabled && a.record.checkinEnabled !== false);
     const results: Array<{ account: string; result: SigninResult }> = [];
 
     for (const account of accounts) {
@@ -428,7 +430,9 @@ export class SchedulerService {
   /** 自动签到的实际执行体（与防重入解耦，便于单测）。 */
   private async runAutoCheckin(): Promise<void> {
     const now = Date.now();
-    const accounts = this.pool.all().filter((a) => a.credential !== null && a.record.enabled);
+    const accounts = this.pool
+      .all()
+      .filter((a) => a.credential !== null && a.record.enabled && a.record.checkinEnabled !== false);
 
     for (const account of accounts) {
       const last = account.record.lastCheckin;

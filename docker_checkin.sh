@@ -78,12 +78,12 @@ if [ -z "${ACCOUNTS}" ]; then
   exit 0
 fi
 
-# 逐个已登录账号签到。
+# 逐个已登录且启用签到的账号签到。
 echo "${ACCOUNTS}" | python3 -c "
 import json,sys
 data = json.load(sys.stdin)
 for a in data.get('accounts', []):
-    if a.get('loggedIn'):
+    if a.get('loggedIn') and a.get('enabled', True) and a.get('checkinEnabled', True):
         print(a['name'])
 " | while read -r name; do
   [ -z "${name}" ] && continue

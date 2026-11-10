@@ -65,6 +65,12 @@ export interface AccountRecord {
   /** 是否参与自动切换（关掉 = 保留账号但不参与反代轮换）。 */
   enabled: boolean;
   /**
+   * 是否参与每日自动签到（默认 true；关掉 = 该账号不参与后台自动签到与全员签到）。
+   *
+   * 独立于 `enabled`：关掉只停签到，不影响反代流量调度；用户可为某些账号单独停用自动签到。
+   */
+  checkinEnabled?: boolean;
+  /**
    * 优先级层 —— **数字越小越优先**（0 = 最高层）。
    *
    * 新 session 只在「最高层里还有可用账号」时分配到那一层；该层全被冻结 / 冷却
@@ -269,6 +275,7 @@ export class AccountStore {
   private normalizeRecord(raw: AccountRecord): AccountRecord {
     return {
       ...raw,
+      checkinEnabled: raw.checkinEnabled !== false,
       priority: typeof raw.priority === 'number' && Number.isFinite(raw.priority) ? raw.priority : 0,
       frozen: raw.frozen === true,
       frozenReason: typeof raw.frozenReason === 'string' ? raw.frozenReason : undefined,
@@ -313,6 +320,7 @@ export class AccountStore {
       name,
       region,
       enabled: true,
+      checkinEnabled: true,
       priority: 0,
       createdAt: now,
       updatedAt: now,
