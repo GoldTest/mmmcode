@@ -270,7 +270,7 @@ cat ~/.waygate/mmcode/admin.json
 要**固定版本**部署，把 `docker-compose.yml` 里的 `image` 改成具体版本标签：
 
 ```yaml
-image: ghcr.io/goldtest/mmmcode:0.5.3
+image: ghcr.io/goldtest/mmmcode:0.5.4
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。
