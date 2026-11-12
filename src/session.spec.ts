@@ -1,25 +1,18 @@
 /**
- * session 识别测试。
+ * session 识别与清理测试（纯 Anthropic 协议版）。
  *
  * 守三件事：
- *   ① **显式 id 优先**：客户端带了 session id 就用它（头或 body 都认）；
- *   ② **推导稳定**：同样的「密钥+模型+首条用户消息」必须推出同一个 key；
- *   ③ **上下文能穿过 core 的归一** —— 这是最容易出错的地方：
- *      core 的 Anthropic 入站归一会**丢弃未识别的顶层字段**，
- *      所以 Anthropic 路线只能靠 system 里的哨兵把上下文带过去。
+ *   ① **显式 id 优先**：支持请求头、顶层字段、`metadata.session_id`、Claude Code `metadata.user_id`（`__session_<id>`）；
+ *   ② **推导稳定**：同一个新会话先调 `/v1/messages/count_tokens` 再调 `/v1/messages`，必须推出同一个 session key；
+ *   ③ **安全清理**：`stripSessionFields` 仅清理非 Anthropic 标准的会话字段，完整保留 `system`、`cache_control`、`thinking`、`metadata`。
  */
 
 import { describe, expect, it } from 'vitest';
-import { anthropicToOpenAiBody } from 'waygate-core';
 import {
-  CTX_FIELD,
-  decodeSentinel,
-  encodeSentinel,
-  extractRequestContext,
   findExplicitSessionId,
   firstUserText,
   resolveSessionKey,
-  SENTINEL_PREFIX,
+  stripSessionFields,
 } from './session.js';
 
 const BODY = {
@@ -28,15 +21,31 @@ const BODY = {
 };
 
 describe('显式 session id', () => {
-  it('从请求头里认 x-session-id / x-session / x-conversation-id', () => {
+  it('从请求头里认 x-session-id / x-session / x-conversation-id / x-chat-id', () => {
     expect(findExplicitSessionId({ 'x-session-id': 'abc' }, null)).toBe('abc');
     expect(findExplicitSessionId({ 'x-session': 'def' }, null)).toBe('def');
     expect(findExplicitSessionId({ 'x-conversation-id': 'ghi' }, null)).toBe('ghi');
+    expect(findExplicitSessionId({ 'x-chat-id': 'jkl' }, null)).toBe('jkl');
   });
 
-  it('从 body 里认 session_id / conversation_id', () => {
+  it('从 body 顶层认 session_id / sessionId / conversation_id / chat_id', () => {
     expect(findExplicitSessionId({}, { session_id: 's1' })).toBe('s1');
+    expect(findExplicitSessionId({}, { sessionId: 's2' })).toBe('s2');
     expect(findExplicitSessionId({}, { conversation_id: 'c1' })).toBe('c1');
+    expect(findExplicitSessionId({}, { chat_id: 'ch1' })).toBe('ch1');
+  });
+
+  it('从 Anthropic metadata.session_id 与 Claude Code metadata.user_id 提取会话 id', () => {
+    expect(
+      findExplicitSessionId({}, { metadata: { session_id: 'meta-sess-1' } }),
+    ).toBe('meta-sess-1');
+
+    expect(
+      findExplicitSessionId(
+        {},
+        { metadata: { user_id: 'user_abc_account_xyz__session_cc-1234-abcd' } },
+      ),
+    ).toBe('cc-1234-abcd');
   });
 
   it('显式 id 优先于推导', () => {
@@ -52,9 +61,27 @@ describe('显式 session id', () => {
 });
 
 describe('推导 session key', () => {
-  it('同样的输入推出同一个 key（多轮对话首条用户消息恒定）', () => {
-    const a = resolveSessionKey({ keyId: 'k1' }, BODY);
-    const b = resolveSessionKey({ keyId: 'k1' }, BODY);
+  it('count_tokens 与 messages 即使参数不同，只要入站密钥/模型/首条用户消息相同就推出同一个 key', () => {
+    const countTokensBody = {
+      model: 'MiniMax-M3',
+      system: '你是代码助手',
+      messages: [{ role: 'user' as const, content: [{ type: 'text', text: '你好，帮我看下这段代码' }] }],
+      tools: [{ name: 'read_file', input_schema: { type: 'object' } }],
+    };
+    const messagesBody = {
+      model: 'MiniMax-M3',
+      max_tokens: 4096,
+      stream: true,
+      system: '你是代码助手',
+      messages: [
+        { role: 'user' as const, content: '你好，帮我看下这段代码' },
+        { role: 'assistant' as const, content: '好的，请发给我' },
+        { role: 'user' as const, content: '第二轮补充' },
+      ],
+    };
+
+    const a = resolveSessionKey({ keyId: 'k1' }, countTokensBody);
+    const b = resolveSessionKey({ keyId: 'k1' }, messagesBody);
     expect(a).toBe(b);
     expect(a.startsWith('d:')).toBe(true);
   });
@@ -70,74 +97,44 @@ describe('推导 session key', () => {
     expect(resolveSessionKey({ keyId: 'k1' }, BODY)).not.toBe(resolveSessionKey({ keyId: 'k1' }, other));
   });
 
-  it('firstUserText 取第一条 user 消息（跳过 system）', () => {
+  it('firstUserText 兼容字符串、content blocks 与非文本块', () => {
     const messages = [
       { role: 'system' as const, content: '系统提示' },
-      { role: 'user' as const, content: '第一句' },
+      { role: 'user' as const, content: [{ type: 'text', text: '第一句' }] },
       { role: 'assistant' as const, content: '回复' },
       { role: 'user' as const, content: '第二句' },
     ];
     expect(firstUserText(messages)).toBe('第一句');
+
+    const imageOnly = [
+      { role: 'user' as const, content: [{ type: 'image', source: { type: 'base64', data: 'abc' } }] },
+    ];
+    expect(firstUserText(imageOnly)).toContain('image');
   });
 });
 
-describe('上下文穿过 core 的归一', () => {
-  it('★ OpenAI 路线：顶层字段被 core 保留 → 能取回上下文', () => {
-    /* core 的 OpenAI 路径：body = { ...raw, model, messages } —— 未知字段保留。 */
-    const raw = { ...BODY, [CTX_FIELD]: { sessionId: 'sess-9', keyId: 'k1', reqId: 'r1' } };
-    const normalized = { ...raw, model: raw.model, messages: raw.messages };
-    const { ctx, body } = extractRequestContext(normalized);
-    expect(ctx.sessionId).toBe('sess-9');
-    expect(ctx.keyId).toBe('k1');
-    expect(ctx.reqId).toBe('r1');
-    /* 运输痕迹被擦掉 —— 不会发到上游。 */
-    expect((body as Record<string, unknown>)[CTX_FIELD]).toBeUndefined();
-  });
-
-  it('★ Anthropic 路线：system 哨兵能穿过 core 的归一被取回', () => {
-    const sentinel = encodeSentinel({ sessionId: 'sess-anthropic', keyId: 'k2', reqId: 'r2' });
+describe('stripSessionFields 清理非标准会话字段', () => {
+  it('移除顶层非标准会话字段，完整保留 Anthropic 原生字段', () => {
     const raw = {
       model: 'MiniMax-M3',
-      system: `${sentinel}\n\n你是助手`,
-      messages: [{ role: 'user', content: '你好' }],
+      max_tokens: 1024,
+      session_id: 's1',
+      sessionId: 's2',
+      conversation_id: 'c1',
+      chat_id: 'ch1',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }],
+      thinking: { type: 'enabled', budget_tokens: 2048 },
+      metadata: { user_id: 'u1__session_abc' },
+      messages: [{ role: 'user', content: 'hi' }],
     };
 
-    /* core 的 Anthropic 归一：只认 system/messages/tools…，未知顶层字段会被丢弃。 */
-    const normalized = anthropicToOpenAiBody(raw as never) as never;
-    const { ctx, body } = extractRequestContext(normalized);
-
-    expect(ctx.sessionId).toBe('sess-anthropic');
-    expect(ctx.keyId).toBe('k2');
-    expect(ctx.reqId).toBe('r2');
-    /* 哨兵被摘掉，用户提示词原样留下。 */
-    const messages = body.messages as Array<{ role: string; content: unknown }>;
-    const system = messages.find((m) => m.role === 'system');
-    expect(system?.content).toBe('你是助手');
-    expect(String(system?.content)).not.toContain(SENTINEL_PREFIX);
-  });
-
-  it('哨兵单独占 system 时整条摘掉，不留空消息', () => {
-    const sentinel = encodeSentinel({ sessionId: 'only' });
-    const raw = { model: 'M', system: sentinel, messages: [{ role: 'user', content: 'hi' }] };
-    const normalized = anthropicToOpenAiBody(raw as never) as never;
-    const { ctx, body } = extractRequestContext(normalized);
-    expect(ctx.sessionId).toBe('only');
-    const messages = body.messages as Array<{ role: string; content: unknown }>;
-    expect(messages.some((m) => String(m.content).includes(SENTINEL_PREFIX))).toBe(false);
-  });
-
-  it('哨兵可逆（base64url 不含 ]，不会与内容里的 ]] 撞车）', () => {
-    const ctx = { sessionId: 'a]b]]c', keyId: 'k' };
-    const sentinel = encodeSentinel(ctx);
-    const decoded = decodeSentinel(`前面${sentinel}后面`);
-    expect(decoded).not.toBeNull();
-    expect(decoded?.ctx.sessionId).toBe('a]b]]c');
-    expect(decoded?.rest).toBe('前面后面');
-  });
-
-  it('没有上下文时原样返回（不报错）', () => {
-    const { ctx, body } = extractRequestContext({ ...BODY });
-    expect(ctx).toEqual({});
-    expect(body.messages).toHaveLength(1);
+    const cleaned = stripSessionFields(raw);
+    expect(cleaned).not.toHaveProperty('session_id');
+    expect(cleaned).not.toHaveProperty('sessionId');
+    expect(cleaned).not.toHaveProperty('conversation_id');
+    expect(cleaned).not.toHaveProperty('chat_id');
+    expect(cleaned.system).toEqual(raw.system);
+    expect(cleaned.thinking).toEqual(raw.thinking);
+    expect(cleaned.metadata).toEqual(raw.metadata);
   });
 });

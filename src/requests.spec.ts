@@ -9,7 +9,7 @@ describe('RequestStore', () => {
     id,
     timestamp: Date.now() - ageMs,
     method: 'POST',
-    path: '/v1/chat/completions',
+    path: '/v1/messages',
     clientIp: '127.0.0.1',
     keyId: 'k1',
     keyName: 'default',

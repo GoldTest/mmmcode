@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MiniMax Code 本地反代管理</title>
-<link rel="stylesheet" href="./style.css?v=0.5.4">
-<link rel="stylesheet" href="./keys.css?v=0.5.4">
+<link rel="stylesheet" href="./style.css?v=0.6.0">
+<link rel="stylesheet" href="./keys.css?v=0.6.0">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔑</text></svg>">
 </head>
 <body>
@@ -152,7 +152,7 @@
         </div>
         <div id="client-setup" class="setup"></div>
         <div id="key-list" class="keys"></div>
-        <p id="keys-empty" class="muted hidden pad">还没有客户端密钥。点「生成新密钥」创建一把，配置到 Claude Code 或 Cursor 等客户端中。</p>
+        <p id="keys-empty" class="muted hidden pad">还没有客户端密钥。点「生成新密钥」创建一把，配置到 Claude Code 或其他 Anthropic 兼容客户端中。</p>
       </section>
     </div>
 
@@ -208,22 +208,22 @@
           </div>
         </div>
         <div style="padding: 18px;">
-          <h3 style="margin:0 0 10px;font-size:13px;color:var(--fg-dim);">兼容路由端点</h3>
+          <h3 style="margin:0 0 10px;font-size:13px;color:var(--fg-dim);">Anthropic 原生透传端点</h3>
           <div class="cards" style="padding:0 0 18px;grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
             <div class="card" style="padding:12px;">
-              <b>OpenAI 兼容端点</b>
-              <code>POST /v1/chat/completions</code>
-              <p class="muted small" style="margin:0;">供 Cursor、NextChat 等客户端使用，支持流式 SSE。</p>
+              <b>Anthropic 消息端点</b>
+              <code>POST /v1/messages</code>
+              <p class="muted small" style="margin:0;">供 Claude Code 等 Anthropic 客户端使用，原生透传 SSE、thinking 与 cache_control。</p>
             </div>
             <div class="card" style="padding:12px;">
-              <b>Anthropic 兼容端点</b>
-              <code>POST /v1/messages</code>
-              <p class="muted small" style="margin:0;">供 Claude Code 等客户端使用，自动协议转义。</p>
+              <b>Token 计数端点</b>
+              <code>POST /v1/messages/count_tokens</code>
+              <p class="muted small" style="margin:0;">预估输入 token 数，并与同一会话的后续对话一对一绑定同一个账号。</p>
             </div>
             <div class="card" style="padding:12px;">
               <b>模型列表端点</b>
               <code>GET /v1/models</code>
-              <p class="muted small" style="margin:0;">返回 OpenAI 格式的模型清单与权限。</p>
+              <p class="muted small" style="margin:0;">返回可用模型清单。</p>
             </div>
           </div>
 
@@ -522,8 +522,8 @@
               <pre id="snippet-claude" class="code-block"></pre>
             </div>
             <div>
-              <span class="small" style="font-weight:600;">Cursor / OpenAI 兼容:</span>
-              <pre id="snippet-cursor" class="code-block"></pre>
+              <span class="small" style="font-weight:600;">Anthropic SDK / curl（含 count_tokens）:</span>
+              <pre id="snippet-anthropic" class="code-block"></pre>
             </div>
           </div>
         </div>
@@ -570,6 +570,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="./app.js?v=0.5.4"></script>
+<script src="./app.js?v=0.6.0"></script>
 </body>
 </html>

@@ -1,18 +1,15 @@
 /**
  * 统一 Web 服务 —— **一个端口**同时提供三样东西：
  *
- *   1. **反代**（`/v1/chat/completions`、`/v1/messages`、`/v1/models`）
- *      —— 委托给 `waygate-core` 的 `startServer`（跑在内部环回端口上）。
- *      **不重写协议**：Anthropic ⇄ OpenAI 的转义、SSE 帧编码、非流式聚合
- *      全部沿用 core 的实现 —— 那部分已经过实战验证，重写只会引入回归。
- *      内部多一跳环回请求，代价可忽略，换来的是「协议零重复实现」。
+ *   1. **反代**（`/v1/messages`、`/v1/messages/count_tokens`、`/v1/models`）
+ *      —— 由 `createProxyHandler` 直接处理原生 Anthropic 协议透传（无内部环回）。
  *
  *   2. **静态管理页**（`/`）—— 纯静态文件，无构建步骤。
  *
  *   3. **管理 API**（`/admin/api/*`）—— 见 `admin-api.ts`。
  *
  * ## 为什么反代要挂在管理页同一个端口
- * Docker 部署只暴露一个端口就够了；客户端（Claude Code / Cursor）配一个
+ * Docker 部署只暴露一个端口就够了；客户端（Claude Code / Anthropic SDK）配一个
  * `base_url` 就能同时用到「模型」和「管理」。若分成两个端口，用户要配两个地址，
  * 容器也要暴露两个端口 —— 没有收益。
  *
@@ -26,13 +23,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startServer, type Adapter } from 'waygate-core';
+import type { MmcodeAdapter } from './adapter.js';
 import { AccountPool } from './pool.js';
-import { SessionStore, ensureAdminKey, maskAdminKey } from './admin.js';
+import { SessionStore, ensureAdminKey } from './admin.js';
 import { createAdminApi } from './admin-api.js';
 import { adminKeyPath } from './admin.js';
 import { waygateRoot } from './accounts.js';
-import { createProxyForwarder, INTERNAL_KEY } from './proxy.js';
+import { createProxyHandler } from './proxy.js';
 import type { InsightsLedger } from './insights.js';
 import type { KeyRegistry } from './keys.js';
 import { RequestStore } from './requests.js';
@@ -45,7 +42,7 @@ export interface WebServerOptions {
   apiKey: string;
   /** 入站密钥注册表（多把，支持生成/吊销）。 */
   keys: KeyRegistry;
-  adapter: Adapter;
+  adapter: MmcodeAdapter;
   pool: AccountPool;
   version: string;
   requests?: RequestStore;
@@ -59,8 +56,6 @@ export interface WebServerOptions {
 export interface WebServerHandle {
   /** 公开端口。 */
   port: number;
-  /** 内部反代端口（环回，仅本机）。 */
-  proxyPort: number;
   close(): Promise<void>;
 }
 
@@ -99,10 +94,20 @@ export function resolveWebRoot(): string | null {
   return null;
 }
 
-/** 反代路由判定：这些路径交给 core 的服务器处理。 */
+/**
+ * 反代路由判定：这些路径交给原生 Anthropic 反代处理器。
+ *
+ * 注意：故意把 `/chat/completions`（以及 `/v1/*`）也归入反代处理器，
+ * 使其返回标准的 Anthropic 404 JSON 错误，而不是落入静态 SPA 回落返回 `index.html`。
+ */
 function isProxyPath(path: string): boolean {
   if (path.startsWith('/v1/')) return true;
-  return path === '/models' || path === '/chat/completions' || path === '/messages';
+  return (
+    path === '/models' ||
+    path === '/messages' ||
+    path === '/messages/count_tokens' ||
+    path === '/chat/completions'
+  );
 }
 
 export async function startWebServer(opts: WebServerOptions): Promise<WebServerHandle> {
@@ -110,7 +115,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
   const sessions = new SessionStore();
 
   /* 管理密钥：不存在就生成一个（首次启动会把明文打到日志里）。 */
-  const adminKey = ensureAdminKey();
+  ensureAdminKey();
 
   const stateDir = join(waygateRoot(), 'mmcode');
   const requests = opts.requests ?? new RequestStore(join(stateDir, 'requests-config.json'), join(stateDir, 'requests.json'));
@@ -122,18 +127,18 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     });
   scheduler.start();
 
-  /* ① 内部反代（环回）+ 鉴权转发器。 */
-  const proxy = await startServer(opts.adapter, {
-    host: '127.0.0.1',
-    port: 0,
-    apiKey: INTERNAL_KEY,
+  /* ① 原生 Anthropic 反代处理器（直通，无内部环回）。 */
+  const handleProxy = createProxyHandler({
+    adapter: opts.adapter,
+    keys: opts.keys,
+    pool: opts.pool,
+    requests,
+    log,
     verbose: opts.verbose,
-    log: (line) => log(line),
   });
-  const forwardProxy = createProxyForwarder(proxy.port, opts.keys, log, requests, opts.pool);
 
   const proxyStatus = () => ({
-    port: proxy.port,
+    port: opts.port,
     upstream: opts.adapter.upstreamLabel,
     accounts: opts.pool.all().length,
     available: opts.pool.available().length,
@@ -200,7 +205,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
 
     /* 反代路由。 */
     if (isProxyPath(path)) {
-      forwardProxy(req, res);
+      await handleProxy(req, res);
       return;
     }
 
@@ -261,12 +266,10 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
 
   return {
     port: publicPort,
-    proxyPort: proxy.port,
     close: async () => {
       scheduler.stop();
       requests.flush();
       opts.insights?.flush();
-      await proxy.close();
       await new Promise<void>((done) => {
         server.close(() => done());
         setTimeout(() => done(), 3000).unref?.();

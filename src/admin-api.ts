@@ -36,6 +36,8 @@
 import { existsSync, rmSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Adapter } from 'waygate-core';
+import type { MmcodeAdapter } from './adapter.js';
+import { aggregateAnthropicSseToMessage, extractAnthropicMessageText } from './protocol/usage.js';
 import {
   adminKeyPath,
   changeAdminKey,
@@ -72,7 +74,7 @@ const NAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export interface AdminApiContext {
   pool: AccountPool;
   sessions: SessionStore;
-  adapter: Adapter;
+  adapter: Adapter | MmcodeAdapter;
   /** 入站密钥注册表（客户端用的那些 token）。 */
   keys: KeyRegistry;
   /** 反代入站密钥（展示时打码）。 */
@@ -590,27 +592,54 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const prompt = typeof body.prompt === 'string' ? body.prompt : 'Hi, please say hello!';
         const start = Date.now();
         try {
-          const result = await ctx.adapter.chat(
-            {
-              model,
-              messages: [{ role: 'user', content: prompt }],
-              stream: false,
-            },
-            AbortSignal.timeout(30_000),
-          );
+          let status = 200;
           let responseText = '';
-          if (result.stream) {
-            const reader = result.stream.getReader();
-            const decoder = new TextDecoder();
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              responseText += decoder.decode(value, { stream: true });
+          if ('messages' in ctx.adapter && typeof ctx.adapter.messages === 'function') {
+            const result = await ctx.adapter.messages(
+              {
+                model,
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 1024,
+                stream: false,
+              },
+              AbortSignal.timeout(30_000),
+            );
+            status = result.status;
+            if (result.bodyText) {
+              try {
+                const parsed = JSON.parse(result.bodyText);
+                const extracted = extractAnthropicMessageText(parsed);
+                responseText = extracted.text || result.bodyText;
+              } catch {
+                responseText = result.bodyText;
+              }
+            } else if (result.stream) {
+              const msg = await aggregateAnthropicSseToMessage(result.stream, model);
+              responseText = extractAnthropicMessageText(msg).text || JSON.stringify(msg);
+            }
+          } else {
+            const result = await ctx.adapter.chat(
+              {
+                model,
+                messages: [{ role: 'user', content: prompt }],
+                stream: false,
+              },
+              AbortSignal.timeout(30_000),
+            );
+            status = result.status;
+            if (result.stream) {
+              const reader = result.stream.getReader();
+              const decoder = new TextDecoder();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                responseText += decoder.decode(value, { stream: true });
+              }
             }
           }
           sendJson(res, 200, {
             ok: true,
-            status: result.status,
+            status,
             durationMs: Date.now() - start,
             response: responseText,
             account: ctx.pool.getLastUsedAccount(),

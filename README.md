@@ -26,14 +26,14 @@
 >
 > 备了**多个**专用账号？本工具会**自动切换**：某个号被顶掉时自动换下一个，服务不中断。
 
-**用官方 OAuth 设备授权登录，在本机起一个 Anthropic / OpenAI 兼容的聊天端点** ——
-Cursor、Claude Code、Cherry Studio、任何能改 base_url 的工具，都能直接用你的订阅额度。
+**用官方 OAuth 设备授权登录，在本机起一个纯 Anthropic 原生兼容反代** ——
+Claude Code、Anthropic SDK、任何支持自定义 `ANTHROPIC_BASE_URL` 的工具，都能直接用你的订阅额度。
 
 - **零配置接入** —— 一条命令起服务，打印出「代理地址 + 密钥 + 模型 ID」
 - **浏览器授权登录** —— `mmcode login` 打印一个链接，点开授权即可；**不需要装桌面客户端**，
   服务器上也能自助登录（这正是它相比「读本机登录态」方案的用处）
-- **两个协议都认** —— `POST /v1/chat/completions`（OpenAI）与 `POST /v1/messages`（Anthropic）
-- **多账号 + 智能调度** —— 账号按**优先级分层**、同层随机分配；**按 session 粘住账号**保住上游缓存，额度耗尽时可无缝滑动
+- **原生 Anthropic 透传** —— 支持 `POST /v1/messages`（含流式 SSE、`thinking`、`cache_control`）与 `POST /v1/messages/count_tokens`（以及去 `/v1` 前缀的 `/messages`、`/messages/count_tokens`），零协议翻译损耗
+- **多账号 + 智能调度** —— 账号按**优先级分层**、同层随机分配；**按 session 1:1 粘住账号**（`count_tokens` 与同会话对话落在同一账号）保住上游缓存，额度耗尽时可无缝滑动
 - **用量洞察面板** —— 看清**每个账号**分别烧了多少 token（输入 / 输出 / 缓存命中），按模型与按天拆分
 - **Web 管理页** —— 浏览器里登录、授权、签到、看状态；密钥保护，状态**落盘持久**
 - **Docker 一键部署** —— 一个容器、一个端口，反代与管理页都在里面
@@ -68,12 +68,11 @@ mmcode
 ```
 
 ```
-途关 · MiniMax Code 反代 v0.3.5
+途关 · MiniMax Code 反代 v0.6.0
 
 凭证    ✓ access 有效约 187 分钟（账号 01a0d156…）
-上游    https://agent.minimax.cn  (Anthropic 兼容)
-代理    http://127.0.0.1:8788/v1   （OpenAI 系客户端：Cursor / Cherry Studio / OpenAI SDK）
-        http://127.0.0.1:8788      （Anthropic 系客户端：Claude Code，它自己会补 /v1）
+上游    https://agent.minimax.cn  (Anthropic 原生透传)
+代理    http://127.0.0.1:8788      （Anthropic 客户端如 Claude Code 填此地址，会自动补 /v1）
 密钥    sk-mmcode-1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d
 
 模型 ID（填进你的客户端）：
@@ -82,7 +81,8 @@ mmcode
   MiniMax-M2.7
   MiniMax-M2.7-highspeed
 
-把上面的「代理地址 + 密钥」填进 Cursor / Claude Code / Cherry Studio 等客户端即可。
+把上面的「代理地址 + 密钥」填进 Claude Code 或 Anthropic SDK 即可。
+端点：POST /v1/messages · POST /v1/messages/count_tokens · GET /v1/models
 按 Ctrl+C 停止。
 ```
 
@@ -100,7 +100,7 @@ mmcode web --host 0.0.0.0 --port 8789
 
 ```
   管理页        http://127.0.0.1:8789/
-  反代地址      http://127.0.0.1:8789/v1
+  反代地址      http://127.0.0.1:8789    （Anthropic 客户端填此地址，勿带 /v1）
   健康检查      http://127.0.0.1:8789/healthz
 
   ⚠️  已生成管理密钥（首次启动自动生成，仅此一次明文显示）：
@@ -114,13 +114,13 @@ mmcode web --host 0.0.0.0 --port 8789
 - 保存在 `~/.waygate/mmcode/admin.json`（**0600**），重启不丢。
 - **可修改**：管理页「设置」里改 —— 必须提供**当前正确的旧密钥**；改完**所有旧会话立刻失效**。
 - 管理密钥与**反代入站密钥**（`~/.waygate/mmcode/key`）是**两把不同的钥匙**：
-  前者进管理页，后者给 Claude Code / Cursor 用。
+  前者进管理页，后者给 Claude Code / Anthropic SDK 用。
 
 > 浏览器里**不存密钥**：登录时把密钥交给服务端换成 HttpOnly 会话 Cookie，密钥本身不落 localStorage。
 
 ### 客户端密钥管理（给客户端用的 token）
 
-客户端 token 是**长期凭据**（填在 Claude Code / Cursor / 脚本里）。一把钥匙用久了有实际麻烦：
+客户端 token 是**长期凭据**（填在 Claude Code / Anthropic SDK / 脚本里）。一把钥匙用久了有实际麻烦：
 
 - **泄露后无法精确吊销** —— 只能整体换掉，把所有客户端一起打断；
 - **无法区分用途** —— 不知道哪把是哪台机器；
@@ -158,9 +158,8 @@ $ mmcode keys rotate <id>
 $ mmcode keys revoke <id>
 ```
 
-> **多把密钥的鉴权在 core 之外**：core 的 `startServer` 只认一把固定密钥，
-> 所以本工具在转发前自己做鉴权（注册表里任意一把**启用且未过期**的都能通过），
-> 再把请求转给内部 core 服务器 —— 协议部分仍由 core 处理，没有重复实现。
+> **多把密钥的鉴权直接集成在统一反代处理器中**：注册表里任意一把**启用且未过期**的密钥均可通过
+> `x-api-key` 或 `Authorization: Bearer <key>` 鉴权，`serve` 与 `web` 共用同一套原生 Anthropic 透传引擎，无需内部环回。
 
 ### 账号管理页能做什么
 
@@ -177,7 +176,7 @@ $ mmcode keys revoke <id>
 | 优先级分层 | 给账号设优先级层（数字越小越优先），同层随机分配 |
 | 额度阈值 | 余额低于多少积分就**冻结**该账号（不再参与调度） |
 | **用量洞察** | 各账号的 token 消耗（输入 / 输出 / 缓存命中 / **缓存命中率**）、按模型与按天拆分 |
-| **请求详情** | 横向三栏：**请求**（入站内容）/ **中转**（上游地址 + 转译后实际发出的请求）/ **输出**（回复 + 输出详情 + 首字符时间） |
+| **请求详情** | 横向三栏：**请求**（入站内容）/ **中转**（上游地址 + 实际发往上游的 Anthropic 请求）/ **输出**（回复 + 输出详情 + 首字符时间） |
 | **客户端密钥** | 多把密钥的生成 / 复制 / 停用 / 轮换 / 吊销（见下节） |
 | 修改管理密钥 | 需旧密钥校验 |
 
@@ -214,13 +213,13 @@ $ mmcode keys revoke <id>
 - 上游回 **429** 同样立即视为额度耗尽并冻结；
 - 余额回到阈值以上**自动解冻**。
 
-**③ session 归属（两种模式）**
+**③ session 归属（一对一绑定与两种模式）**
 
-「同一 session 的对话永远待在同一个账号上」—— 这样才能吃到上游的提示词缓存，
-否则每轮都要重吃一遍全量 prompt。session 的识别：
+「同一 session 的请求永远待在同一个账号上」—— 不仅多轮对话不切换账号以保住上游提示词缓存，
+**新会话开始前先发起的 `POST /v1/messages/count_tokens` 也会与随后的 `POST /v1/messages` 绑定到同一个账号**，确保同一会话全程一对一落在同一账号上。session 的识别：
 
-- 客户端显式给 `x-session-id` 头或 body 的 `session_id` → **优先采用**；
-- 没有则按「入站密钥 + 模型 + 首条用户消息」哈希推导（主流客户端每轮重发完整历史，首条消息恒定）。
+- 客户端显式给 `x-session-id` / `x-session` / `x-conversation-id` / `x-chat-id` 头、body 的 `session_id` / `metadata.session_id`，或 Claude Code `metadata.user_id` 中的 `__session_<id>` → **优先采用**；
+- 没有则按「入站密钥 + 模型 + 首条用户消息」哈希推导（`count_tokens` 与对话首轮及后续重发历史的首条用户消息与模型一致，因而命中同一 `sessionKey`）。
 
 | 模式 | 行为 |
 | --- | --- |
@@ -270,7 +269,7 @@ cat ~/.waygate/mmcode/admin.json
 要**固定版本**部署，把 `docker-compose.yml` 里的 `image` 改成具体版本标签：
 
 ```yaml
-image: ghcr.io/goldtest/mmmcode:0.5.4
+image: ghcr.io/goldtest/mmmcode:0.6.0
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。
@@ -418,22 +417,32 @@ MiniMax Code 积分账本
 
 ## 客户端怎么填
 
-**Cursor / Cherry Studio / OpenAI SDK**
-
-- Base URL：`http://127.0.0.1:8788/v1`
-- API Key：启动时打印的 `sk-mmcode-…`
-- 模型：模型 ID（如 `MiniMax-M3`）
-
 **Claude Code**
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8788
-ANTHROPIC_API_KEY=sk-mmcode-…
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8788"
+export ANTHROPIC_API_KEY="sk-mmcode-…"
+export CLAUDE_CODE_USE_BEDROCK="false"
 ```
 
-暴露的端点：`POST /v1/chat/completions` · `POST /v1/messages` · `GET /v1/models` · `GET /healthz`
+（若使用 `mmcode web` 统一服务，将端口改为 `8789`；**不要**在 `ANTHROPIC_BASE_URL` 末尾带 `/v1`，Anthropic SDK 与 Claude Code 会自动补 `/v1`。）
 
-支持流式（SSE）与非流式（`stream: false` 时自动聚合为单个 JSON）两种响应模式。
+**Anthropic SDK / curl**
+
+- Base URL：`http://127.0.0.1:8788`（或统一服务 `http://127.0.0.1:8789`）
+- API Key：启动时打印的 `sk-mmcode-…`（支持 `x-api-key` 或 `Authorization: Bearer <key>`）
+- 模型：模型 ID（如 `MiniMax-M3`、`MiniMax-M3.1-Flash-Preview`）
+
+暴露的端点（均兼容去 `/v1` 前缀）：
+
+- `POST /v1/messages`（及 `/messages`）—— 原生 Anthropic 消息接口，完整透传 SSE、`thinking`、`cache_control` 与 `tools`
+- `POST /v1/messages/count_tokens`（及 `/messages/count_tokens`）—— 原生 Anthropic Token 计数透传，并与同会话对话一对一绑定同一账号
+- `GET /v1/models`（及 `/models`）—— 可用模型列表
+- `GET /healthz` —— 健康检查
+
+> 本工具仅支持 **Anthropic 协议**，不再支持 OpenAI `/v1/chat/completions`（调用将返回 404 Anthropic `not_found_error`）。
+
+支持流式（SSE）与非流式（`stream: false`）两种响应模式。
 
 ## 工作原理
 
@@ -443,26 +452,25 @@ ANTHROPIC_API_KEY=sk-mmcode-…
 - **令牌生命周期**：access token（`mmoat_`）寿命短（约 1–4 小时），到期前 2 分钟自动刷新；refresh token（`mmort_`）刷新后会被上游**轮换**，本工具自动写回本地。
 - **模型清单**：上游的清单端点是 `/mavis/api/v1/models`（**无需鉴权**即可读）—— 本工具**真拉取**，失败时回落内置清单（4 个模型）。
 - **多账号**：每个账号一套独立令牌（`accounts/<name>/mmcode/`）+ 一条运营状态（`accounts.json`）。
-  `AccountPool` 负责选号（**优先级分层 + 同层随机 + 额度冻结 + session 绑定**），
+  `AccountPool` 负责选号（**优先级分层 + 同层随机 + 额度冻结 + session 1:1 绑定**），
   **冷却与冻结状态落盘**，重启不丢。
-- **用量洞察**：适配器在响应流里摘出权威 usage 记进 `insights.json` —— 各账号的
+- **用量洞察**：适配器从原生 Anthropic 响应（JSON 与 SSE `message_start` / `message_delta`）里摘出权威 usage（含 `cache_read_input_tokens` / `cache_creation_input_tokens`）记进 `insights.json` —— 各账号的
   token 消耗（输入 / 输出 / 缓存命中）按模型、按天拆分，并给出**缓存命中率**
-  （命中 token / 输入 token），管理页与请求详情里都能看到。
-- **统一服务**：`mmcode web` 把反代（内部委托给 `waygate-core` 的 `startServer`，**协议零重复实现**）、
-  静态管理页、管理 API 挂在**同一个端口**上。
+  （命中 token / 输入 token），管理页与请求详情里都能看到；`count_tokens` 请求留痕在请求详情中，不计入用量台账以免虚增消耗。
+- **原生直通反代**：`mmcode serve` 与 `mmcode web` 共用同一套原生 Anthropic 透传处理器，无内部环回、无协议往返翻译，完整保留 `system` blocks、`cache_control`、`thinking` 与 `count_tokens`。
 
 ```mermaid
 flowchart LR
-  C[你的客户端<br/>Cursor / Claude Code]
+  C[你的客户端<br/>Claude Code / Anthropic SDK]
   M[mmcode web<br/>:8789]
   W[浏览器<br/>管理页]
   G[MiniMax mavis 网关]
   B[浏览器<br/>授权页]
 
-  C -->|OpenAI / Anthropic 协议| M
+  C -->|Anthropic /v1/messages & count_tokens| M
   W -->|管理 API| M
-  M -->|Anthropic 兼容协议| G
-  M -->|账号池<br/>优先级 + 额度 + session| G
+  M -->|原生 Anthropic 透传| G
+  M -->|账号池<br/>优先级 + 额度 + session 1:1| G
 
   subgraph local [本机]
     M

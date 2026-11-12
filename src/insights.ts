@@ -7,7 +7,7 @@
  * 连同「这次请求实际用了哪个账号」一起记账 —— 因此统计口径是**账号级真实消耗**，
  * 而不是估算。
  *
- * ## 口径（与 `protocol/stream-decode.ts` 保持一致）
+ * ## 口径（与 `protocol/usage.ts` 保持一致）
  *   prompt_tokens     = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
  *   completion_tokens = output_tokens
  *   cached_tokens     = cache_read_input_tokens（只算**读**命中；写入不算命中）

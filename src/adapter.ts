@@ -1,18 +1,21 @@
 /**
- * MiniMax Code 适配器：把「官方 OAuth 设备授权登录取到的凭证」变成「本地 Anthropic/OpenAI 兼容反代」。
+ * MiniMax Code 适配器：把「官方 OAuth 设备授权登录取到的凭证」变成「本地 Anthropic 兼容反代」。
  *
- * 与 waygate-qoder / waygate-workbuddy 同构（同一个 core 骨架），差异在于：
+ * 与 waygate-qoder / waygate-workbuddy 同构，差异在于：
  *   · 凭证：走 **官方 OAuth 设备授权**（`mmcode login`），**不读本机客户端、不解密**；
- *     这样服务器（无反代目标机的桌面客户端）也能自助登录，无需人工注入 token；
- *   · 协议：上游是 **Anthropic 兼容**（`/mavis/api/v1/llm/v1/messages`），不是自研签名；
+ *     这样服务器也能自助登录，无需人工注入 token；
+ *   · 协议：上游是 **原生 Anthropic 兼容**（`/mavis/api/v1/llm/v1/messages` 与
+ *     `/mavis/api/v1/llm/v1/messages/count_tokens`），不再做 OpenAI 往返翻译，完整透传
+ *     `system` blocks、`cache_control`、`thinking`、`tools` 与缓存命中 usage；
  *   · ⚠️ 有**凭证互斥**问题（见 README），必须给用户明确告警。
  *
  * ## 多账号与调度（本文件的核心）
  * MiniMax **同一账号只能有一个有效会话** —— 上游 401 通常意味着「这个号在别处登过」，
  * 光重试没用。所以反代必须**手上有多个号**：
  *   · `AccountPool` 负责选号（**按优先级分层 + 同层随机 + 额度冻结**）；
- *   · 本文件的 `chat()` 负责按 **session** 选号并执行失败重试：
- *     401/403/429 → 标记该号 → 换下一个（受调度模式约束）；
+ *   · 本文件的 `messages()` 与 `countTokens()` 共用同一套 **session 选号 + 失败重试** 逻辑：
+ *     同一会话先调 `count_tokens` 再调 `messages` 会命中同一个 `sessionKey` 并一对一绑定
+ *     同一个账号；遇到 401/403/429 时受调度模式约束自动换号或拒绝迁移；
  *   · 每个账号**各自持有**令牌管理器（各自缓存、各自刷新、各自写回），互不干扰。
  *
  * ## 两种模式（由 `AccountPool.mode()` 决定，全局生效）
@@ -32,7 +35,6 @@ import {
 } from 'waygate-core';
 import {
   LOGIN_WAIT_MS,
-  MinimaxTokenManager,
   PendingLoginError,
   credentialPath,
   credentialSummary,
@@ -45,17 +47,21 @@ import {
 } from './credential.js';
 import { CredentialError, UpstreamError } from './errors.js';
 import { MinimaxActivity, renderCheckin, renderCredits } from './activity.js';
-import { anthropicToOpenAiSse } from './protocol/stream-decode.js';
-import { collectUsage } from './protocol/usage.js';
-import { toAnthropicRequest } from './protocol/translate.js';
+import {
+  aggregateAnthropicSseToMessage,
+  collectAnthropicUsage,
+  extractAnthropicJsonUsage,
+  type StreamUsage,
+} from './protocol/usage.js';
 import { AccountStore, DEFAULT_ACCOUNT_NAME } from './accounts.js';
 import { AccountPool, classifyFailure, type PoolAccount } from './pool.js';
-import { extractRequestContext, resolveSessionKey } from './session.js';
+import { resolveSessionKey, stripSessionFields, type RequestContext } from './session.js';
 import type { InsightsLedger } from './insights.js';
 import { maskInboundKey, type KeyRegistry } from './keys.js';
 
 export const DEFAULT_MMCODE_BASE_URL = 'https://agent.minimax.cn';
 export const DEFAULT_MMCODE_CHAT_PATH = '/mavis/api/v1/llm/v1/messages';
+export const DEFAULT_MMCODE_COUNT_TOKENS_PATH = '/mavis/api/v1/llm/v1/messages/count_tokens';
 
 export function resolveAdapterBaseUrl(opts: { baseUrl?: string; region?: MinimaxRegion } = {}): string {
   if (opts.baseUrl) return opts.baseUrl.replace(/\/+$/, '');
@@ -66,15 +72,6 @@ export function resolveAdapterBaseUrl(opts: { baseUrl?: string; region?: Minimax
 
 /**
  * MiniMax 内置模型清单 —— **仅作回落**（v0.3.5 起）。
- *
- * 此前注释称「上游没有清单端点（实测 /mavis/api/v1/llm/v1/models 恒 503）」，
- * 那是**测错了路径**：清单端点是 `/mavis/api/v1/models`（不带 `llm/v1` 段，
- * 与 chat 端点前缀不同）。2026-10-17 实测该端点**无需鉴权**即可返回
- *   `{version, ttlSeconds, providers:[{providerId:'minimax', config:{models:{...}}}]}`
- *   —— 当前 4 个模型，与本清单一致。
- *
- * 故改为「真拉取 + 本清单回落」：上游新增模型能自动跟上（不必发版），
- * 拉取失败（离线 / 端点变更）时退回这里，保证 `mmcode models` 永远有输出。
  */
 export const MINIMAX_MODELS: ModelEntry[] = [
   { id: 'MiniMax-M3', displayName: 'MiniMax M3' },
@@ -83,7 +80,7 @@ export const MINIMAX_MODELS: ModelEntry[] = [
   { id: 'MiniMax-M2.7-highspeed', displayName: 'MiniMax M2.7 Highspeed' },
 ];
 
-/** 清单端点（相对 baseUrl）。与 chat 端点不同前缀 —— 这是当初测错的地方。 */
+/** 清单端点（相对 baseUrl）。与 chat 端点不同前缀。 */
 export const MODELS_PATH = '/mavis/api/v1/models';
 
 /** 拉取超时：清单是启动路径上的调用，不能拖慢 `mmcode serve`。 */
@@ -100,9 +97,7 @@ interface MinimaxCatalogResponse {
 /**
  * 拉上游真清单。失败 / 结构不符 / 空清单 → 返回 null（调用方回落内置清单）。
  *
- * **不带 access token**：实测该端点无需鉴权（带假 token 反而 401 —— 上游若收到
- * Authorization 会去校验它）。不带即匿名可读，也就不依赖登录态，`mmcode models`
- * 在未登录时同样可用。
+ * **不带 access token**：实测该端点无需鉴权（带假 token 反而 401）。
  */
 export async function pullMinimaxModels(baseUrl: string): Promise<ModelEntry[] | null> {
   try {
@@ -118,21 +113,15 @@ export async function pullMinimaxModels(baseUrl: string): Promise<ModelEntry[] |
       .filter(([id]) => typeof id === 'string' && id.length > 0)
       .map(([id, m]) => ({
         id,
-        /* 上游 name 是短名（如 `M2.7`），补上厂商前缀便于客户端里辨认。 */
         displayName: typeof m?.name === 'string' && m.name ? `MiniMax ${m.name}` : id,
       }));
     return entries.length > 0 ? entries : null;
   } catch {
-    /* 网络不可达 / 超时 / 坏 JSON —— 一律回落，不向调用方抛（清单不是关键路径）。 */
     return null;
   }
 }
 
-/**
- * 轮询进度行 —— 用 `\r` 覆盖同一行，不刷屏。
- *
- * 没有它，用户面对的是最长 2 分钟的**完全静默**（实测），分不清"在等"还是"卡死了"。
- */
+/** 轮询进度行 —— 用 `\r` 覆盖同一行，不刷屏。 */
 function tickTo(out: NodeJS.WriteStream): (info: { waitedMs: number; remainingMs: number }) => void {
   return ({ waitedMs, remainingMs }) => {
     const w = Math.round(waitedMs / 1000);
@@ -141,13 +130,7 @@ function tickTo(out: NodeJS.WriteStream): (info: { waitedMs: number; remainingMs
   };
 }
 
-/**
- * 登录成功后必讲的互斥告警 —— 设备授权**不解除**它。
- *
- * 走 OAuth 只是让「服务器上自助登录」成为可能，MiniMax 的
- * 「同一账号同时只有一个有效会话」规则没有变：这个账号一旦在别处登过
- * （桌面客户端或官方 `mcode` CLI），本工具手里的 refresh token 立刻作废。
- */
+/** 登录成功后必讲的互斥告警 —— 设备授权不解除它。 */
 function mutualExclusionNotice(): string {
   return (
     '\n⚠️  凭证互斥（必读）：MiniMax 同一账号只能有一个有效会话。\n' +
@@ -156,12 +139,53 @@ function mutualExclusionNotice(): string {
   );
 }
 
+/** 原生 Anthropic `/v1/messages` 调用结果。 */
+export interface AnthropicCallResult {
+  status: number;
+  contentType: string;
+  /** 流式响应（`text/event-stream`） */
+  stream?: ReadableStream<Uint8Array>;
+  /** 非流式响应（`application/json`） */
+  bodyText?: string;
+}
+
+/** 原生 Anthropic `/v1/messages/count_tokens` 调用结果。 */
+export interface AnthropicCountTokensResult {
+  status: number;
+  contentType: string;
+  bodyText: string;
+}
+
+/** 可选透传的 Anthropic 请求头。 */
+export interface AnthropicInboundHeaders {
+  anthropicVersion?: string;
+  anthropicBeta?: string;
+}
+
+/** 扩展后的 MiniMax Code 适配器契约（含原生 Anthropic messages 与 count_tokens）。 */
+export interface MmcodeAdapter extends Adapter {
+  messages(
+    body: Record<string, unknown>,
+    signal: AbortSignal,
+    ctx?: RequestContext,
+    inboundHeaders?: AnthropicInboundHeaders,
+  ): Promise<AnthropicCallResult>;
+  countTokens(
+    body: Record<string, unknown>,
+    signal: AbortSignal,
+    ctx?: RequestContext,
+    inboundHeaders?: AnthropicInboundHeaders,
+  ): Promise<AnthropicCountTokensResult>;
+}
+
 /** 适配器构造选项。 */
 export interface MmcodeAdapterOptions {
   /** 强制指定上游 base（调试用；否则按账号区域推导）。 */
   baseUrl?: string;
-  /** 聊天端点路径（默认 Anthropic 兼容路径）。 */
+  /** Messages 端点路径（默认 Anthropic 兼容路径）。 */
   chatPath?: string;
+  /** Count Tokens 端点路径（默认 Anthropic 兼容路径）。 */
+  countTokensPath?: string;
   /** 区域兜底（账号未记录区域时用）。 */
   region?: MinimaxRegion;
   /** 账号池（不传则基于默认注册表自建）。 */
@@ -174,9 +198,10 @@ export interface MmcodeAdapterOptions {
   log?: (line: string) => void;
 }
 
-export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
+export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdapter {
   const log = opts.log ?? ((line: string) => process.stdout.write(`[mmcode] ${line}\n`));
   const chatPath = opts.chatPath ?? DEFAULT_MMCODE_CHAT_PATH;
+  const countTokensPath = opts.countTokensPath ?? DEFAULT_MMCODE_COUNT_TOKENS_PATH;
 
   /* 账号池：外部可注入（管理端与 CLI 共用一个实例），否则自建。 */
   const pool = opts.pool ?? new AccountPool(new AccountStore(), { log });
@@ -188,12 +213,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     return getAgentBase(region);
   };
 
-  /**
-   * 兜底账号 —— **仅供 CLI / 体检这类「要一个账号去问上游」的场景**。
-   *
-   * 新模型里**没有「当前账号」概念**：调度只看优先级与额度。这里取「第一个可用账号」，
-   * 没有可用就退到「第一个已登记账号」（只为把 base URL / 区域推给用户看）。
-   */
+  /** 兜底账号 —— 仅供 CLI / 体检这类「要一个账号去问上游」的场景。 */
   const fallbackAccount = (): PoolAccount | null => {
     return pool.available()[0] ?? pool.all()[0] ?? null;
   };
@@ -215,7 +235,146 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     return fallbackAccount();
   };
 
-  return {
+  /**
+   * 共享的「按 session 选号 + 401/403/429 自动换号重试」调度引擎。
+   *
+   * `/v1/messages` 与 `/v1/messages/count_tokens` 共用同一条链路：
+   *   1. 通过相同的 `sessionKey` 命中或建立一对一账号绑定；
+   *   2. 401/403/429 或网络抖动时，受 `max-cache` / `balanced` 约束触发冷却与换号；
+   *   3. 400 / 5xx 等非账号问题直接抛出，不污染健康账号；
+   *   4. 客户端断连（`signal.aborted`）直接中止，不惩罚账号。
+   */
+  async function dispatchWithFailover<T>(params: {
+    sessionKey: string;
+    ctx: RequestContext;
+    upstreamPath: string;
+    upstreamPayload: Record<string, unknown>;
+    accept: string;
+    inboundHeaders?: AnthropicInboundHeaders;
+    signal: AbortSignal;
+    onSuccess: (res: Response, account: PoolAccount) => Promise<T>;
+  }): Promise<T> {
+    const { sessionKey, ctx, upstreamPath, upstreamPayload, accept, inboundHeaders, signal, onSuccess } = params;
+    const bodyJson = JSON.stringify(upstreamPayload);
+    const tried = new Set<string>();
+    let lastError: Error | null = null;
+
+    /* 最多试 4 个账号（再多也没意义 —— 用户通常只备了两三个号）。 */
+    const maxAttempts = Math.max(1, Math.min(pool.all().length || 1, 4));
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const acquired = pool.acquireForSession(sessionKey);
+      if (!acquired.ok) {
+        if (acquired.reason === 'pinned') {
+          const pinned = acquired.pinnedAccount ? pool.get(acquired.pinnedAccount) : null;
+          const hint =
+            pinned?.record.health === 'unauthorized'
+              ? '该账号的凭证已被别处登录顶掉，请给它重新授权（管理页或 `mmcode login`）。'
+              : '可以给它补额度（签到）或切换到「平衡」模式让会话自动滑动。';
+          throw new CredentialError(`${acquired.detail} ${hint}`);
+        }
+        break;
+      }
+
+      const account = acquired.account;
+      if (tried.has(account.record.name)) {
+        break;
+      }
+      tried.add(account.record.name);
+
+      let token: string;
+      try {
+        token = await account.tokens.accessToken();
+      } catch (err) {
+        if (signal.aborted) throw err;
+        pool.reportFailure(account, 'unauthorized', (err as Error).message);
+        lastError = err as Error;
+        continue;
+      }
+
+      const baseUrl = baseUrlFor(account);
+      const upstreamUrl = `${baseUrl}${upstreamPath}`;
+      pool.recordRequestTransit(ctx.reqId ?? null, {
+        upstream: upstreamUrl,
+        account: account.record.name,
+        protocol: 'anthropic',
+        payload: upstreamPayload,
+      });
+
+      const headers: Record<string, string> = {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        accept,
+        'anthropic-version': inboundHeaders?.anthropicVersion || '2023-06-01',
+        'user-agent': 'MiniMaxCode',
+      };
+      if (inboundHeaders?.anthropicBeta) {
+        headers['anthropic-beta'] = inboundHeaders.anthropicBeta;
+      }
+
+      let res: Response;
+      try {
+        res = await fetch(upstreamUrl, {
+          method: 'POST',
+          headers,
+          body: bodyJson,
+          signal,
+        });
+      } catch (err) {
+        if (signal.aborted) throw err;
+        pool.reportFailure(account, 'error', (err as Error).message);
+        lastError = err as Error;
+        continue;
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        const detail = `上游 HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`;
+        if (res.status === 401 || res.status === 403 || res.status === 429) {
+          pool.reportFailure(account, classifyFailure(res.status), detail);
+          lastError =
+            res.status === 429
+              ? new UpstreamError(`${detail}（已限流，账号额度已冻结，自动换下一个账号重试）`, res.status, text)
+              : new CredentialError(
+                  `上游鉴权失败（HTTP ${res.status}）—— 账号 [${account.record.name}] 的凭证已被别处登录顶掉` +
+                    '：请给该账号重新授权（管理页或 `mmcode login`）',
+                );
+          continue;
+        }
+        /* 400 / 5xx 等：不换号，保留上游状态码供反代层回传。 */
+        throw new UpstreamError(detail, res.status, text);
+      }
+
+      pool.reportSuccess(account);
+      pool.recordRequestAccount(ctx.reqId ?? null, account.record.name);
+      return await onSuccess(res, account);
+    }
+
+    throw (
+      lastError ??
+      new CredentialError('没有可用账号 —— 先跑 `mmcode login` 登录至少一个账号')
+    );
+  }
+
+  /** 把采集到的用量记入请求日志缓存与账号级洞察台账。 */
+  function recordUsage(ctx: RequestContext, account: PoolAccount, sessionKey: string, model: string, usage: StreamUsage): void {
+    pool.recordRequestUsage(ctx.reqId ?? null, {
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      cachedTokens: usage.cachedTokens,
+      totalTokens: usage.totalTokens,
+    });
+    opts.insights?.record({
+      account: account.record.name,
+      sessionKey,
+      model,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      cachedTokens: usage.cachedTokens,
+    });
+  }
+
+  const adapter: MmcodeAdapter = {
     command: 'mmcode',
     displayName: 'MiniMax Code',
     defaultPort: 8788,
@@ -227,12 +386,10 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       const usable = pool.available().length;
       const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
       const base = opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(r);
-      return `${base}${tag}  (Anthropic 兼容)  可用账号 ${usable}/${total} · ${modeTag}`;
+      return `${base}${tag}  (Anthropic 协议)  可用账号 ${usable}/${total} · ${modeTag}`;
     },
-    // 模型清单走公开的 /mavis/api/v1/models（无需登录）；这里说明的是**聊天**所需凭证。
     loginHint: '登录（官方 OAuth 设备授权；按提示在浏览器完成授权）',
 
-    /** [专属子命令] MiniMax 的签到与积分 —— 用本工具维护的令牌代签，无需开客户端。 */
     extraCommands: [
       {
         name: 'login-poll',
@@ -264,7 +421,8 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       {
         name: 'accounts',
         summary: '列出所有已配置账号及其状态（优先级 / 额度 / 健康 / 冷却 / 签到）',
-        usage: 'accounts',        async run({ json }) {
+        usage: 'accounts',
+        async run({ json }) {
           const list = pool.refresh().map((a) => ({
             name: a.record.name,
             region: a.record.region,
@@ -332,14 +490,14 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
               lines.push(` ${mark} ${k.name}  [${state}]  ${maskInboundKey(k.key)}  (${k.id})${used}`);
               lines.push(`     ${k.key}`);
             }
-            lines.push('', '★ = 主密钥（core 的 key 文件指向它）');
+            lines.push('', '★ = 主密钥（key 文件指向它）');
             return lines.join('\n');
           }
 
           if (action === 'new') {
             const name = rest.join(' ').trim() || `密钥 ${registry.list().length + 1}`;
             const created = registry.create(name);
-            return `✓ 已生成入站密钥\n  名称：${created.name}\n  密钥：${created.key}\n  id  ：${created.id}\n\n把它填进客户端的 API Key 即可。`;
+            return `✓ 已生成入站密钥\n  名称：${created.name}\n  密钥：${created.key}\n  id  ：${created.id}\n\n把它填进 Anthropic 客户端的 API Key 即可。`;
           }
 
           if (action === 'revoke') {
@@ -377,7 +535,8 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       {
         name: 'credits',
         summary: '查询积分账本（剩余/已消耗/累计，精确到 0.01）',
-        usage: 'credits [账号名]',        async run({ json, args }) {
+        usage: 'credits [账号名]',
+        async run({ json, args }) {
           const account = pickAccount(args[0]);
           if (!account) throw new CredentialError('没有可用账号 —— 先跑 `mmcode login`');
           const l = await activityFor(account).credits();
@@ -426,16 +585,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       };
     },
 
-    /**
-     * 登录 = 官方 OAuth 设备授权（`mmcode login`）。
-     *
-     * **原地等 2 分钟**：打印授权链接后就地轮询，用户在浏览器点完授权、终端**自动**继续，
-     * 不用像 WorkBuddy 那样手动回来再跑一次。
-     * 超时（或用户没在 2 分钟内完成）→ 抛 `PendingLoginError`，此时**保留 state**并提示
-     * 改用 `mmcode login-poll` 续跑（设备码本身有效期 5 分钟）。
-     */
     async login(): Promise<void> {
-      /* 登录进「兜底账号」；一个号都没注册时用默认账号目录（老行为）。 */
       const account = fallbackAccount();
       const dir = account?.dir;
       const region = account?.record.region ?? resolveRegion(opts.region);
@@ -451,7 +601,6 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       );
       try {
         const cred = await pollDeviceLogin(LOGIN_WAIT_MS, tickTo(out), dir);
-        /* 登录后把账号登记进注册表 —— 否则新号不会被自动切换看见。 */
         pool.getAccountStore().upsert(account?.record.name ?? DEFAULT_ACCOUNT_NAME, cred.region);
         out.write('\n✓ 登录成功 → ' + credentialPath(dir) + '\n' + credentialSummary(dir) + '\n' + mutualExclusionNotice());
       } catch (err) {
@@ -468,8 +617,6 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     },
 
     async listModels(): Promise<ModelEntry[]> {
-      /* v0.3.5：真拉取 /mavis/api/v1/models（无需鉴权），失败回落内置清单。
-         此前返回硬编码常量 —— 上游新增模型时必须发版才能跟上。 */
       const account = fallbackAccount();
       const baseUrl = account
         ? baseUrlFor(account)
@@ -483,8 +630,6 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
       const baseUrl = account
         ? baseUrlFor(account)
         : opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(resolveRegion(opts.region));
-      /* [复核修正] 此前 .catch(()=>null) 吞掉了所有网络错误 → 「上游连通」恒报 ✓。
-         fetch 只在网络不可达（DNS/超时/拒连）时抛错；HTTP 404/502 不抛（反而证明可达）。 */
       try {
         await fetch(`${baseUrl}${MODELS_PATH}`, { signal: AbortSignal.timeout(8000) });
         checks.push({ name: '上游连通', ok: true, detail: `${baseUrl} 可达` });
@@ -492,7 +637,6 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
         checks.push({ name: '上游连通', ok: false, detail: (err as Error).message });
       }
 
-      /* 账号池总览：每个可用账号各取一次 token —— 既验证刷新链，也把轮换写回。 */
       const usable = pool.available();
       if (usable.length === 0) {
         checks.push({
@@ -534,154 +678,124 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): Adapter {
     },
 
     /**
-     * 聊天 —— **按 session 选号 + 模式感知的换号重试**。
+     * 原生 Anthropic `/v1/messages` 透传。
+     */
+    async messages(
+      body: Record<string, unknown>,
+      signal: AbortSignal,
+      ctx: RequestContext = {},
+      inboundHeaders?: AnthropicInboundHeaders,
+    ): Promise<AnthropicCallResult> {
+      const sessionKey = resolveSessionKey(ctx, body);
+      const upstreamPayload = stripSessionFields(body);
+      /* 若客户端未传 max_tokens，补一个安全默认值（Anthropic 协议要求必填），其余字段全量透传。 */
+      if (typeof upstreamPayload.max_tokens !== 'number' || !Number.isFinite(upstreamPayload.max_tokens) || upstreamPayload.max_tokens <= 0) {
+        upstreamPayload.max_tokens = 8192;
+      }
+      const wantsStream = upstreamPayload.stream === true;
+      const model = typeof upstreamPayload.model === 'string' ? upstreamPayload.model : '';
+
+      return dispatchWithFailover({
+        sessionKey,
+        ctx,
+        upstreamPath: chatPath,
+        upstreamPayload,
+        accept: wantsStream ? 'text/event-stream' : 'application/json, text/event-stream',
+        inboundHeaders,
+        signal,
+        onSuccess: async (res, account) => {
+          const contentType = res.headers.get('content-type') ?? '';
+          if (contentType.includes('text/event-stream') && res.body) {
+            if (wantsStream) {
+              const stream = collectAnthropicUsage(res.body, (usage) => {
+                recordUsage(ctx, account, sessionKey, model, usage);
+              });
+              return { status: res.status, contentType: contentType || 'text/event-stream; charset=utf-8', stream };
+            }
+            /* 客户端明确非流式，但上游返回了 SSE：在服务侧聚合成标准 Anthropic Message JSON。 */
+            const aggregated = await aggregateAnthropicSseToMessage(res.body, model);
+            const usage = extractAnthropicJsonUsage(aggregated);
+            if (usage) recordUsage(ctx, account, sessionKey, model, usage);
+            return {
+              status: res.status,
+              contentType: 'application/json; charset=utf-8',
+              bodyText: JSON.stringify(aggregated),
+            };
+          }
+
+          /* 上游直接返回 JSON（或非 SSE 响应）。 */
+          const bodyText = await res.text();
+          try {
+            const parsed = JSON.parse(bodyText);
+            const usage = extractAnthropicJsonUsage(parsed);
+            if (usage) recordUsage(ctx, account, sessionKey, model, usage);
+          } catch {
+            // 非 JSON 忽略 usage 抽取
+          }
+          return {
+            status: res.status,
+            contentType: contentType || 'application/json; charset=utf-8',
+            bodyText,
+          };
+        },
+      });
+    },
+
+    /**
+     * 原生 Anthropic `/v1/messages/count_tokens` 透传。
      *
-     * 选号由 `AccountPool.acquireForSession` 决定：
-     *   · 新 session → 最高可用优先级层，**层内随机**；
-     *   · 已有 session → 回到**绑定账号**（保住上游提示词缓存）。
-     *
-     * 失败后的重试受**模式**约束：
-     *   · `max-cache`：绑定账号不可用 ⇒ **不迁移**，直接报错（缓存语义优先）；
-     *   · `balanced`：绑定账号额度耗尽 / 不可用 ⇒ **无缝滑到**别的可用账号。
-     *
-     * 换号触发条件（且仅这些）：
-     *   401 / 403 → 凭证被别处登录顶掉；
-     *   429      → 限流 / 额度耗尽（同时冻结该号的额度）；
-     *   令牌拿不到（refresh token 失效）→ 换号。
-     *
-     * ⚠️ 其它错误（5xx / 网络抖动）**不换号** —— 那是上游或网络整体的问题，
-     *    换号只会把所有号都标记成故障，反而降低可用性。
+     * 与 `messages()` 共用同一套 `resolveSessionKey` + `AccountPool.acquireForSession` +
+     * 自动换号逻辑，保证新会话先调用 `count_tokens` 再调用 `messages` 时一对一落在同一个账号。
+     */
+    async countTokens(
+      body: Record<string, unknown>,
+      signal: AbortSignal,
+      ctx: RequestContext = {},
+      inboundHeaders?: AnthropicInboundHeaders,
+    ): Promise<AnthropicCountTokensResult> {
+      const sessionKey = resolveSessionKey(ctx, body);
+      const upstreamPayload = stripSessionFields(body);
+
+      return dispatchWithFailover({
+        sessionKey,
+        ctx,
+        upstreamPath: countTokensPath,
+        upstreamPayload,
+        accept: 'application/json',
+        inboundHeaders,
+        signal,
+        onSuccess: async (res) => {
+          const bodyText = await res.text();
+          return {
+            status: res.status,
+            contentType: res.headers.get('content-type') ?? 'application/json; charset=utf-8',
+            bodyText,
+          };
+        },
+      });
+    },
+
+    /**
+     * 满足 `waygate-core` `Adapter` 接口的兼容入口（仅作向后兼容，反代 HTTP 层不再经过它）。
      */
     async chat(body: ChatRequestBody, signal: AbortSignal): Promise<UpstreamCallResult> {
-      /* ① 摘出上下文（session / 入站密钥 / 请求 id），并把运输痕迹擦干净。 */
-      const { ctx, body: cleanBody } = extractRequestContext(body);
-      const sessionKey = resolveSessionKey(ctx, cleanBody);
-      const anthropicReq = toAnthropicRequest(cleanBody);
-      const payload = JSON.stringify(anthropicReq);
-      const tried = new Set<string>();
-      let lastError: Error | null = null;
-
-      /* 最多试 4 个账号（再多也没意义 —— 用户通常只备了两三个号）。 */
-      const maxAttempts = Math.max(1, Math.min(pool.all().length || 1, 4));
-
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        /* ② 按 session 选号。 */
-        const acquired = pool.acquireForSession(sessionKey);
-        if (!acquired.ok) {
-          if (acquired.reason === 'pinned') {
-            /* 最大缓存模式：绑定账号不可用 —— 不迁移，报清楚为什么。 */
-            const pinned = acquired.pinnedAccount ? pool.get(acquired.pinnedAccount) : null;
-            const hint =
-              pinned?.record.health === 'unauthorized'
-                ? '该账号的凭证已被别处登录顶掉，请给它重新授权（管理页或 `mmcode login`）。'
-                : '可以给它补额度（签到）或切换到「平衡」模式让会话自动滑动。';
-            throw new CredentialError(`${acquired.detail} ${hint}`);
-          }
-          break; /* 没有可用账号 → 走下面的兜底报错 */
-        }
-
-        const account = acquired.account;
-        if (tried.has(account.record.name)) {
-          /* 池又给了同一个号（理论上失败过的号已被冷却排除，这里兜底）。 */
-          break;
-        }
-        tried.add(account.record.name);
-
-        /* ③ 取令牌。取不到 = refresh token 已被顶掉/失效 → 换号。 */
-        let token: string;
-        try {
-          token = await account.tokens.accessToken();
-        } catch (err) {
-          if (signal.aborted) throw err;
-          pool.reportFailure(account, 'unauthorized', (err as Error).message);
-          lastError = err as Error;
-          continue;
-        }
-
-        /* ④ 打上游。 */
-        const baseUrl = baseUrlFor(account);
-        /* 记下「中转」信息：上游地址 + **转译后实际发给上游的请求体** ——
-           入站是 OpenAI/Anthropic 形状，出站统一是 Anthropic 兼容形状，
-           这一层翻译最容易出「我发的和上游收到的不一样」，请求详情里要能查。 */
-        pool.recordRequestTransit(ctx.reqId ?? null, {
-          upstream: `${baseUrl}${chatPath}`,
-          account: account.record.name,
-          protocol: 'anthropic',
-          payload: anthropicReq,
-        });
-        let res: Response;
-        try {
-          res = await fetch(`${baseUrl}${chatPath}`, {
-            method: 'POST',
-            headers: {
-              authorization: `Bearer ${token}`,
-              'content-type': 'application/json',
-              accept: 'text/event-stream',
-              'anthropic-version': '2023-06-01',
-              'user-agent': 'MiniMaxCode',
-            },
-            body: payload,
-            signal,
-          });
-        } catch (err) {
-          /* 客户端断连不是账号的错 —— 不换号、不惩罚账号。 */
-          if (signal.aborted) throw err;
-          pool.reportFailure(account, 'error', (err as Error).message);
-          lastError = err as Error;
-          continue;
-        }
-
-        /* ⑤ 非 2xx：只有「换号有意义」的状态才继续往下走。 */
-        if (!res.ok || !res.body) {
-          const text = await res.text().catch(() => '');
-          const detail = `上游 HTTP ${res.status}${text ? `：${text.slice(0, 200)}` : ''}`;
-          if (res.status === 401 || res.status === 403 || res.status === 429) {
-            pool.reportFailure(account, classifyFailure(res.status), detail);
-            lastError =
-              res.status === 429
-                ? new UpstreamError(`${detail}（已限流，账号额度已冻结，自动换下一个账号重试）`)
-                : new CredentialError(
-                    `上游鉴权失败（HTTP ${res.status}）—— 账号 [${account.record.name}] 的凭证已被别处登录顶掉` +
-                      '：请给该账号重新授权（管理页或 `mmcode login`）',
-                  );
-            continue;
-          }
-          /* 5xx 等：上游整体异常，不换号。 */
-          throw new UpstreamError(detail);
-        }
-
-        pool.reportSuccess(account);
-        pool.recordRequestAccount(ctx.reqId ?? null, account.record.name);
-
-        /* ⑥ 上游 Anthropic 事件流 → OpenAI SSE（core 负责把流吐给客户端）。
-           顺带把 usage 摘出来记进台账 —— 洞察面板的 token 统计就来自这里。 */
-        const openAiStream = res.body.pipeThrough(anthropicToOpenAiSse());
-        const stream = collectUsage(openAiStream, (usage) => {
-          /* 权威用量（含缓存命中）：先按请求 id 存下来，供反代层写请求日志 ——
-             Anthropic 路线经 core 重编码后缓存字段会被丢掉，只有这一层拿得到。 */
-          pool.recordRequestUsage(ctx.reqId ?? null, {
-            promptTokens: usage.promptTokens,
-            completionTokens: usage.completionTokens,
-            cachedTokens: usage.cachedTokens,
-            totalTokens: usage.totalTokens,
-          });
-          opts.insights?.record({
-            account: account.record.name,
-            sessionKey,
-            model: cleanBody.model,
-            promptTokens: usage.promptTokens,
-            completionTokens: usage.completionTokens,
-            cachedTokens: usage.cachedTokens,
-          });
-        });
-        return { stream, status: 200 };
+      const result = await adapter.messages({ ...body, stream: body.stream !== false }, signal);
+      if (result.stream) {
+        return { status: result.status, stream: result.stream };
       }
-
-      /* 所有账号都试过了。 */
-      throw (
-        lastError ??
-        new CredentialError('没有可用账号 —— 先跑 `mmcode login` 登录至少一个账号')
-      );
+      const enc = new TextEncoder();
+      const text = result.bodyText ?? '';
+      return {
+        status: result.status,
+        stream: new ReadableStream<Uint8Array>({
+          start(c) {
+            if (text) c.enqueue(enc.encode(text));
+            c.close();
+          },
+        }),
+      };
     },
   };
+
+  return adapter;
 }

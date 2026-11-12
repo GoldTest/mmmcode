@@ -1,20 +1,18 @@
 /**
- * `mmcode web` —— 统一 Web 服务（反代 + 管理页 + 管理 API）一个端口。
+ * `mmcode web` 与 `mmcode serve` CLI 入口。
  *
  * 与 `mmcode serve` 的分工：
- *   · `serve` = **纯反代**（core 的 startServer，老行为不变，客户端连它就行）；
- *   · `web`   = **反代 + 管理页 + 管理 API**（同一端口），给需要管理多账号的人用。
- * 两者共用同一个账号池（同一份 `accounts.json` 与同一套令牌）。
- *
- * 端口默认 8789（`serve` 的 8788 留给纯反代）。
+ *   · `serve` = **纯反代**（不含管理页，默认 8788）；
+ *   · `web`   = **反代 + 管理页 + 管理 API**（同一端口，默认 8789），给需要管理多账号的人用。
+ * 两者共用同一个账号池（同一份 `accounts.json` 与同一套令牌），且均只暴露原生 Anthropic 兼容端点。
  */
 
-import { resolveKey, renderReady, renderReadyJson, type Adapter } from 'waygate-core';
+import { resolveKey } from 'waygate-core';
+import type { MmcodeAdapter } from './adapter.js';
 import { AccountPool } from './pool.js';
 import { startWebServer } from './web-server.js';
 import { startProxyServer } from './proxy.js';
-import { ensureAdminKey, maskAdminKey } from './admin.js';
-import { adminKeyPath } from './admin.js';
+import { ensureAdminKey, maskAdminKey, adminKeyPath } from './admin.js';
 import type { InsightsLedger } from './insights.js';
 import type { KeyRegistry } from './keys.js';
 
@@ -23,7 +21,7 @@ export const DEFAULT_WEB_PORT = 8789;
 
 export interface WebCliOptions {
   argv: string[];
-  adapter: Adapter;
+  adapter: MmcodeAdapter;
   pool: AccountPool;
   keys: KeyRegistry;
   /** 用量台账（洞察面板数据源）。 */
@@ -72,15 +70,87 @@ function webHelp(version: string): string {
     '  --help              显示本帮助',
     '',
     '端点：',
-    '  /                    管理页（需管理密钥登录）',
-    '  /admin/api/*         管理 API',
-    '  /v1/chat/completions 反代（OpenAI 兼容）',
-    '  /v1/messages         反代（Anthropic 兼容）',
-    '  /v1/models           模型列表',
-    '  /healthz             健康检查（不鉴权）',
+    '  /                              管理页（需管理密钥登录）',
+    '  /admin/api/*                   管理 API',
+    '  /v1/messages                   反代（Anthropic 原生透传）',
+    '  /v1/messages/count_tokens      Token 计数（Anthropic 原生透传，与同会话对话共绑账号）',
+    '  /v1/models                     模型列表',
+    '  /healthz                       健康检查（不鉴权）',
     '',
     '只在你本机读写与转发；不上传任何数据。',
   ].join('\n');
+}
+
+function originUrl(host: string, port: number): string {
+  const h = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  return `http://${h}:${port}`;
+}
+
+interface ServeReadyInfo {
+  command: string;
+  displayName: string;
+  version: string;
+  upstream: string;
+  host: string;
+  port: number;
+  key: string;
+  credential: { ok: boolean; detail: string; source?: string };
+  models: Array<{ id: string; displayName?: string }>;
+}
+
+/** `mmcode serve` 人读启动横幅（纯 Anthropic 协议，不含 OpenAI 提示）。 */
+function renderServeReady(r: ServeReadyInfo): string {
+  const origin = originUrl(r.host, r.port);
+  const lines: string[] = [];
+  lines.push(`途关 · ${r.displayName} 反代 v${r.version}`);
+  lines.push('');
+  lines.push(`凭证    ${r.credential.ok ? '✓' : '✗'} ${r.credential.detail}`);
+  lines.push(`上游    ${r.upstream}`);
+  lines.push(`代理    ${origin}      （Anthropic 客户端如 Claude Code 填此地址，会自动补 /v1）`);
+  lines.push(`密钥    ${r.key}`);
+  if (r.host === '0.0.0.0' || r.host === '::') {
+    lines.push('');
+    lines.push(`⚠️  正在监听所有网络接口（${r.host}）—— 局域网内任何设备都能访问你的订阅。`);
+    lines.push('    如非必要，请改用默认的 127.0.0.1。');
+  }
+  lines.push('');
+  lines.push('模型 ID（填进你的客户端）：');
+  if (r.models.length === 0) lines.push('  （暂无 —— 先跑一次 doctor 排查）');
+  for (const m of r.models) {
+    const hint = m.displayName && m.displayName !== m.id ? `   ${m.displayName}` : '';
+    lines.push(`  ${m.id}${hint}`);
+  }
+  lines.push('');
+  lines.push('把上面的「代理地址 + 密钥」填进 Claude Code 或 Anthropic SDK 即可。');
+  lines.push('端点：POST /v1/messages · POST /v1/messages/count_tokens · GET /v1/models');
+  lines.push('按 Ctrl+C 停止。');
+  return lines.join('\n');
+}
+
+/** `mmcode serve --json` 机器可读输出（纯 Anthropic 协议）。 */
+function renderServeReadyJson(r: ServeReadyInfo): string {
+  const origin = originUrl(r.host, r.port);
+  return JSON.stringify(
+    {
+      command: r.command,
+      displayName: r.displayName,
+      version: r.version,
+      upstream: r.upstream,
+      origin,
+      proxyUrl: origin,
+      anthropicBaseUrl: origin,
+      key: r.key,
+      credential: { ok: r.credential.ok, detail: r.credential.detail, source: r.credential.source ?? null },
+      models: r.models.map((m) => ({ id: m.id, displayName: m.displayName ?? null })),
+      endpoints: {
+        anthropic: '/v1/messages',
+        countTokens: '/v1/messages/count_tokens',
+        models: '/v1/models',
+      },
+    },
+    null,
+    2,
+  );
 }
 
 /**
@@ -122,7 +192,7 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
 
   const models = await opts.adapter.listModels().catch(() => []);
   const cred = await opts.adapter.credentialStatus();
-  const base = `http://${args.host === '0.0.0.0' ? '127.0.0.1' : args.host}:${running.port}`;
+  const base = originUrl(args.host, running.port);
 
   const lines: string[] = [];
   lines.push('─'.repeat(58));
@@ -130,13 +200,13 @@ export async function runWebCommand(opts: WebCliOptions): Promise<number> {
   lines.push('─'.repeat(58));
   lines.push('');
   lines.push(`  管理页        ${base}/`);
-  lines.push(`  反代地址      ${base}/v1`);
+  lines.push(`  反代地址      ${base}    （Anthropic 客户端填此地址，勿带 /v1）`);
   lines.push(`  健康检查      ${base}/healthz`);
   lines.push('');
   lines.push(`  上游          ${opts.adapter.upstreamLabel}`);
   lines.push(`  凭证          ${cred.ok ? '✓' : '✗'} ${cred.detail}`);
   lines.push(`  入站密钥      ${apiKey}`);
-  lines.push(`                 （客户端填这个：Claude Code 用 x-api-key，OpenAI 客户端用 Bearer）`);
+  lines.push(`                 （客户端填这个：x-api-key 或 Authorization: Bearer <key>）`);
   lines.push(`                 共 ${opts.keys.list().length} 把，可在管理页生成/吊销`);
   if (adminKey.generated) {
     lines.push('');
@@ -178,7 +248,7 @@ export interface ServeCliOptions {
   key?: string;
   json: boolean;
   verbose: boolean;
-  adapter: Adapter;
+  adapter: MmcodeAdapter;
   keys: KeyRegistry;
   version: string;
 }
@@ -186,9 +256,7 @@ export interface ServeCliOptions {
 /**
  * `mmcode serve` —— 纯反代（不含管理页）。
  *
- * 与 core 自带的 serve 行为一致，但走**本仓的代理层**，因此支持
- * **多把**入站密钥（注册表里任意一把启用且未过期的都能通过）。
- * 协议部分仍由 core 的 `startServer` 处理 —— 没有重复实现。
+ * 支持多把入站密钥（注册表里任意一把启用且未过期的都能通过）与纯 Anthropic 协议透传。
  */
 export async function runServeCommand(opts: ServeCliOptions): Promise<number> {
   const log = (line: string) => process.stdout.write(line + '\n');
@@ -197,9 +265,6 @@ export async function runServeCommand(opts: ServeCliOptions): Promise<number> {
   let key = opts.key?.trim();
   if (!key) key = opts.keys.primaryKey() ?? undefined;
   if (!key) key = opts.keys.create('默认密钥').key;
-  /* ★ 显式 --key 必须**临时登记**进鉴权层 ——
-     否则它只出现在启动横幅里，实际每个请求都会被 401 拒掉。
-     临时登记不落盘，沿用 core「用户显式指定即由用户自管」的语义。 */
   if (opts.key?.trim()) opts.keys.addTransient(opts.key);
 
   const cred = await opts.adapter.credentialStatus();
@@ -219,7 +284,7 @@ export async function runServeCommand(opts: ServeCliOptions): Promise<number> {
       log,
     });
 
-    const ready = {
+    const ready: ServeReadyInfo = {
       command: opts.adapter.command,
       displayName: opts.adapter.displayName,
       version: opts.version,
@@ -230,7 +295,7 @@ export async function runServeCommand(opts: ServeCliOptions): Promise<number> {
       credential: cred,
       models,
     };
-    process.stdout.write((opts.json ? renderReadyJson(ready) : renderReady(ready)) + '\n');
+    process.stdout.write((opts.json ? renderServeReadyJson(ready) : renderServeReady(ready)) + '\n');
 
     const shutdown = () => {
       process.stdout.write('\n正在停止…\n');

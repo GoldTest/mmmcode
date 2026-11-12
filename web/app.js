@@ -252,8 +252,7 @@ function openRequestModal(record) {
   const firstByteStr = typeof record.firstByteMs === 'number' ? `${record.firstByteMs} ms` : '—';
 
   /* ── 中转栏 ──
-     入站是 OpenAI / Anthropic 形状，出站统一是 Anthropic 兼容形状 ——
-     这一层翻译最容易出「我发的和上游收到的不一样」，所以把上游实际收到的请求摆出来。 */
+     入站与出站均为原生 Anthropic 协议，把实际发给上游的请求展示出来便于排查。 */
   const transit = record.transit;
   const transitHtml = transit
     ? `
@@ -263,7 +262,7 @@ function openRequestModal(record) {
         <dt>出站协议</dt><dd>${escapeHtml(transit.protocol || '—')}</dd>
       </dl>
       <details open>
-        <summary class="small muted" style="cursor:pointer;">转译后实际发给上游的请求</summary>
+        <summary class="small muted" style="cursor:pointer;">实际发给上游的请求</summary>
         <pre class="code-block">${escapeHtml(JSON.stringify(transit.payload ?? null, null, 2))}</pre>
       </details>`
     : '<p class="muted small">本次请求没有中转记录 —— 可能未到达上游。</p>';
@@ -1195,7 +1194,7 @@ function renderClientSetup() {
 
   el.innerHTML = `
     <div class="setup-item">
-      <div class="setup-label">反代 Base URL（填进 Claude Code / Cursor，不要带 /v1）</div>
+      <div class="setup-label">反代 Base URL（填进 Claude Code 等 Anthropic 客户端，不要带 /v1）</div>
       <div class="setup-value">
         <code>${escapeHtml(baseUrl)}</code>
         <span class="copy-slot"></span>
@@ -1222,20 +1221,32 @@ function renderSnippets(baseUrl, apiKey) {
 `export ANTHROPIC_BASE_URL="${baseUrl}"
 export ANTHROPIC_API_KEY="${apiKey}"
 export CLAUDE_CODE_USE_BEDROCK="false"`;
-  $('#snippet-claude').textContent = claudeSnippet;
+  const claudeEl = $('#snippet-claude');
+  if (claudeEl) claudeEl.textContent = claudeSnippet;
 
-  const cursorSnippet =
-`Base URL: ${baseUrl}/v1
-API Key:  ${apiKey}
-Model:    MiniMax-M3 (或 MiniMax-M3.1-Flash-Preview)`;
-  $('#snippet-cursor').textContent = cursorSnippet;
+  const anthropicSnippet =
+`# 对话请求
+curl ${baseUrl}/v1/messages \\
+  -H "x-api-key: ${apiKey}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -H "content-type: application/json" \\
+  -d '{"model":"MiniMax-M3","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
+
+# Token 计数（与同会话后续对话一对一绑定同一账号）
+curl ${baseUrl}/v1/messages/count_tokens \\
+  -H "x-api-key: ${apiKey}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -H "content-type: application/json" \\
+  -d '{"model":"MiniMax-M3","messages":[{"role":"user","content":"你好"}]}'`;
+  const anthropicEl = $('#snippet-anthropic');
+  if (anthropicEl) anthropicEl.textContent = anthropicSnippet;
 }
 
 $('#btn-new-key').addEventListener('click', () => {
   openModal(
     '生成新客户端密钥',
     `<label class="field">密钥名称
-       <input id="key-name" type="text" placeholder="例如 我的 Cursor / 办公笔记本" autocomplete="off">
+       <input id="key-name" type="text" placeholder="例如 我的 Claude Code / 办公笔记本" autocomplete="off">
      </label>
      <label class="field">用途备注（可选）
        <input id="key-purpose" type="text" placeholder="例如 专用模型请求 / 测试用途" autocomplete="off">
@@ -1313,7 +1324,7 @@ function renderProxyDetails() {
     <dt>最小可用积分</dt><dd><b>${escapeHtml(String(c.creditsThreshold ?? '—'))}</b>（低于此值冻结账号）</dd>
     <dt>优先级分层</dt><dd>${renderTiers(c.tiers)}</dd>
     <dt>入站鉴权模式</dt><dd>多密钥注册表隔离，支持单独吊销</dd>
-    <dt>内部安全环回</dt><dd>127.0.0.1 随机密钥桥接，零协议损耗</dd>`;
+    <dt>协议与透传方式</dt><dd>纯 Anthropic 原生协议直通（含 /v1/messages 与 /v1/messages/count_tokens）</dd>`;
 }
 
 /** 把优先级分层数组拼成「P0: a1、a2 ｜ P1: b1」这样的一行。 */

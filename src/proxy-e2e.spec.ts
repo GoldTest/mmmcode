@@ -1,12 +1,13 @@
 /**
- * 反代链路端到端测试 —— 验「上下文注入 → core 归一 → 适配器选号」整条链。
+ * 反代链路端到端测试（纯 Anthropic 协议版）。
  *
- * 这是本次改造里**最容易静默出错**的一段：
- *   客户端请求 → 反代层（提取 session id、注入上下文）→ 内部 core（协议归一）
- *   → 适配器（按 session 选号）。
- *
- * 中间隔着 core 的 Anthropic 入站归一 —— 它会**丢弃未识别的顶层字段**，
- * 所以上下文能不能活着穿过它，必须用真链路验，不能靠单测各测各的。
+ * 重点守五件事：
+ *   ① 原生 Anthropic `/v1/messages`（及 `/messages`）流式与非流式透传，保留 `system` blocks、`cache_control`、`thinking`、`tools`；
+ *   ② 原生 `/v1/messages/count_tokens`（及 `/messages/count_tokens`）透传与请求记录；
+ *   ③ 同一 session 先调 `count_tokens` 再调 `/v1/messages` 一对一绑定同一个账号（含显式 `x-session-id` / `metadata` 与无显式 id 的推导绑定），
+ *      并遵守 `max-cache` 锁定与 `balanced` 换号规则；
+ *   ④ OpenAI `/v1/chat/completions` 与 `/chat/completions` 彻底下线，返回 404 Anthropic `not_found_error`；
+ *   ⑤ 用量记账与缓存命中率准确，且 `count_tokens` 不虚增 `InsightsLedger` 与 `output.usage`。
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -65,24 +66,51 @@ function sseResponse(): Response {
   return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
 }
 
+/** 上游请求记录。 */
+interface UpstreamCapture {
+  url: string;
+  accountToken: string;
+  headers: Record<string, string>;
+  body: string;
+}
+
 /**
  * 只打桩**上游**调用（agent.minimax.cn），其余（测试自己打反代的那一跳）走真 fetch。
- *
- * 直接全局替换 fetch 会把「测试 → 反代」这一跳也拦掉 —— 请求根本到不了服务。
  */
-function stubUpstream(inspect?: (body: string) => void): void {
+function stubUpstream(
+  customHandler?: (cap: UpstreamCapture, callIndex: number) => Response | Promise<Response>,
+): UpstreamCapture[] {
   const realFetch = globalThis.fetch;
+  const captures: UpstreamCapture[] = [];
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: unknown, init?: RequestInit) => {
       const href = String(url);
       if (href.includes('minimax')) {
-        if (inspect) inspect(String(init?.body ?? ''));
+        const hdrs = (init?.headers ?? {}) as Record<string, string>;
+        const auth = hdrs['authorization'] ?? hdrs['Authorization'] ?? '';
+        const cap: UpstreamCapture = {
+          url: href,
+          accountToken: auth.replace(/^Bearer\s+/i, ''),
+          headers: hdrs,
+          body: String(init?.body ?? ''),
+        };
+        captures.push(cap);
+        if (customHandler) {
+          return await customHandler(cap, captures.length);
+        }
+        if (href.endsWith('/count_tokens')) {
+          return new Response(JSON.stringify({ input_tokens: 437 }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
         return sseResponse();
       }
       return realFetch(url as never, init);
     }),
   );
+  return captures;
 }
 
 interface Harness {
@@ -121,17 +149,19 @@ async function startHarness(names: string[], mode: 'max-cache' | 'balanced' = 'm
   return { port: handle.port, key, pool, insights, requests, close: () => handle.close() };
 }
 
-/** 发一条聊天请求，返回状态码与文本。 */
-async function chat(
+/** 发一条 Anthropic `/v1/messages`（或自定义路径）请求。 */
+async function postAnthropic(
   h: Harness,
+  path: string,
   body: Record<string, unknown>,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; text: string }> {
-  const res = await fetch(`http://127.0.0.1:${h.port}/v1/chat/completions`, {
+  const res = await fetch(`http://127.0.0.1:${h.port}${path}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: `Bearer ${h.key}`,
+      'x-api-key': h.key,
+      'anthropic-version': '2023-06-01',
       ...headers,
     },
     body: JSON.stringify(body),
@@ -139,182 +169,324 @@ async function chat(
   return { status: res.status, text: await res.text() };
 }
 
-const BODY = { model: 'MiniMax-M3', messages: [{ role: 'user', content: '帮我写个函数' }] };
+const MESSAGES_BODY = {
+  model: 'MiniMax-M3',
+  max_tokens: 1024,
+  stream: true,
+  system: '你是一个助手',
+  messages: [{ role: 'user', content: '帮我写个函数' }],
+};
 
-describe('反代端到端：session 上下文', () => {
-  it('★ OpenAI 路线：同一 x-session-id 的两次请求落在同一账号', async () => {
-    const h = await startHarness(['a1', 'a2']);
+const COUNT_BODY = {
+  model: 'MiniMax-M3',
+  system: '你是一个助手',
+  messages: [{ role: 'user', content: '帮我写个函数' }],
+  tools: [
+    {
+      name: 'get_weather',
+      description: 'Get weather',
+      input_schema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+    },
+  ],
+};
+
+describe('反代端到端：纯 Anthropic 协议与下线 OpenAI 协议', () => {
+  it('★ OpenAI /v1/chat/completions 与 /chat/completions 均返回 404 Anthropic not_found_error', async () => {
+    const h = await startHarness(['a1']);
     stubUpstream();
 
-    await chat(h, BODY, { 'x-session-id': 'sess-A' });
-    const first = h.pool.getLastUsedAccount();
-    await chat(h, BODY, { 'x-session-id': 'sess-A' });
-    const second = h.pool.getLastUsedAccount();
-
-    expect(first).toBeTruthy();
-    expect(second).toBe(first);
-    await h.close();
-  });
-
-  it('★ OpenAI 路线：不同 session id 可以落在不同账号', async () => {
-    const h = await startHarness(['a1', 'a2']);
-    stubUpstream();
-
-    const used = new Set<string>();
-    for (let i = 0; i < 30; i += 1) {
-      await chat(h, BODY, { 'x-session-id': `sess-${i}` });
-      used.add(h.pool.getLastUsedAccount() ?? '');
+    for (const path of ['/v1/chat/completions', '/chat/completions']) {
+      const res = await fetch(`http://127.0.0.1:${h.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${h.key}`,
+        },
+        body: JSON.stringify({ model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      expect(res.status).toBe(404);
+      const err = (await res.json()) as { type: string; error: { type: string; message: string } };
+      expect(err.type).toBe('error');
+      expect(err.error.type).toBe('not_found_error');
+      expect(err.error.message).toContain('Anthropic');
     }
-    expect(used.size).toBeGreaterThan(1);
     await h.close();
   });
 
-  it('★ Anthropic 路线：上下文穿过 core 归一，session 仍然粘住', async () => {
-    const h = await startHarness(['a1', 'a2']);
+  it('入站密钥缺失/错误返回 401 Anthropic 错误；/healthz 无需鉴权；/v1/models 返回模型列表', async () => {
+    const h = await startHarness(['a1']);
     stubUpstream();
 
-    const anthropicBody = {
+    const health = await fetch(`http://127.0.0.1:${h.port}/healthz`);
+    expect(health.status).toBe(200);
+    expect(((await health.json()) as { ok: boolean }).ok).toBe(true);
+
+    const unauth = await fetch(`http://127.0.0.1:${h.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'sk-wrong' },
+      body: JSON.stringify(MESSAGES_BODY),
+    });
+    expect(unauth.status).toBe(401);
+    const err = (await unauth.json()) as { type: string; error: { type: string } };
+    expect(err.type).toBe('error');
+    expect(err.error.type).toBe('authentication_error');
+
+    const models = await fetch(`http://127.0.0.1:${h.port}/v1/models`, {
+      headers: { 'x-api-key': h.key },
+    });
+    expect(models.status).toBe(200);
+    const modelsJson = (await models.json()) as { data: Array<{ id: string }> };
+    expect(modelsJson.data.length).toBeGreaterThan(0);
+
+    await h.close();
+  });
+
+  it('★ 原生字段（system blocks / cache_control / thinking / tools）无哨兵污染直通上游', async () => {
+    const h = await startHarness(['a1']);
+    const captures = stubUpstream();
+
+    const richBody = {
       model: 'MiniMax-M3',
-      system: '你是一个助手',
-      messages: [{ role: 'user', content: '帮我写个函数' }],
-      max_tokens: 1024,
+      max_tokens: 2048,
+      stream: true,
+      system: [{ type: 'text', text: '你是一个助手', cache_control: { type: 'ephemeral' } }],
+      thinking: { type: 'enabled', budget_tokens: 1024 },
+      tools: COUNT_BODY.tools,
+      messages: [{ role: 'user', content: 'hi' }],
     };
 
-    const first = await fetch(`http://127.0.0.1:${h.port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': h.key, 'x-session-id': 'sess-AN' },
-      body: JSON.stringify(anthropicBody),
+    const res = await postAnthropic(h, '/v1/messages', richBody, {
+      'x-session-id': 'sess-rich',
+      'anthropic-beta': 'prompt-caching-2024-07-31',
     });
-    expect(first.status).toBe(200);
-    await first.text();
-    const account1 = h.pool.getLastUsedAccount();
+    expect(res.status).toBe(200);
+    expect(captures).toHaveLength(1);
 
-    const second = await fetch(`http://127.0.0.1:${h.port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': h.key, 'x-session-id': 'sess-AN' },
-      body: JSON.stringify(anthropicBody),
-    });
-    expect(second.status).toBe(200);
-    await second.text();
-    const account2 = h.pool.getLastUsedAccount();
+    const sent = JSON.parse(captures[0]!.body) as typeof richBody;
+    expect(captures[0]!.body).not.toContain('mmcode-ctx');
+    expect(captures[0]!.body).not.toContain('mmcode_ctx');
+    expect(sent.system).toEqual(richBody.system);
+    expect(sent.thinking).toEqual(richBody.thinking);
+    expect(sent.tools).toEqual(richBody.tools);
+    expect(captures[0]!.headers['anthropic-beta']).toBe('prompt-caching-2024-07-31');
 
-    expect(account1).toBeTruthy();
-    expect(account2).toBe(account1);
-    await h.close();
-  });
-
-  it('★ 请求体里的 session_id 也能被认出来', async () => {
-    const h = await startHarness(['a1', 'a2']);
-    stubUpstream();
-
-    await chat(h, { ...BODY, session_id: 'body-sess' });
-    const first = h.pool.getLastUsedAccount();
-    await chat(h, { ...BODY, session_id: 'body-sess' });
-    expect(h.pool.getLastUsedAccount()).toBe(first);
-    await h.close();
-  });
-
-  it('★ 哨兵不会漏到上游（system 里没有内部标记）', async () => {
-    const h = await startHarness(['a1']);
-    let upstreamBody = '';
-    stubUpstream((body) => {
-      upstreamBody = body;
-    });
-
-    await fetch(`http://127.0.0.1:${h.port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': h.key, 'x-session-id': 'sess-X' },
-      body: JSON.stringify({ model: 'MiniMax-M3', system: '你是一个助手', messages: [{ role: 'user', content: 'hi' }] }),
-    });
-
-    expect(upstreamBody).not.toContain('mmcode-ctx');
-    expect(upstreamBody).not.toContain('mmcode_ctx');
-    /* 用户提示词原样保留。 */
-    expect(upstreamBody).toContain('你是一个助手');
     await h.close();
   });
 });
 
-describe('反代端到端：用量记账', () => {
-  it('★ token 用量记到了服务该请求的账号名下', async () => {
+describe('反代端到端：count_tokens 透传与 session 一对一绑定', () => {
+  it('★ POST /v1/messages/count_tokens 与 /messages/count_tokens 原生透传并清理 session_id', async () => {
+    const h = await startHarness(['a1']);
+    const captures = stubUpstream();
+
+    const r1 = await postAnthropic(h, '/v1/messages/count_tokens', {
+      ...COUNT_BODY,
+      session_id: 'ct-strip-me',
+    });
+    expect(r1.status).toBe(200);
+    expect(JSON.parse(r1.text)).toEqual({ input_tokens: 437 });
+
+    const r2 = await postAnthropic(h, '/messages/count_tokens', COUNT_BODY);
+    expect(r2.status).toBe(200);
+    expect(JSON.parse(r2.text)).toEqual({ input_tokens: 437 });
+
+    expect(captures).toHaveLength(2);
+    expect(captures[0]!.url).toContain('/mavis/api/v1/llm/v1/messages/count_tokens');
+    const sent0 = JSON.parse(captures[0]!.body) as Record<string, unknown>;
+    expect(sent0).not.toHaveProperty('session_id');
+    expect(sent0.tools).toEqual(COUNT_BODY.tools);
+
+    await h.close();
+  });
+
+  it('★ 核心场景：新会话先 count_tokens 再 /v1/messages（无显式 session id），1:1 命中同一个账号', async () => {
     const h = await startHarness(['a1', 'a2']);
+    const captures = stubUpstream();
+
+    /* 连续测 10 个不同首句的会话，确认每次 count_tokens -> messages(turn1) -> messages(turn2) 都是一对一同一账号 */
+    const seenAccounts = new Set<string>();
+    for (let i = 0; i < 10; i += 1) {
+      const prompt = `新会话首句-${i}`;
+      const ct = await postAnthropic(h, '/v1/messages/count_tokens', {
+        model: 'MiniMax-M3',
+        system: '你是助手',
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+        tools: COUNT_BODY.tools,
+      });
+      expect(ct.status).toBe(200);
+      const tokenAfterCt = captures[captures.length - 1]!.accountToken;
+
+      const m1 = await postAnthropic(h, '/v1/messages', {
+        model: 'MiniMax-M3',
+        max_tokens: 1024,
+        stream: true,
+        system: '你是助手',
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(m1.status).toBe(200);
+      const tokenAfterM1 = captures[captures.length - 1]!.accountToken;
+
+      const m2 = await postAnthropic(h, '/v1/messages', {
+        model: 'MiniMax-M3',
+        max_tokens: 1024,
+        stream: true,
+        system: '你是助手',
+        messages: [
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: '你好' },
+          { role: 'user', content: '继续下一问' },
+        ],
+      });
+      expect(m2.status).toBe(200);
+      const tokenAfterM2 = captures[captures.length - 1]!.accountToken;
+
+      expect(tokenAfterM1).toBe(tokenAfterCt);
+      expect(tokenAfterM2).toBe(tokenAfterCt);
+      seenAccounts.add(tokenAfterCt);
+    }
+
+    /* 多个独立会话会随机分散到不同账号，但每个会话内部严格一对一绑定 */
+    expect(seenAccounts.size).toBeGreaterThan(1);
+    await h.close();
+  });
+
+  it('★ Claude Code metadata.user_id (__session_<id>) 与 metadata.session_id 也能在 count_tokens -> messages 间 1:1 绑定', async () => {
+    const h = await startHarness(['a1', 'a2']);
+    const captures = stubUpstream();
+
+    await postAnthropic(h, '/v1/messages/count_tokens', {
+      ...COUNT_BODY,
+      metadata: { user_id: 'user_demo__session_cc-session-42' },
+    });
+    const token1 = captures[0]!.accountToken;
+
+    await postAnthropic(h, '/messages', {
+      ...MESSAGES_BODY,
+      messages: [{ role: 'user', content: '哪怕首句文本变了但同一 Claude Code session' }],
+      metadata: { user_id: 'user_demo__session_cc-session-42' },
+    });
+    const token2 = captures[1]!.accountToken;
+
+    await postAnthropic(h, '/v1/messages', {
+      ...MESSAGES_BODY,
+      metadata: { session_id: 'cc-session-42' },
+    });
+    const token3 = captures[2]!.accountToken;
+
+    expect(token2).toBe(token1);
+    expect(token3).toBe(token1);
+    await h.close();
+  });
+
+  it('★ max-cache 模式：count_tokens 绑定某账号后，该账号 401 时拒绝迁移并返回 502', async () => {
+    const h = await startHarness(['a1', 'a2'], 'max-cache');
+    const captures = stubUpstream((cap) => {
+      if (cap.url.endsWith('/count_tokens')) {
+        return new Response(JSON.stringify({ input_tokens: 100 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('unauthorized', { status: 401 });
+    });
+
+    const ct = await postAnthropic(h, '/v1/messages/count_tokens', COUNT_BODY, {
+      'x-session-id': 'sess-locked',
+    });
+    expect(ct.status).toBe(200);
+    const boundToken = captures[0]!.accountToken;
+
+    const msg = await postAnthropic(h, '/v1/messages', MESSAGES_BODY, {
+      'x-session-id': 'sess-locked',
+    });
+    expect(msg.status).toBe(502);
+    expect(msg.text).toMatch(/最大缓存|重新授权/);
+    /* 只打到了原绑定账号，未尝试第二个号 */
+    expect(captures).toHaveLength(2);
+    expect(captures[1]!.accountToken).toBe(boundToken);
+    await h.close();
+  });
+
+  it('★ balanced 模式：count_tokens 绑定某账号后，该账号 429 时无缝滑到另一个可用账号并更新绑定', async () => {
+    const h = await startHarness(['a1', 'a2'], 'balanced');
+    let boundToken = '';
+    const captures = stubUpstream((cap) => {
+      if (cap.url.endsWith('/count_tokens')) {
+        boundToken = cap.accountToken;
+        return new Response(JSON.stringify({ input_tokens: 100 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (cap.accountToken === boundToken) {
+        return new Response('quota exceeded', { status: 429 });
+      }
+      return sseResponse();
+    });
+
+    const ct = await postAnthropic(h, '/v1/messages/count_tokens', COUNT_BODY, {
+      'x-session-id': 'sess-balanced',
+    });
+    expect(ct.status).toBe(200);
+
+    const msg = await postAnthropic(h, '/v1/messages', MESSAGES_BODY, {
+      'x-session-id': 'sess-balanced',
+    });
+    expect(msg.status).toBe(200);
+    expect(captures).toHaveLength(3);
+    expect(captures[2]!.accountToken).not.toBe(boundToken);
+
+    /* 后续同一 session 复用新绑定的账号 */
+    await postAnthropic(h, '/v1/messages', MESSAGES_BODY, {
+      'x-session-id': 'sess-balanced',
+    });
+    expect(captures[3]!.accountToken).toBe(captures[2]!.accountToken);
+    await h.close();
+  });
+});
+
+describe('反代端到端：用量记账与请求详情', () => {
+  it('★ token 用量与缓存命中率记到了服务账号名下，且 count_tokens 不虚增用量', async () => {
+    const h = await startHarness(['a1']);
     stubUpstream();
 
-    await chat(h, BODY, { 'x-session-id': 'sess-U' });
-    /* 等流结束（usage 在流末尾采集）。 */
+    await postAnthropic(h, '/v1/messages/count_tokens', COUNT_BODY, { 'x-session-id': 'sess-U' });
+    await postAnthropic(h, '/v1/messages', MESSAGES_BODY, { 'x-session-id': 'sess-U' });
     await new Promise((r) => setTimeout(r, 50));
 
+    /* InsightsLedger 只记对话请求（1 次），不记 count_tokens */
     const snapshot = h.insights.snapshot();
     expect(snapshot.length).toBe(1);
     const used = snapshot[0]!;
-    /* prompt = input(120) + cache_read(40) = 160；输出 30。 */
+    /* prompt = input(120) + cache_read(40) = 160；输出 30；命中率 = 40/160 = 25% */
     expect(used.requests).toBe(1);
     expect(used.promptTokens).toBe(160);
     expect(used.completionTokens).toBe(30);
     expect(used.cachedTokens).toBe(40);
     expect(used.totalTokens).toBe(190);
-    expect(used.name).toBe(h.pool.getLastUsedAccount());
-    await h.close();
-  });
+    expect(used.cacheHitRate).toBeCloseTo(0.25, 5);
+    expect(used.name).toBe('a1');
 
-  it('★ 缓存命中率：台账与请求日志都带上', async () => {
-    const h = await startHarness(['a1']);
-    stubUpstream();
+    /* RequestStore 两条都记录，但 count_tokens 不带 output.usage */
+    const items = h.requests.list().items;
+    expect(items).toHaveLength(2);
+    const msgLog = items.find((i) => i.path === '/v1/messages');
+    const ctLog = items.find((i) => i.path === '/v1/messages/count_tokens');
 
-    await chat(h, BODY, { 'x-session-id': 'sess-C' });
-    await new Promise((r) => setTimeout(r, 50));
+    expect(msgLog?.output?.usage?.cached_tokens).toBe(40);
+    expect(msgLog?.output?.usage?.cache_hit_rate).toBeCloseTo(0.25, 5);
+    expect(msgLog?.transit?.upstream).toContain('/mavis/api/v1/llm/v1/messages');
+    expect(msgLog?.transit?.protocol).toBe('anthropic');
+    expect(typeof msgLog?.firstByteMs).toBe('number');
+    expect(msgLog!.firstByteMs!).toBeGreaterThanOrEqual(0);
+    expect(msgLog!.firstByteMs!).toBeLessThanOrEqual(msgLog!.durationMs);
 
-    /* 命中率 = 缓存命中(40) / 输入(160) = 25%。 */
-    const snapshot = h.insights.snapshot();
-    expect(snapshot[0]!.cacheHitRate).toBeCloseTo(0.25, 5);
-    expect(h.insights.totals().cacheHitRate).toBeCloseTo(0.25, 5);
+    expect(ctLog?.status).toBe(200);
+    expect(ctLog?.account).toBe('a1');
+    expect(ctLog?.transit?.upstream).toContain('/mavis/api/v1/llm/v1/messages/count_tokens');
+    expect(ctLog?.output?.usage).toBeUndefined();
+    expect(ctLog?.output?.raw).toEqual({ input_tokens: 437 });
 
-    /* 请求日志里也要有（请求详情弹窗显示它）。 */
-    const logged = h.requests.list().items[0];
-    expect(logged?.output?.usage?.cached_tokens).toBe(40);
-    expect(logged?.output?.usage?.cache_hit_rate).toBeCloseTo(0.25, 5);
-    await h.close();
-  });
-
-  it('★ 请求日志带首字符时间与中转信息', async () => {
-    const h = await startHarness(['a1']);
-    stubUpstream();
-
-    await chat(h, BODY, { 'x-session-id': 'sess-T' });
-    await new Promise((r) => setTimeout(r, 50));
-
-    const logged = h.requests.list().items[0];
-    /* 首字符时间：收到请求 → 第一个响应字节。 */
-    expect(typeof logged?.firstByteMs).toBe('number');
-    expect(logged!.firstByteMs!).toBeGreaterThanOrEqual(0);
-    expect(logged!.firstByteMs!).toBeLessThanOrEqual(logged!.durationMs);
-
-    /* 中转：上游地址 / 账号 / 协议 / 转译后实际发给上游的请求体。 */
-    expect(logged?.transit?.upstream).toContain('agent.minimax.cn');
-    expect(logged?.transit?.account).toBe('a1');
-    expect(logged?.transit?.protocol).toBe('anthropic');
-    const payload = logged?.transit?.payload as { messages?: unknown[]; model?: string };
-    expect(Array.isArray(payload?.messages)).toBe(true);
-    expect(payload?.model).toBe('MiniMax-M3');
-    await h.close();
-  });
-
-  it('★ Anthropic 路线：请求日志也带缓存命中率（core 重编码会丢缓存字段）', async () => {
-    const h = await startHarness(['a1']);
-    stubUpstream();
-
-    const res = await fetch(`http://127.0.0.1:${h.port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': h.key },
-      body: JSON.stringify({ model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }] }),
-    });
-    expect(res.status).toBe(200);
-    await res.text();
-    await new Promise((r) => setTimeout(r, 50));
-
-    const logged = h.requests.list().items[0];
-    expect(logged?.output?.usage?.cached_tokens).toBe(40);
-    expect(logged?.output?.usage?.cache_hit_rate).toBeCloseTo(0.25, 5);
     await h.close();
   });
 });

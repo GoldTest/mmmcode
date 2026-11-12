@@ -65,19 +65,19 @@ export interface RequestRecord {
 }
 
 /**
- * 中转信息 —— 反代内部把入站请求转译成**上游协议**后发出去的东西。
+ * 中转信息 —— 反代实际发往上游请求的关键信息。
  *
- * 入站是 OpenAI 或 Anthropic 形状，出站统一是 Anthropic 兼容形状 —— 中间这层翻译
- * 是最容易出「我发的和我以为的不一样」的地方，所以把它记下来给人看。
+ * 入站与出站均为原生 Anthropic 协议（剥离仅用于本地识别 session 的非标准顶层字段），
+ * 记录实际发给上游的地址、账号与请求体，便于排查「我发的和上游收到的不一样」。
  */
 export interface RequestTransit {
   /** 上游地址（不含任何令牌）。 */
   upstream: string;
   /** 实际服务这次请求的账号。 */
   account: string | null;
-  /** 出站协议（当前只有 Anthropic 兼容）。 */
+  /** 出站协议（原生 Anthropic）。 */
   protocol: string;
-  /** 转译后**实际发给上游**的请求体。 */
+  /** 实际发给上游的请求体。 */
   payload?: unknown;
 }
 

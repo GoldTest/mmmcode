@@ -15,7 +15,7 @@
  *   · 首次启动时**打印到 stdout**（容器场景看 `docker logs` 即可拿到），
  *     同时登录页提示该文件路径，运维随时能查。
  *
- * ⚠️ 与反代的**入站密钥**（`~/.waygate/mmcode/key`，给 Claude Code / Cursor 用）
+ * ⚠️ 与反代的**入站密钥**（`~/.waygate/mmcode/key`，给 Claude Code / Anthropic SDK 用）
  * 是**两把不同的钥匙**：
  *   · 入站密钥 = 调模型用（客户端持有）；
  *   · 管理密钥 = 进管理页用（只有管理员持有）。

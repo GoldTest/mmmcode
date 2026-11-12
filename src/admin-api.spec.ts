@@ -134,7 +134,7 @@ describe('Admin API: 新增功能路由测试', () => {
         id: 'req-1',
         timestamp: Date.now(),
         method: 'POST',
-        path: '/v1/chat/completions',
+        path: '/v1/messages',
         stream: false,
         status: 200,
         durationMs: 80,
@@ -376,6 +376,87 @@ describe('Admin API: 新增功能路由测试', () => {
       expect(refreshCookieStr).toContain('Max-Age=259200');
     } finally {
       await ctx.close();
+    }
+  });
+
+  it('POST /admin/api/proxy/test 优先走 adapter.messages 并提取 Anthropic 文本', async () => {
+    const keyFile = ensureAdminKey();
+    const store = new AccountStore({ filePath: join(root, 'accounts-m.json') });
+    const pool = new AccountPool(store);
+    const keys = new KeyRegistry({ filePath: join(root, 'keys-m.json') });
+    const sessions = new SessionStore();
+
+    const adapter = {
+      command: 'mmcode',
+      displayName: 'MiniMax Code',
+      defaultPort: 8788,
+      upstreamLabel: 'test-upstream',
+      loginHint: 'login',
+      async credentialStatus() {
+        return { ok: true, detail: 'ok' };
+      },
+      async login() {},
+      async listModels() {
+        return [{ id: 'MiniMax-M3', displayName: 'MiniMax M3' }];
+      },
+      async chat() {
+        throw new Error('should not call chat when messages exists');
+      },
+      async messages() {
+        return {
+          status: 200,
+          contentType: 'application/json',
+          bodyText: JSON.stringify({
+            id: 'msg_test',
+            type: 'message',
+            role: 'assistant',
+            model: 'MiniMax-M3',
+            content: [{ type: 'text', text: 'Anthropic 原生测试回复' }],
+            stop_reason: 'end_turn',
+          }),
+        };
+      },
+      async countTokens() {
+        return { status: 200, contentType: 'application/json', bodyText: '{"input_tokens":10}' };
+      },
+    };
+
+    const handler = createAdminApi({
+      pool,
+      sessions,
+      adapter,
+      keys,
+      apiKey: 'sk-test',
+      version: '0.5.4',
+      log: () => {},
+      proxyStatus: () => ({ port: 8789, upstream: 'test', accounts: 0, available: 0 }),
+    });
+
+    const server = createServer(async (req, res) => {
+      const handled = await handler(req, res);
+      if (!handled) {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as any).port as number;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/admin/api/proxy/test`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-key': keyFile.key,
+        },
+        body: JSON.stringify({ model: 'MiniMax-M3', prompt: '你好' }),
+      });
+      expect(res.status).toBe(200);
+      const data = (await res.json()) as { ok: boolean; response: string };
+      expect(data.ok).toBe(true);
+      expect(data.response).toBe('Anthropic 原生测试回复');
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()));
     }
   });
 });
