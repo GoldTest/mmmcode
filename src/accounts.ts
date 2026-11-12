@@ -56,6 +56,22 @@ export interface CreditsSnapshot {
   nextExpireAt: number | null;
 }
 
+/** 一次生文测活（ping）的快照。 */
+export interface ProbeSnapshot {
+  at: number;
+  ttftMs: number;
+  status: 'ok' | 'suspected' | 'paused' | 'error';
+  message: string;
+}
+
+/** 一次不耗 token 预热的快照。 */
+export interface WarmupSnapshot {
+  at: number;
+  durationMs: number;
+  ok: boolean;
+  message: string;
+}
+
 /** 注册表里的一个账号条目。 */
 export interface AccountRecord {
   /** 账号名（目录名，全局唯一）。 */
@@ -100,6 +116,14 @@ export interface AccountRecord {
   lastCheckin?: CheckinSnapshot;
   /** 上次积分查询结果。 */
   lastCredits?: CreditsSnapshot;
+  /** 限流标记 —— 测活超过 20s（疑似限流）或被限流时置位，该账号不参与调度。 */
+  rateLimited?: boolean;
+  /** 限流原因（人话，展示用）。 */
+  rateLimitReason?: string;
+  /** 上次生文测活（首字耗时）快照。 */
+  lastProbe?: ProbeSnapshot;
+  /** 上次无 token 预热快照。 */
+  lastWarmup?: WarmupSnapshot;
   /** 备注（网页上可编辑）。 */
   notes?: string;
 }
@@ -279,6 +303,8 @@ export class AccountStore {
       priority: typeof raw.priority === 'number' && Number.isFinite(raw.priority) ? raw.priority : 0,
       frozen: raw.frozen === true,
       frozenReason: typeof raw.frozenReason === 'string' ? raw.frozenReason : undefined,
+      rateLimited: raw.rateLimited === true,
+      rateLimitReason: typeof raw.rateLimitReason === 'string' ? raw.rateLimitReason : undefined,
     };
   }
 

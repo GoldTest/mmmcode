@@ -210,6 +210,9 @@ export class AccountPool {
   /** 账号当前**不可调度**的原因（null = 可调度）。 */
   unavailableReason(account: PoolAccount, now = Date.now()): string | null {
     if (!account.record.enabled) return '已停用';
+    if (account.record.rateLimited) {
+      return account.record.rateLimitReason ? `限流保护：${account.record.rateLimitReason}` : '账号被限流';
+    }
     if (!account.credential) return '未登录';
     if (this.cooling(account.record, now)) return '冷却中';
     if (this.frozen(account.record, now)) {
@@ -407,7 +410,7 @@ export class AccountPool {
     return last;
   }
 
-  /** 解除单个或全部账号的冷却与冻结（人工干预）。 */
+  /** 解除单个或全部账号的冷却、冻结与限流（人工干预）。 */
   resetCooldown(name?: string): void {
     if (name) {
       this.store.update(name, {
@@ -417,11 +420,17 @@ export class AccountPool {
         frozen: false,
         frozenReason: undefined,
         frozenUntil: undefined,
+        rateLimited: false,
+        rateLimitReason: undefined,
       });
-      this.log(`手动解除账号 [${name}] 的冷却与冻结状态`);
+      this.log(`手动解除账号 [${name}] 的冷却、冻结与限流状态`);
     } else {
       for (const a of this.all()) {
-        if ((a.record.disabledUntil ?? 0) > Date.now() || a.record.frozen === true) {
+        if (
+          (a.record.disabledUntil ?? 0) > Date.now() ||
+          a.record.frozen === true ||
+          a.record.rateLimited === true
+        ) {
           this.store.update(a.record.name, {
             disabledUntil: undefined,
             health: 'healthy',
@@ -429,8 +438,10 @@ export class AccountPool {
             frozen: false,
             frozenReason: undefined,
             frozenUntil: undefined,
+            rateLimited: false,
+            rateLimitReason: undefined,
           });
-          this.log(`手动解除账号 [${a.record.name}] 的冷却与冻结状态`);
+          this.log(`手动解除账号 [${a.record.name}] 的冷却、冻结与限流状态`);
         }
       }
     }

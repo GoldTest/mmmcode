@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MiniMax Code 本地反代管理</title>
-<link rel="stylesheet" href="./style.css?v=0.6.0">
-<link rel="stylesheet" href="./keys.css?v=0.6.0">
+<link rel="stylesheet" href="./style.css?v=0.6.1">
+<link rel="stylesheet" href="./keys.css?v=0.6.1">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔑</text></svg>">
 </head>
 <body>
@@ -66,6 +66,8 @@
               <input id="credits-threshold-input" type="number" min="0" step="10" value="100" style="width:96px;">
             </label>
             <span class="small muted">最小可用积分：低于此值冻结该账号</span>
+            <button id="btn-probe-all" class="ghost sm" title="批量测试生文首字延迟，>20s 疑似限流停调度，>30s 自动暂停">⚡ 批量测活</button>
+            <button id="btn-warmup-all" class="ghost sm" title="批量无 token 预热（count_tokens）">🔥 批量预热</button>
             <button id="btn-refresh-credits" class="ghost sm">立即刷新额度</button>
             <button id="btn-add" class="primary sm">+ 新增账号</button>
             <button id="btn-refresh-accounts" class="ghost sm">刷新</button>

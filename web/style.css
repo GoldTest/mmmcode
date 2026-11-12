@@ -188,8 +188,20 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
   gap: 14px;
   padding: 18px;
 }
-/* 账号卡片：**横向占满一行** —— 一行一个账号，信息展开成横向条。 */
-.cards-account { grid-template-columns: 1fr; }
+/* 账号卡片：**限制账户部分最大高度**，内置平滑滚动；卡片紧凑美观、信息全面。 */
+.cards-account {
+  grid-template-columns: 1fr;
+  max-height: 540px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  gap: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.cards-account::-webkit-scrollbar { width: 6px; }
+.cards-account::-webkit-scrollbar-track { background: transparent; }
+.cards-account::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+.cards-account::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
 .card {
   background: var(--bg-soft);
   border: 1px solid var(--line);
@@ -226,36 +238,118 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 .card-metrics b { color: var(--fg); font-weight: 500; }
 .card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
 
-/* ───────── 账号卡片（横向一行） ───────── */
+/* ───────── 账号卡片（紧凑三栏布局） ───────── */
 .card-account {
   display: grid;
-  grid-template-columns: minmax(220px, 1.1fr) minmax(260px, 1.4fr) auto;
-  grid-template-areas:
-    "head metrics actions"
-    "prio metrics actions";
-  align-items: start;
+  grid-template-columns: minmax(220px, 1.05fr) minmax(300px, 1.45fr) minmax(220px, auto);
+  grid-template-areas: "head metrics actions";
+  align-items: center;
   column-gap: 18px;
-  row-gap: 8px;
+  row-gap: 10px;
+  padding: 12px 16px;
+  transition: border-color .15s ease, background-color .15s ease;
 }
-.card-account .card-top { grid-area: head; align-items: flex-start; }
+.card-account:hover {
+  border-color: rgba(76, 141, 255, .38);
+}
+.card-account.rate-limited {
+  border-color: rgba(210, 153, 34, .5);
+  background: linear-gradient(90deg, rgba(210, 153, 34, .05), transparent 40%), var(--bg-soft);
+}
+.card-account .card-top {
+  grid-area: head;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+}
+.card-account .card-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .card-account .card-head { min-width: 0; }
-.card-account .card-metrics { grid-area: metrics; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; }
-.card-account .card-priority { grid-area: prio; align-self: end; }
-.card-account .card-actions { grid-area: actions; align-self: center; justify-content: flex-end; }
-.card-account .card-order { display: inline-flex; gap: 4px; margin-right: 2px; }
+.card-account .card-metrics {
+  grid-area: metrics;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 12px;
+  align-content: center;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.card-account .card-metric-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.card-account .card-metric-label {
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.card-account .card-metric-val {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-account .card-metric-val.ok { color: var(--ok); }
+.card-account .card-metric-val.warn { color: var(--warn); }
+.card-account .card-metric-val.err { color: var(--err); }
+
+.card-account .card-priority {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 0;
+}
+.card-account .card-actions {
+  grid-area: actions;
+  align-self: center;
+  justify-content: flex-end;
+  margin-top: 0;
+  padding-top: 0;
+  max-width: 340px;
+}
+.card-account .card-order { display: inline-flex; gap: 4px; }
 .card-account button.icon-only { padding: 4px 8px; font-size: 13px; line-height: 1; }
+
+@media (max-width: 980px) {
+  .card-account {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "head"
+      "metrics"
+      "actions";
+  }
+  .card-account .card-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .card-account .card-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+}
 
 /* 账号卡片上的优先级编辑行 */
 .card-priority {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
-  padding-top: 2px;
 }
 .card-priority .prio-input {
-  width: 68px;
-  padding: 4px 8px;
+  width: 56px;
+  padding: 2px 6px;
   font-size: 12px;
   text-align: center;
 }

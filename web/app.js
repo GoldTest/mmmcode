@@ -485,8 +485,8 @@ function renderAccounts() {
   $('#mode-select').value = state.mode;
   $('#credits-threshold-input').value = String(state.creditsThreshold);
 
-  // 顶栏 Badge（冻结的账号不参与调度，算作不可用）
-  const availableCount = state.accounts.filter((a) => a.enabled && a.loggedIn && !a.cooling && !a.frozen).length;
+  // 顶栏 Badge（冻结与限流的账号不参与调度，算作不可用）
+  const availableCount = state.accounts.filter((a) => a.enabled && a.loggedIn && !a.cooling && !a.frozen && !a.rateLimited).length;
   const accBadge = $('#account-badge');
   if (accBadge) {
     accBadge.textContent = `账号 ${availableCount}/${state.accounts.length} 就绪`;
@@ -498,9 +498,28 @@ function renderAccounts() {
   }
 }
 
+function formatProbeMetric(p) {
+  if (!p) return { text: '未测活', cls: '' };
+  const ms = typeof p.ttftMs === 'number' ? p.ttftMs : 0;
+  const sec = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+  if (p.status === 'ok') return { text: `${sec} (正常)`, cls: 'ok' };
+  if (p.status === 'suspected') return { text: `${sec} (疑似限流)`, cls: 'warn' };
+  if (p.status === 'paused') return { text: `${sec} (超时暂停)`, cls: 'err' };
+  return { text: '测活异常', cls: 'err' };
+}
+
+function formatWarmupMetric(w) {
+  if (!w) return { text: '未预热', cls: '' };
+  if (w.ok) return { text: `${w.durationMs}ms (0 token)`, cls: 'ok' };
+  return { text: '预热失败', cls: 'err' };
+}
+
 function renderAccountCard(a) {
   const card = document.createElement('div');
-  card.className = 'card card-account' + (a.enabled ? '' : ' disabled');
+  card.className =
+    'card card-account' +
+    (a.enabled ? '' : ' disabled') +
+    (a.rateLimited ? ' rate-limited' : '');
   card.dataset.name = a.name;
 
   /* 令牌失效判定：健康态为 unauthorized，或令牌已过期 —— 这两种情况才需要重新授权。 */
@@ -508,44 +527,23 @@ function renderAccountCard(a) {
 
   const top = document.createElement('div');
   top.className = 'card-top';
+
+  const titleRow = document.createElement('div');
+  titleRow.className = 'card-title-row';
+
   const left = document.createElement('div');
   left.className = 'card-head';
   left.innerHTML = `
     <div class="card-name">${escapeHtml(a.name)}${a.isDefault ? ' <span class="muted small">（默认）</span>' : ''}</div>
-    <div class="card-sub">${escapeHtml(regionTag(a.region))}${a.account ? ' · 账号 ' + escapeHtml(a.account) + '…' : ''}</div>
-    <div class="tags" id="tags-${escapeHtml(a.name)}"></div>`;
-  top.appendChild(left);
-
-  const toggle = document.createElement('button');
-  toggle.className = 'ghost sm';
-  toggle.textContent = a.enabled ? '停用' : '启用';
-  toggle.title = a.enabled ? '停用后不参与自动切换' : '启用后参与自动切换';
-  toggle.addEventListener('click', async () => {
-    await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
-      method: 'PATCH',
-      body: { enabled: !a.enabled },
-    });
-    toast(`账号 ${a.name} 已${a.enabled ? '停用' : '启用'}`, 'ok');
-    await loadAccounts();
-  });
-  top.appendChild(toggle);
-  card.appendChild(top);
-
-  const metrics = document.createElement('div');
-  metrics.className = 'card-metrics';
-  metrics.innerHTML = `
-    <div>登录态 <b>${a.loggedIn ? '已登录' : '未登录'}</b></div>
-    <div>令牌有效 <b>${tokenLeft(a.tokenExpiresAt)}</b></div>
-    <div>上次签到 <b>${a.lastCheckin ? escapeHtml(a.lastCheckin.outcome) : '—'}</b></div>
-    <div>剩余积分 <b>${a.lastCredits ? a.lastCredits.remaining : '—'}</b></div>`;
-  card.appendChild(metrics);
+    <div class="card-sub">${escapeHtml(regionTag(a.region))}${a.account ? ' · ' + escapeHtml(a.account) + '…' : ''}</div>`;
+  titleRow.appendChild(left);
 
   // 优先级编辑（数字越小越优先，0 为最高层）
   const prioRow = document.createElement('div');
   prioRow.className = 'card-priority';
   const prioLabel = document.createElement('span');
   prioLabel.className = 'small muted';
-  prioLabel.textContent = '优先级';
+  prioLabel.textContent = 'P';
   const prioInput = document.createElement('input');
   prioInput.type = 'number';
   prioInput.min = '0';
@@ -553,7 +551,7 @@ function renderAccountCard(a) {
   prioInput.step = '1';
   prioInput.className = 'prio-input';
   prioInput.value = String(a.priority ?? 0);
-  prioInput.title = '数字越小越优先（0 为最高层）';
+  prioInput.title = '调度优先级（数字越小越优先，0 为最高层）';
   prioInput.addEventListener('change', async () => {
     const next = Math.max(0, Math.min(99, Math.trunc(Number(prioInput.value) || 0)));
     if (next === (a.priority ?? 0)) {
@@ -577,7 +575,46 @@ function renderAccountCard(a) {
   });
   prioRow.appendChild(prioLabel);
   prioRow.appendChild(prioInput);
-  card.appendChild(prioRow);
+  titleRow.appendChild(prioRow);
+
+  top.appendChild(titleRow);
+
+  const tagsEl = document.createElement('div');
+  tagsEl.className = 'tags';
+  tagsEl.id = `tags-${a.name}`;
+  top.appendChild(tagsEl);
+  card.appendChild(top);
+
+  const probeM = formatProbeMetric(a.lastProbe);
+  const warmupM = formatWarmupMetric(a.lastWarmup);
+  const metrics = document.createElement('div');
+  metrics.className = 'card-metrics';
+  metrics.innerHTML = `
+    <div class="card-metric-item">
+      <span class="card-metric-label">登录态</span>
+      <span class="card-metric-val ${a.loggedIn ? 'ok' : 'warn'}">${a.loggedIn ? '已登录' : '未登录'}</span>
+    </div>
+    <div class="card-metric-item">
+      <span class="card-metric-label">令牌有效</span>
+      <span class="card-metric-val">${tokenLeft(a.tokenExpiresAt)}</span>
+    </div>
+    <div class="card-metric-item">
+      <span class="card-metric-label">剩余积分</span>
+      <span class="card-metric-val">${a.lastCredits ? a.lastCredits.remaining : '—'}</span>
+    </div>
+    <div class="card-metric-item">
+      <span class="card-metric-label">上次签到</span>
+      <span class="card-metric-val">${a.lastCheckin ? escapeHtml(a.lastCheckin.outcome) : '—'}</span>
+    </div>
+    <div class="card-metric-item" title="${a.lastProbe ? escapeHtml(a.lastProbe.message) : '点击测活测试生文首字延迟'}">
+      <span class="card-metric-label">测活首字</span>
+      <span class="card-metric-val ${probeM.cls}">${escapeHtml(probeM.text)}</span>
+    </div>
+    <div class="card-metric-item" title="${a.lastWarmup ? escapeHtml(a.lastWarmup.message) : '点击预热（不消耗 token）'}">
+      <span class="card-metric-label">预热耗时</span>
+      <span class="card-metric-val ${warmupM.cls}">${escapeHtml(warmupM.text)}</span>
+    </div>`;
+  card.appendChild(metrics);
 
   const actions = document.createElement('div');
   actions.className = 'card-actions';
@@ -588,6 +625,70 @@ function renderAccountCard(a) {
   } else if (tokenDead) {
     actions.appendChild(mkBtn('重新授权', 'primary sm', () => startLogin(a.name, a.region)));
   }
+
+  actions.appendChild(mkBtn('⚡ 测活', 'ghost sm', async (btn) => {
+    btn.disabled = true;
+    btn.textContent = '测活中…';
+    try {
+      const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/probe`, { method: 'POST' });
+      const res = r.result || {};
+      toast(res.message || '测活完成', res.ok ? 'ok' : 'err');
+      await loadAccounts();
+    } catch (err) {
+      toast('测活失败：' + err.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⚡ 测活';
+    }
+  }));
+
+  actions.appendChild(mkBtn('🔥 预热', 'ghost sm', async (btn) => {
+    btn.disabled = true;
+    btn.textContent = '预热中…';
+    try {
+      const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/warmup`, { method: 'POST' });
+      const res = r.result || {};
+      toast(res.message || '预热完成', res.ok ? 'ok' : 'err');
+      await loadAccounts();
+    } catch (err) {
+      toast('预热失败：' + err.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🔥 预热';
+    }
+  }));
+
+  if (a.rateLimited) {
+    actions.appendChild(mkBtn('解除限流', 'primary sm', async (btn) => {
+      btn.disabled = true;
+      try {
+        await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
+          method: 'PATCH',
+          body: { rateLimited: false },
+        });
+        toast(`账号 ${a.name} 已解除限流标记`, 'ok');
+        await loadAccounts();
+      } catch (err) {
+        toast('解除限流失败：' + err.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    }));
+  }
+
+  const toggle = document.createElement('button');
+  toggle.className = 'ghost sm';
+  toggle.textContent = a.enabled ? '暂停' : '启用';
+  toggle.title = a.enabled ? '暂停后不参与自动切换' : '启用后参与自动切换';
+  toggle.addEventListener('click', async () => {
+    await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
+      method: 'PATCH',
+      body: { enabled: !a.enabled },
+    });
+    toast(`账号 ${a.name} 已${a.enabled ? '暂停' : '启用'}`, 'ok');
+    await loadAccounts();
+  });
+  actions.appendChild(toggle);
 
   actions.appendChild(mkBtn('体检', 'ghost sm', async (btn) => {
     btn.disabled = true;
@@ -687,14 +788,15 @@ function renderAccountCard(a) {
     };
     if (!a.loggedIn) t('未登录', 'warn');
     else if (a.cooling) t('冷却中', 'warn');
+    else if (a.rateLimited) t(a.lastProbe && a.lastProbe.status === 'paused' ? '限流暂停' : '疑似限流（停调度）', 'err');
     else if (a.health === 'healthy') t('正常', 'ok');
     else if (a.health === 'unauthorized') t('凭证失效', 'err');
     else if (a.health === 'rate_limited') t('限流中', 'warn');
     else if (a.health === 'error') t('异常', 'err');
-    t(`优先级 P${a.priority ?? 0}`, 'info');
+    t(`P${a.priority ?? 0}`, 'info');
     if (a.frozen) t(`额度冻结${a.frozenReason ? '：' + a.frozenReason : ''}`, 'warn');
     if (a.pendingLogin) t('授权中', 'info');
-    if (!a.enabled) t('已停用', '');
+    if (!a.enabled) t('已暂停', '');
     if (a.checkinEnabled === false) t('签到已停用', 'warn');
   }
   return card;
@@ -751,6 +853,66 @@ $('#credits-threshold-input').addEventListener('change', async (e) => {
   } catch (err) {
     toast('设置最小可用积分失败：' + err.message, 'err');
     await loadAccounts();
+  }
+});
+
+// 批量测活（ping 生文接口看首字耗时）
+$('#btn-probe-all').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = '测活中…';
+  try {
+    const res = await api('/admin/api/accounts/probe', { method: 'POST', body: {} });
+    const results = res.results || [];
+    if (results.length === 0) {
+      toast('没有可测活的已登录且启用账号', 'warn');
+    } else {
+      const okCount = results.filter((r) => r.status === 'ok').length;
+      const suspectedCount = results.filter((r) => r.status === 'suspected').length;
+      const pausedCount = results.filter((r) => r.status === 'paused').length;
+      const errCount = results.filter((r) => r.status === 'error').length;
+      const summary = `批量测活完成：正常 ${okCount} 个` +
+        (suspectedCount ? `，疑似限流 ${suspectedCount} 个` : '') +
+        (pausedCount ? `，超时暂停 ${pausedCount} 个` : '') +
+        (errCount ? `，异常 ${errCount} 个` : '');
+      toast(summary, suspectedCount + pausedCount + errCount > 0 ? 'err' : 'ok');
+
+      const detailRows = results.map((r) => {
+        const icon = r.status === 'ok' ? '✓' : r.status === 'suspected' ? '⚠️' : r.status === 'paused' ? '🛑' : '✕';
+        return `<div style="padding:4px 0;border-bottom:1px solid var(--line);">${icon} <b>${escapeHtml(r.account)}</b>：${escapeHtml(r.message)}</div>`;
+      }).join('');
+      openModal('批量测活结果', `<div style="font-size:13px;line-height:1.6;">${detailRows}</div>`);
+    }
+    await loadAccounts();
+  } catch (err) {
+    toast('批量测活失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚡ 批量测活';
+  }
+});
+
+// 批量无 token 预热
+$('#btn-warmup-all').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = '预热中…';
+  try {
+    const res = await api('/admin/api/accounts/warmup', { method: 'POST', body: {} });
+    const results = res.results || [];
+    if (results.length === 0) {
+      toast('没有可预热的已登录且启用账号', 'warn');
+    } else {
+      const okCount = results.filter((r) => r.ok).length;
+      const failCount = results.filter((r) => !r.ok).length;
+      toast(`批量预热完成：成功 ${okCount} 个${failCount ? `，失败 ${failCount} 个` : ''}`, failCount > 0 ? 'err' : 'ok');
+    }
+    await loadAccounts();
+  } catch (err) {
+    toast('批量预热失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔥 批量预热';
   }
 });
 

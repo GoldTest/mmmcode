@@ -16,7 +16,9 @@
  *   GET    /admin/api/accounts           账号列表（含状态）
  *   POST   /admin/api/accounts           { name, region } → 新增/登记账号
  *   POST   /admin/api/accounts/reorder   { order: [name, ...] } → 调整账号展示顺序
- *   PATCH  /admin/api/accounts/:name     { enabled?, checkinEnabled?, notes?, region?, priority? }
+ *   POST   /admin/api/accounts/probe     { names? } → 批量生文测活（测首字延迟、疑似限流标记、超时暂停）
+ *   POST   /admin/api/accounts/warmup    { names? } → 批量无 token 预热（count_tokens）
+ *   PATCH  /admin/api/accounts/:name     { enabled?, checkinEnabled?, notes?, region?, priority?, rateLimited? }
  *   DELETE /admin/api/accounts/:name     删除账号（含令牌文件）
  *   POST   /admin/api/accounts/:name/login    发起设备授权 → 返回短码与链接
  *   GET    /admin/api/accounts/:name/login    查授权进度（非阻塞单次轮询）
@@ -24,6 +26,8 @@
  *   POST   /admin/api/accounts/:name/checkin  签到
  *   GET    /admin/api/accounts/:name/credits  积分账本
  *   GET    /admin/api/accounts/:name/doctor   单账号体检
+ *   POST   /admin/api/accounts/:name/probe    单账号生文测活
+ *   POST   /admin/api/accounts/:name/warmup   单账号无 token 预热
  *   GET    /admin/api/config              总体配置（调度模式/优先级分层/额度阈值/入站密钥打码）
  *   POST   /admin/api/config              { mode?, creditsThreshold? }
  *   GET    /admin/api/insights             用量洞察：各账号 token 消耗（输入/输出/缓存命中）
@@ -62,6 +66,7 @@ import {
 } from './credential.js';
 import { MinimaxActivity } from './activity.js';
 import { refreshCreditsForAll } from './credits-refresh.js';
+import { probeAccount, probeAllAccounts, warmupAccount, warmupAllAccounts } from './probe.js';
 import { CredentialError } from './errors.js';
 import type { RequestStore } from './requests.js';
 import type { SchedulerService } from './scheduler.js';
@@ -150,6 +155,10 @@ function accountView(a: PoolAccount): Record<string, unknown> {
     frozen,
     frozenReason: a.record.frozenReason ?? null,
     frozenUntil: a.record.frozenUntil ?? null,
+    rateLimited: a.record.rateLimited === true,
+    rateLimitReason: a.record.rateLimitReason ?? null,
+    lastProbe: a.record.lastProbe ?? null,
+    lastWarmup: a.record.lastWarmup ?? null,
     loggedIn: a.credential !== null,
     account: a.credential?.account ?? null,
     tokenExpiresAt: a.credential?.expiresAt ?? null,
@@ -285,6 +294,28 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         return true;
       }
 
+      /* ── 批量生文测活（测首字返回耗时，>20s 疑似限流停调度，>30s 自动暂停） ── */
+      if (route === 'accounts/probe' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const names = Array.isArray(body.names)
+          ? body.names.filter((n): n is string => typeof n === 'string' && n.length > 0)
+          : undefined;
+        const results = await probeAllAccounts(ctx.pool, { names });
+        sendJson(res, 200, { ok: true, results });
+        return true;
+      }
+
+      /* ── 批量无 token 预热 ── */
+      if (route === 'accounts/warmup' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const names = Array.isArray(body.names)
+          ? body.names.filter((n): n is string => typeof n === 'string' && n.length > 0)
+          : undefined;
+        const results = await warmupAllAccounts(ctx.pool, { names });
+        sendJson(res, 200, { ok: true, results });
+        return true;
+      }
+
       /* ── 入站密钥（客户端 token）的生成与管理 ── */
       if (route === 'keys' && method === 'GET') {
         /* 返回**明文**密钥 —— 管理页要支持「点击复制」，不给明文就没法复制。
@@ -378,6 +409,20 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
             patch.frozen = true;
             patch.frozenReason = typeof body.frozenReason === 'string' ? body.frozenReason.slice(0, 300) : '手动冻结';
             patch.frozenUntil = undefined;
+          }
+          /* 限流标记可手动解除或设置。 */
+          if (body.rateLimited === false) {
+            patch.rateLimited = false;
+            patch.rateLimitReason = undefined;
+            const cur = ctx.pool.get(name);
+            if (cur && cur.record.health === 'rate_limited') {
+              patch.health = 'healthy';
+              patch.healthDetail = undefined;
+            }
+          } else if (body.rateLimited === true) {
+            patch.rateLimited = true;
+            patch.rateLimitReason =
+              typeof body.rateLimitReason === 'string' ? body.rateLimitReason.slice(0, 300) : '手动标记限流';
           }
           /* 账号可能已存在于磁盘但还没登记进注册表 —— 先 upsert 再改，
              否则「停用一个刚建好的账号」会 404（upsert 不覆盖已有状态）。 */
@@ -499,6 +544,24 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
             checks.push({ name: '令牌刷新', ok: false, detail: (err as Error).message });
           }
           sendJson(res, 200, { name, checks, credential: accountView(found) });
+          return true;
+        }
+
+        /* 单账号生文测活（ping 首字延迟） */
+        if (action === 'probe' && method === 'POST') {
+          const found = mustFind(name);
+          const result = await probeAccount(ctx.pool, found);
+          const refreshed = ctx.pool.get(name);
+          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed) : null });
+          return true;
+        }
+
+        /* 单账号无 token 预热 */
+        if (action === 'warmup' && method === 'POST') {
+          const found = mustFind(name);
+          const result = await warmupAccount(ctx.pool, found);
+          const refreshed = ctx.pool.get(name);
+          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed) : null });
           return true;
         }
 
