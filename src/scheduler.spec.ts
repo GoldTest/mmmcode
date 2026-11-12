@@ -35,7 +35,7 @@ describe('SchedulerService', () => {
     expect(initial.autoCheckin.cn.time).toBe('08:00');
     expect(initial.autoCheckin.cn.timezone).toBe('Asia/Shanghai');
     expect(initial.autoCheckin.global.time).toBe('08:00');
-    expect(initial.autoCheckin.global.timezone).toBe('UTC');
+    expect(initial.autoCheckin.global.timezone).toBe('America/New_York');
     expect(initial.autoCheckin.cn.jitterMinutes).toBe(0);
 
     const updated = scheduler.updateConfig({

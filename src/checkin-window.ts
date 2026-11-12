@@ -32,8 +32,13 @@ import { createHash } from 'node:crypto';
 
 /** 国内账号默认时区。 */
 export const CN_TIMEZONE = 'Asia/Shanghai';
-/** 海外账号默认时区。 */
-export const GLOBAL_TIMEZONE = 'UTC';
+/**
+ * 海外账号默认时区 —— **美国东部时间**。
+ *
+ * 美国不是单一时区（东部 / 中部 / 山地 / 太平洋…），这里取最常用的东部；
+ * 想要别的在管理页改就行（任意 IANA 名，如 `America/Los_Angeles`）。
+ */
+export const GLOBAL_TIMEZONE = 'America/New_York';
 
 /** 解析 "HH:mm" → { hour, minute }；格式或取值不合法返回 null。 */
 export function parseHhMm(value: string): { hour: number; minute: number } | null {

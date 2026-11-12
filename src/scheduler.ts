@@ -234,7 +234,7 @@ export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
     enabled: true,
     /* 国内账号：北京时间 08:00 固定签到。 */
     cn: { time: '08:00', jitterMinutes: 0, timezone: CN_TIMEZONE },
-    /* 海外账号：默认按 UTC 解释（可在管理页改成任意 IANA 时区）。 */
+    /* 海外账号：默认按美国东部时间解释（可在管理页改成任意 IANA 时区）。 */
     global: { time: '08:00', jitterMinutes: 0, timezone: GLOBAL_TIMEZONE },
     intervalMinutes: 30,
   },

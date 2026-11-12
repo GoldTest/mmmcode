@@ -1049,30 +1049,6 @@ async function startLogin(name, region) {
 
 /* ───────────────────────── 自动签到表格与调度 ───────────────────────── */
 
-/** 把 epoch 毫秒格式化成指定时区的 "HH:mm"。 */
-function fmtZonedHM(ts, timeZone) {
-  if (!ts) return '—';
-  return new Date(ts).toLocaleString('zh-CN', {
-    timeZone: timeZone || 'Asia/Shanghai',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-}
-
-/** 把 epoch 毫秒格式化成指定时区的 "MM-DD HH:mm"。 */
-function fmtZonedDateTime(ts, timeZone) {
-  if (!ts) return '—';
-  return new Date(ts).toLocaleString('zh-CN', {
-    timeZone: timeZone || 'Asia/Shanghai',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-}
-
 /** 签到计划的一句话描述（国内 / 海外各一句）。 */
 function formatCheckinSchedule(st) {
   const regions = st.regions || {};
@@ -1087,38 +1063,6 @@ function formatCheckinSchedule(st) {
   return cn || global || `每日定时 ${st.time || ''}`;
 }
 
-/**
- * 设置页下方的窗口说明 —— 按区域各一行：
- * 今日窗口 / 下次签到 / 待签账号数。
- */
-function updateCheckinWindowHint(st) {
-  const el = $('#checkin-window-hint');
-  if (!el) return;
-  if (!st.enabled) {
-    el.textContent = '自动签到已暂停 —— 不会自动签，也不会安排随机时刻。';
-    return;
-  }
-  const regions = st.regions || {};
-  const lines = [];
-  for (const [region, label] of [['cn', '国内'], ['global', '海外']]) {
-    const r = regions[region];
-    if (!r || !r.accountCount) continue;
-    const tz = r.timezone || 'Asia/Shanghai';
-    const parts = [`${label}（${tz}）`];
-    if (r.jitterMinutes > 0 && r.windowStart && r.windowEnd) {
-      parts.push(`今日随机窗口 ${fmtZonedHM(r.windowStart, tz)} ~ ${fmtZonedHM(r.windowEnd, tz)}`);
-    } else {
-      parts.push(`固定时间 ${r.time}`);
-    }
-    if (r.nextRunAt) parts.push(`下次签到 ${fmtZonedDateTime(r.nextRunAt, tz)}`);
-    if (r.pendingCount) parts.push(`${r.pendingCount} 个账号待签`);
-    lines.push(parts.join(' · '));
-  }
-  el.innerHTML = lines.length
-    ? lines.map((l) => escapeHtml(l)).join('<br>')
-    : '还没有启用自动签到的账号。';
-}
-
 async function loadScheduler() {
   try {
     const s = await api('/admin/api/scheduler');
@@ -1131,14 +1075,13 @@ async function loadScheduler() {
       const regions = s.autoCheckin.regions || {};
       for (const [region, fallbackTz, fallbackTime] of [
         ['cn', 'Asia/Shanghai', '08:00'],
-        ['global', 'UTC', '08:00'],
+        ['global', 'America/New_York', '08:00'],
       ]) {
         const r = regions[region] || {};
         $(`#setting-checkin-time-${region}`).value = r.time || fallbackTime;
         $(`#setting-checkin-jitter-${region}`).value = r.jitterMinutes || 0;
         $(`#setting-checkin-tz-${region}`).value = r.timezone || fallbackTz;
       }
-      updateCheckinWindowHint(s.autoCheckin);
     }
     if (s.autoRefresh) {
       $('#refresh-status-badge').textContent = s.autoRefresh.enabled ? '后台自动巡检中' : '已暂停';
@@ -1980,7 +1923,7 @@ $('#scheduler-form').addEventListener('submit', async (e) => {
   const readSchedule = (region) => ({
     time: $(`#setting-checkin-time-${region}`).value.trim() || '08:00',
     jitterMinutes: Math.max(0, Math.min(240, Number($(`#setting-checkin-jitter-${region}`).value) || 0)),
-    timezone: $(`#setting-checkin-tz-${region}`).value.trim() || (region === 'cn' ? 'Asia/Shanghai' : 'UTC'),
+    timezone: $(`#setting-checkin-tz-${region}`).value.trim() || (region === 'cn' ? 'Asia/Shanghai' : 'America/New_York'),
   });
   const refreshEnabled = $('#setting-refresh-enabled').checked;
   const refreshInterval = Number($('#setting-refresh-interval').value) || 15;

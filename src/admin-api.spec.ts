@@ -224,7 +224,7 @@ describe('Admin API: 新增功能路由测试', () => {
       /* 国内 / 海外两套独立计划，各带自己的时区与随机窗口。 */
       expect(status.body.autoCheckin.regions.cn.time).toBe('08:00');
       expect(status.body.autoCheckin.regions.cn.timezone).toBe('Asia/Shanghai');
-      expect(status.body.autoCheckin.regions.global.timezone).toBe('UTC');
+      expect(status.body.autoCheckin.regions.global.timezone).toBe('America/New_York');
 
       const update = await ctx.req('/admin/api/scheduler/config', {
         method: 'POST',
