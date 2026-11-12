@@ -503,10 +503,43 @@
               <input type="checkbox" id="setting-checkin-enabled" checked>
               启用每日自动签到
             </label>
-            <label class="field inline">
-              每日签到时间
-              <input type="text" id="setting-checkin-time" value="08:00" placeholder="08:00" style="width:90px;">
-            </label>
+            <!-- 国内与海外是两套独立服务 —— 签到计划各配各的（含时区）。 -->
+            <div style="display:flex; flex-wrap:wrap; gap:16px;">
+              <div style="display:flex; flex-direction:column; gap:8px; min-width:260px;">
+                <b class="small">🇨🇳 国内账号（cn）</b>
+                <label class="field inline">
+                  签到时间
+                  <input type="text" id="setting-checkin-time-cn" value="08:00" placeholder="08:00" style="width:80px;">
+                </label>
+                <label class="field inline">
+                  随机窗口（分钟）
+                  <input type="number" id="setting-checkin-jitter-cn" value="0" min="0" max="240" style="width:80px;">
+                </label>
+                <label class="field inline">
+                  时区
+                  <input type="text" id="setting-checkin-tz-cn" value="Asia/Shanghai" placeholder="Asia/Shanghai" style="width:150px;">
+                </label>
+              </div>
+              <div style="display:flex; flex-direction:column; gap:8px; min-width:260px;">
+                <b class="small">🌐 海外账号（global）</b>
+                <label class="field inline">
+                  签到时间
+                  <input type="text" id="setting-checkin-time-global" value="08:00" placeholder="08:00" style="width:80px;">
+                </label>
+                <label class="field inline">
+                  随机窗口（分钟）
+                  <input type="number" id="setting-checkin-jitter-global" value="0" min="0" max="240" style="width:80px;">
+                </label>
+                <label class="field inline">
+                  时区
+                  <input type="text" id="setting-checkin-tz-global" value="UTC" placeholder="UTC" style="width:150px;">
+                </label>
+              </div>
+            </div>
+            <div class="muted small">
+              随机窗口 = 0 表示固定时间；填 30 则在签到时间<b>前后 30 分钟</b>内随机落点（每个账号各一个时刻）。
+            </div>
+            <div id="checkin-window-hint" class="muted small"></div>
             <hr style="border:none;border-top:1px solid var(--line);margin:4px 0;">
             <label class="field inline">
               <input type="checkbox" id="setting-refresh-enabled" checked>

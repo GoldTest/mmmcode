@@ -30,6 +30,10 @@
  *   POST   /admin/api/accounts/:name/warmup   单账号无 token 预热
  *   GET    /admin/api/config              总体配置（调度模式/优先级分层/额度阈值/入站密钥打码）
  *   POST   /admin/api/config              { mode?, creditsThreshold? }
+ *   GET    /admin/api/scheduler            调度器状态（自动签到/自动刷新/额度巡检）
+ *   POST   /admin/api/scheduler/config     { autoCheckin?: { enabled?, time?, jitterMinutes?, intervalMinutes? } }
+ *   POST   /admin/api/scheduler/checkin-all  立即全员签到（手动，不受时间窗口限制）
+ *   POST   /admin/api/scheduler/refresh-all  立即全员刷新令牌（{ force? }）
  *   GET    /admin/api/insights             用量洞察：各账号 token 消耗（输入/输出/缓存命中）
  *   POST   /admin/api/insights/reset      { name? } → 清空统计（不带 name = 全清）
  *   POST   /admin/api/credits/refresh     立即刷新各账号余额（按阈值冻结/解冻）
@@ -67,6 +71,7 @@ import {
 import { MinimaxActivity } from './activity.js';
 import { refreshCreditsForAll } from './credits-refresh.js';
 import { probeAccount, probeAllAccounts, warmupAccount, warmupAllAccounts } from './probe.js';
+import { parseHhMm, isValidTimezone } from './checkin-window.js';
 import { CredentialError } from './errors.js';
 import type { RequestStore, RequestSource } from './requests.js';
 import type { SchedulerService } from './scheduler.js';
@@ -138,6 +143,70 @@ function setSessionCookie(req: IncomingMessage, res: ServerResponse, token: stri
 
 function clearSessionCookie(res: ServerResponse): void {
   res.setHeader('set-cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+}
+
+/**
+ * 校验调度器配置补丁 —— 返回错误文案；通过则返回 null。
+ *
+ * 为什么要单独校验：`autoCheckin` 里的时间写坏（比如 "25:00"）会让
+ * 「该签的那一刻」永远算不出来 —— 表现是**签到再也不发生了**，而且不报错，
+ * 极难排查。所以格式不对就直接 400，让用户当场改掉。
+ *
+ * 国内（cn）与海外（global）两套计划各自校验：时间、随机窗口、时区都要过。
+ */
+function validateSchedulerPatch(body: Record<string, unknown>): string | null {
+  const checkin = body['autoCheckin'];
+  if (!checkin || typeof checkin !== 'object') return null;
+  const ac = checkin as Record<string, unknown>;
+
+  const checkTime = (value: unknown, label: string): string | null => {
+    if (value === undefined) return null;
+    if (typeof value !== 'string' || parseHhMm(value) === null) {
+      return `${label}签到时间格式不对，应为 HH:mm（24 小时制，如 "08:30"）`;
+    }
+    return null;
+  };
+
+  const checkJitter = (value: unknown, label: string): string | null => {
+    if (value === undefined) return null;
+    const jitter = Number(value);
+    if (!Number.isFinite(jitter) || jitter < 0 || jitter > 240) {
+      return `${label}随机窗口必须是 0 ~ 240 分钟之间的数字（0 = 固定时间）`;
+    }
+    return null;
+  };
+
+  const checkTimezone = (value: unknown, label: string): string | null => {
+    if (value === undefined) return null;
+    if (!isValidTimezone(value)) {
+      return `${label}时区名不合法，应为 IANA 时区名（如 "Asia/Shanghai" / "UTC"）`;
+    }
+    return null;
+  };
+
+  /* 旧形态：一个时间两区共用 —— 仍然接受，但要知道它在改哪一套。 */
+  const legacy = checkTime(ac['time'], '') ?? checkJitter(ac['jitterMinutes'], '');
+  if (legacy) return legacy;
+
+  for (const region of ['cn', 'global'] as const) {
+    const label = region === 'cn' ? '国内账号' : '海外账号';
+    const schedule = ac[region];
+    if (!schedule || typeof schedule !== 'object') continue;
+    const s = schedule as Record<string, unknown>;
+    const bad =
+      checkTime(s['time'], label) ??
+      checkJitter(s['jitterMinutes'], label) ??
+      checkTimezone(s['timezone'], label);
+    if (bad) return bad;
+  }
+
+  if (ac['intervalMinutes'] !== undefined) {
+    const interval = Number(ac['intervalMinutes']);
+    if (!Number.isFinite(interval) || interval < 1 || interval > 1440) {
+      return '轮询间隔必须是 1 ~ 1440 分钟之间的数字';
+    }
+  }
+  return null;
 }
 
 /** 账号对外视图（**绝不回显令牌**）。 */
@@ -858,7 +927,14 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
 
       /* ── 调度器配置 ── */
       if (route === 'scheduler/config' && method === 'POST') {
-        const body = await readJsonBody(req);
+        const body = (await readJsonBody(req)) as Record<string, unknown>;
+        /* 参数校验 —— 签到时间写坏会导致「永远等不到该签的那一刻」，
+           所以宁可当场报错让用户改，也不要静默接受。 */
+        const invalid = validateSchedulerPatch(body);
+        if (invalid) {
+          sendJson(res, 400, { error: invalid });
+          return true;
+        }
         const config = ctx.scheduler?.updateConfig(body as any);
         sendJson(res, 200, { ok: true, config });
         return true;

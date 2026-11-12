@@ -221,14 +221,64 @@ describe('Admin API: 新增功能路由测试', () => {
       const status = await ctx.req('/admin/api/scheduler');
       expect(status.status).toBe(200);
       expect(status.body.autoCheckin.enabled).toBe(true);
+      /* 国内 / 海外两套独立计划，各带自己的时区与随机窗口。 */
+      expect(status.body.autoCheckin.regions.cn.time).toBe('08:00');
+      expect(status.body.autoCheckin.regions.cn.timezone).toBe('Asia/Shanghai');
+      expect(status.body.autoCheckin.regions.global.timezone).toBe('UTC');
 
       const update = await ctx.req('/admin/api/scheduler/config', {
         method: 'POST',
-        body: { autoCheckin: { enabled: false, time: '10:00' } },
+        body: {
+          autoCheckin: {
+            enabled: false,
+            cn: { time: '10:00', jitterMinutes: 30, timezone: 'Asia/Shanghai' },
+            global: { time: '22:00', jitterMinutes: 15, timezone: 'UTC' },
+          },
+        },
       });
       expect(update.status).toBe(200);
       expect(update.body.config.autoCheckin.enabled).toBe(false);
-      expect(update.body.config.autoCheckin.time).toBe('10:00');
+      expect(update.body.config.autoCheckin.cn.time).toBe('10:00');
+      expect(update.body.config.autoCheckin.cn.jitterMinutes).toBe(30);
+      expect(update.body.config.autoCheckin.global.time).toBe('22:00');
+      expect(update.body.config.autoCheckin.global.jitterMinutes).toBe(15);
+
+      /* 旧形态（一个时间两区共用）依然接受 —— 老脚本不必改。 */
+      const legacy = await ctx.req('/admin/api/scheduler/config', {
+        method: 'POST',
+        body: { autoCheckin: { time: '07:15' } },
+      });
+      expect(legacy.status).toBe(200);
+      expect(legacy.body.config.autoCheckin.cn.time).toBe('07:15');
+      expect(legacy.body.config.autoCheckin.global.time).toBe('07:15');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('POST /admin/api/scheduler/config 拒绝写坏的签到时间与时区', async () => {
+    const ctx = await setupServer();
+    try {
+      const badTime = await ctx.req('/admin/api/scheduler/config', {
+        method: 'POST',
+        body: { autoCheckin: { cn: { time: '25:00' } } },
+      });
+      expect(badTime.status).toBe(400);
+      expect(String(badTime.body.error)).toMatch(/时间格式/);
+
+      const badTz = await ctx.req('/admin/api/scheduler/config', {
+        method: 'POST',
+        body: { autoCheckin: { global: { timezone: 'Not/AZone' } } },
+      });
+      expect(badTz.status).toBe(400);
+      expect(String(badTz.body.error)).toMatch(/时区/);
+
+      const badJitter = await ctx.req('/admin/api/scheduler/config', {
+        method: 'POST',
+        body: { autoCheckin: { cn: { jitterMinutes: 9999 } } },
+      });
+      expect(badJitter.status).toBe(400);
+      expect(String(badJitter.body.error)).toMatch(/随机窗口/);
     } finally {
       await ctx.close();
     }
