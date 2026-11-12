@@ -438,6 +438,15 @@
                 <option value="error">异常 4xx/5xx</option>
               </select>
             </label>
+            <label class="field inline">
+              来源
+              <select id="req-filter-source" class="sm">
+                <option value="all">全部</option>
+                <option value="proxy">反代</option>
+                <option value="probe">测活</option>
+                <option value="warmup">预热</option>
+              </select>
+            </label>
             <input id="req-search-input" type="text" placeholder="搜索 ID / 提示词 / 回复 / 模型..." class="sm" style="width:220px;">
           </div>
         </div>
@@ -447,6 +456,7 @@
               <tr>
                 <th>时间</th>
                 <th>状态</th>
+                <th>来源</th>
                 <th>耗时</th>
                 <th>路由与端点</th>
                 <th>请求模型</th>
@@ -458,7 +468,7 @@
               </tr>
             </thead>
             <tbody id="requests-table-body">
-              <tr><td colspan="10" class="muted">暂无请求记录</td></tr>
+              <tr><td colspan="11" class="muted">暂无请求记录</td></tr>
             </tbody>
           </table>
         </div>

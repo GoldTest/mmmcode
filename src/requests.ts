@@ -9,11 +9,27 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import { dirname } from 'node:path';
 import { approxBytes, clipRecord } from './clip.js';
 
+/**
+ * 请求来源。
+ *
+ * · `proxy`  —— 客户端经反代发起的正常请求（**默认**，历史数据也按它处理）。
+ * · `probe`  —— 测活：生文 ping，测首字延迟（TTFT）。
+ * · `warmup` —— 预热：count_tokens，不占 token 地验证凭证链路。
+ *
+ * 为什么要单独标来源：测活/预热**同样会打到上游**，排查「上游到底收到了什么」
+ * 时必须能看到它们；但它们不是客户端流量，混在一起会污染「入站请求历史」的语义。
+ */
+export type RequestSource = 'proxy' | 'probe' | 'warmup';
+
 export interface RequestRecord {
   id: string;
   timestamp: number;
   method: string;
   path: string;
+  /**
+   * 请求来源 —— 缺省视为 `proxy`（兼容旧数据）。
+   */
+  source?: RequestSource;
   clientIp?: string;
   keyId?: string | null;
   keyName?: string | null;
@@ -118,6 +134,8 @@ export interface RequestListFilter {
   model?: string;
   account?: string;
   search?: string;
+  /** 按来源筛选（'all' 或不传 = 不过滤）。 */
+  source?: RequestSource | 'all';
 }
 
 export const DEFAULT_MAX_ITEMS = 200;
@@ -402,6 +420,11 @@ export class RequestStore {
 
     if (filter.account) {
       result = result.filter((item) => item.account === filter.account);
+    }
+
+    /* 来源筛选：老记录没有 source 字段，一律按 'proxy' 算。 */
+    if (filter.source && filter.source !== 'all') {
+      result = result.filter((item) => (item.source ?? 'proxy') === filter.source);
     }
 
     if (filter.search) {

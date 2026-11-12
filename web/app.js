@@ -284,6 +284,7 @@ function openRequestModal(record) {
     <!-- 基本指标 -->
     <div class="card-metrics" style="background:var(--bg-soft);padding:12px;border-radius:8px;border:1px solid var(--line);">
       <div>请求状态 <b>${statusBadge}</b></div>
+      <div>请求来源 <b>${requestSourceTag(record.source)}</b></div>
       <div>首字符时间 <b>${firstByteStr}</b></div>
       <div>响应耗时 <b>${record.durationMs} ms</b></div>
       <div>请求端点 <b>${escapeHtml(record.method)} ${escapeHtml(record.path)}</b></div>
@@ -1678,9 +1679,11 @@ async function loadRequestStats() {
 async function loadRequests() {
   try {
     const status = $('#req-filter-status').value;
+    const source = $('#req-filter-source').value;
     const search = $('#req-search-input').value.trim();
     const params = new URLSearchParams();
     if (status && status !== 'all') params.set('status', status);
+    if (source && source !== 'all') params.set('source', source);
     if (search) params.set('search', search);
     params.set('limit', '100');
 
@@ -1692,10 +1695,22 @@ async function loadRequests() {
   }
 }
 
+/* 请求来源 → 展示标签。
+   测活/预热也会打到上游，混在反代流量里会看不出「这条是谁发的」。 */
+const REQUEST_SOURCE_LABEL = { proxy: '反代', probe: '测活', warmup: '预热' };
+const REQUEST_SOURCE_CLS = { proxy: 'tag', probe: 'tag info', warmup: 'tag warn' };
+
+function requestSourceTag(source) {
+  const key = source || 'proxy';
+  const label = REQUEST_SOURCE_LABEL[key] || key;
+  const cls = REQUEST_SOURCE_CLS[key] || 'tag';
+  return `<span class="${cls}">${escapeHtml(label)}</span>`;
+}
+
 function renderRequestsTable() {
   const tbody = $('#requests-table-body');
   if (!state.requests || state.requests.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无请求记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="muted">暂无请求记录</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -1731,6 +1746,7 @@ function renderRequestsTable() {
     tr.innerHTML = `
       <td class="small muted">${fmtTimeShort(item.timestamp)}</td>
       <td>${statusBadge}</td>
+      <td>${requestSourceTag(item.source)}</td>
       <td><b>${item.durationMs}ms</b></td>
       <td class="small"><code>${escapeHtml(item.method)} ${escapeHtml(item.path)}</code></td>
       <td><span class="tag">${escapeHtml(item.model || '—')}</span></td>
@@ -1757,6 +1773,7 @@ function renderRequestsTable() {
 
 // 筛选监听
 $('#req-filter-status').addEventListener('change', () => loadRequests());
+$('#req-filter-source').addEventListener('change', () => loadRequests());
 $('#req-search-input').addEventListener('input', () => {
   clearTimeout($('#req-search-input')._t);
   $('#req-search-input')._t = setTimeout(() => loadRequests(), 300);

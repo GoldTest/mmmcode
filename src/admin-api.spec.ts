@@ -157,6 +157,45 @@ describe('Admin API: 新增功能路由测试', () => {
     }
   });
 
+  it('GET /admin/api/requests 支持按来源筛选（反代 / 测活 / 预热）', async () => {
+    const ctx = await setupServer();
+    try {
+      ctx.requests.add({
+        id: 'req-proxy',
+        timestamp: Date.now(),
+        method: 'POST',
+        path: '/v1/messages',
+        source: 'proxy',
+        stream: false,
+        status: 200,
+        durationMs: 80,
+      });
+      ctx.requests.add({
+        id: 'req-probe',
+        timestamp: Date.now(),
+        method: 'POST',
+        path: '/v1/messages',
+        source: 'probe',
+        stream: true,
+        status: 200,
+        durationMs: 120,
+      });
+
+      const all = await ctx.req('/admin/api/requests');
+      expect(all.body.total).toBe(2);
+
+      const probeOnly = await ctx.req('/admin/api/requests?source=probe');
+      expect(probeOnly.body.total).toBe(1);
+      expect(probeOnly.body.items[0].id).toBe('req-probe');
+
+      const proxyOnly = await ctx.req('/admin/api/requests?source=proxy');
+      expect(proxyOnly.body.total).toBe(1);
+      expect(proxyOnly.body.items[0].id).toBe('req-proxy');
+    } finally {
+      await ctx.close();
+    }
+  });
+
   it('GET & POST /admin/api/requests-config 更新缓存上限与保留时长', async () => {
     const ctx = await setupServer();
     try {

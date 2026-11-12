@@ -68,7 +68,7 @@ import { MinimaxActivity } from './activity.js';
 import { refreshCreditsForAll } from './credits-refresh.js';
 import { probeAccount, probeAllAccounts, warmupAccount, warmupAllAccounts } from './probe.js';
 import { CredentialError } from './errors.js';
-import type { RequestStore } from './requests.js';
+import type { RequestStore, RequestSource } from './requests.js';
 import type { SchedulerService } from './scheduler.js';
 
 export const SESSION_COOKIE = 'mmcode_session';
@@ -300,7 +300,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const names = Array.isArray(body.names)
           ? body.names.filter((n): n is string => typeof n === 'string' && n.length > 0)
           : undefined;
-        const results = await probeAllAccounts(ctx.pool, { names });
+        const results = await probeAllAccounts(ctx.pool, { names, requests: ctx.requests });
         sendJson(res, 200, { ok: true, results });
         return true;
       }
@@ -311,7 +311,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const names = Array.isArray(body.names)
           ? body.names.filter((n): n is string => typeof n === 'string' && n.length > 0)
           : undefined;
-        const results = await warmupAllAccounts(ctx.pool, { names });
+        const results = await warmupAllAccounts(ctx.pool, { names, requests: ctx.requests });
         sendJson(res, 200, { ok: true, results });
         return true;
       }
@@ -550,7 +550,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         /* 单账号生文测活（ping 首字延迟） */
         if (action === 'probe' && method === 'POST') {
           const found = mustFind(name);
-          const result = await probeAccount(ctx.pool, found);
+          const result = await probeAccount(ctx.pool, found, { requests: ctx.requests });
           const refreshed = ctx.pool.get(name);
           sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed) : null });
           return true;
@@ -559,7 +559,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         /* 单账号无 token 预热 */
         if (action === 'warmup' && method === 'POST') {
           const found = mustFind(name);
-          const result = await warmupAccount(ctx.pool, found);
+          const result = await warmupAccount(ctx.pool, found, { requests: ctx.requests });
           const refreshed = ctx.pool.get(name);
           sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed) : null });
           return true;
@@ -732,6 +732,8 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const model = parsedUrl.searchParams.get('model') || undefined;
         const account = parsedUrl.searchParams.get('account') || undefined;
         const search = parsedUrl.searchParams.get('search') || undefined;
+        /* 来源筛选：proxy（反代）/ probe（测活）/ warmup（预热）。 */
+        const source = parsedUrl.searchParams.get('source') as RequestSource | 'all' | null;
 
         const data = ctx.requests.list({
           since,
@@ -741,6 +743,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           model,
           account,
           search,
+          source: source || undefined,
         });
         sendJson(res, 200, data);
         return true;

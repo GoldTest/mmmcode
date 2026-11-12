@@ -20,6 +20,7 @@ import { DEFAULT_MMCODE_CHAT_PATH, DEFAULT_MMCODE_COUNT_TOKENS_PATH } from './ad
 import { getAgentBase, resolveRegion } from './credential.js';
 import type { AccountRecord, ProbeSnapshot, WarmupSnapshot } from './accounts.js';
 import type { AccountPool, PoolAccount } from './pool.js';
+import type { RequestRecord, RequestStore } from './requests.js';
 
 /** 首字延迟警戒阈值（ms）：超过 20s 标记疑似被限流。 */
 export const PROBE_SUSPECTED_MS = 20_000;
@@ -39,6 +40,14 @@ export interface ProbeOptions {
   pauseMs?: number;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /**
+   * 请求记录存储 —— 传了就把测活/预热写进「请求列表」。
+   *
+   * 为什么需要：测活/预热**真的打到了上游**，排查「上游收到了什么」时看不到它们
+   * 会误判成「上游没收到请求」。用 `source` 标出来，客户端流量与内部健康检查
+   * 在列表里可区分、可筛选。
+   */
+  requests?: RequestStore;
 }
 
 export interface WarmupResult {
@@ -67,6 +76,26 @@ function baseUrlFor(account: PoolAccount, override?: string): string {
 }
 
 /**
+ * 内部请求的 ID —— 测活/预热没有客户端入站请求，用前缀 + 时间戳区分来源。
+ */
+function internalReqId(prefix: 'probe' | 'warmup'): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 把一次内部（测活/预热）请求写进请求列表。
+ *
+ * 记请求失败**绝不能**影响测活/预热本身 —— 这里吞掉所有异常。
+ */
+function recordInternalRequest(requests: RequestStore | undefined, record: RequestRecord): void {
+  try {
+    requests?.add(record);
+  } catch {
+    /* 忽略：请求列表只是观测手段，不该让健康检查因它失败 */
+  }
+}
+
+/**
  * 单账号预热：调用 count_tokens 接口，不占用 token 地让接口返回一次。
  */
 export async function warmupAccount(
@@ -92,9 +121,14 @@ export async function warmupAccount(
     return { account: name, ok: false, durationMs: 0, message: msg };
   }
 
-  const url = `${baseUrlFor(account, opts.baseUrl)}${opts.countTokensPath ?? DEFAULT_MMCODE_COUNT_TOKENS_PATH}`;
+  const countTokensPath = opts.countTokensPath ?? DEFAULT_MMCODE_COUNT_TOKENS_PATH;
+  const base = baseUrlFor(account, opts.baseUrl);
+  const url = `${base}${countTokensPath}`;
   const model = opts.model ?? 'MiniMax-M3';
   const start = Date.now();
+  const reqId = internalReqId('warmup');
+  /* 预热请求体固定，单独留一份好让管理页展示「实际发给上游的请求」。 */
+  const payload = { model, messages: [{ role: 'user', content: 'ping' }] };
 
   try {
     const res = await fetchFn(url, {
@@ -106,10 +140,7 @@ export async function warmupAccount(
         'anthropic-version': '2023-06-01',
         'user-agent': 'MiniMaxCode',
       },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: 'ping' }],
-      }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(opts.timeoutMs ?? WARMUP_TIMEOUT_MS),
     });
 
@@ -129,19 +160,76 @@ export async function warmupAccount(
         patch.healthDetail = msg;
       }
       store.update(name, patch);
+      recordInternalRequest(opts.requests, {
+        id: reqId,
+        timestamp: start,
+        method: 'POST',
+        path: countTokensPath,
+        source: 'warmup',
+        model,
+        stream: false,
+        status: res.status,
+        durationMs,
+        firstByteMs: durationMs,
+        transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+        account: name,
+        input: { model, messages: payload.messages, raw: payload },
+        output: { text: text.slice(0, 200) || undefined },
+        error: msg,
+      });
       return { account: name, ok: false, durationMs, message: msg };
     }
 
-    await res.text().catch(() => '');
+    const bodyText = await res.text().catch(() => '');
     const msg = `预热成功（${durationMs}ms，0 token）`;
     const snap: WarmupSnapshot = { at: Date.now(), durationMs, ok: true, message: msg };
     store.update(name, { lastWarmup: snap });
+    /* count_tokens 不记 usage —— 预热本来就是 0 token，记进去会虚增消耗统计。 */
+    let inputTokens: number | undefined;
+    try {
+      const parsed = JSON.parse(bodyText) as { input_tokens?: unknown };
+      if (typeof parsed.input_tokens === 'number') inputTokens = parsed.input_tokens;
+    } catch {
+      // ignore
+    }
+    recordInternalRequest(opts.requests, {
+      id: reqId,
+      timestamp: start,
+      method: 'POST',
+      path: countTokensPath,
+      source: 'warmup',
+      model,
+      stream: false,
+      status: res.status,
+      durationMs,
+      firstByteMs: durationMs,
+      transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+      account: name,
+      input: { model, messages: payload.messages, raw: payload },
+      output: { text: inputTokens !== undefined ? `input_tokens: ${inputTokens}` : bodyText.slice(0, 200) || undefined },
+    });
     return { account: name, ok: true, durationMs, message: msg };
   } catch (err) {
     const durationMs = Date.now() - start;
     const msg = `预热异常：${(err as Error).message}`;
     const snap: WarmupSnapshot = { at: Date.now(), durationMs, ok: false, message: msg };
     store.update(name, { lastWarmup: snap });
+    recordInternalRequest(opts.requests, {
+      id: reqId,
+      timestamp: start,
+      method: 'POST',
+      path: countTokensPath,
+      source: 'warmup',
+      model,
+      stream: false,
+      /* 没拿到上游响应 —— 用 502 表示「上游不可达」，与反代的错误语义一致。 */
+      status: 502,
+      durationMs,
+      transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+      account: name,
+      input: { model, messages: payload.messages, raw: payload },
+      error: msg,
+    });
     return { account: name, ok: false, durationMs, message: msg };
   }
 }
@@ -219,6 +307,20 @@ export async function probeAccount(
     const msg = `获取令牌失败：${(err as Error).message}`;
     const snap: ProbeSnapshot = { at: Date.now(), ttftMs: 0, status: 'error', message: msg };
     store.update(name, { lastProbe: snap, health: 'unauthorized', healthDetail: msg });
+    /* 请求没发出去，但这次测活尝试本身要留痕 —— 否则列表里「什么都没发生」无从查起。 */
+    recordInternalRequest(opts.requests, {
+      id: internalReqId('probe'),
+      timestamp: Date.now(),
+      method: 'POST',
+      path: opts.chatPath ?? DEFAULT_MMCODE_CHAT_PATH,
+      source: 'probe',
+      model: opts.model ?? 'MiniMax-M3',
+      stream: true,
+      status: 502,
+      durationMs: 0,
+      error: msg,
+      account: name,
+    });
     return {
       account: name,
       ok: false,
@@ -230,11 +332,16 @@ export async function probeAccount(
     };
   }
 
-  const url = `${baseUrlFor(account, opts.baseUrl)}${opts.chatPath ?? DEFAULT_MMCODE_CHAT_PATH}`;
+  const chatPath = opts.chatPath ?? DEFAULT_MMCODE_CHAT_PATH;
+  const base = baseUrlFor(account, opts.baseUrl);
+  const url = `${base}${chatPath}`;
   const model = opts.model ?? 'MiniMax-M3';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const start = Date.now();
+  const reqId = internalReqId('probe');
+  /* 测活请求体固定，单独留一份好让管理页展示「实际发给上游的请求」。 */
+  const payload = { model, messages: [{ role: 'user', content: '1' }], max_tokens: 1, stream: true };
 
   try {
     const res = await fetchFn(url, {
@@ -246,12 +353,7 @@ export async function probeAccount(
         'anthropic-version': '2023-06-01',
         'user-agent': 'MiniMaxCode',
       },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: '1' }],
-        max_tokens: 1,
-        stream: true,
-      }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 
@@ -260,55 +362,58 @@ export async function probeAccount(
       const text = await res.text().catch(() => '');
       const detail = `HTTP ${res.status}${text ? `：${text.slice(0, 120)}` : ''}`;
 
+      /* 三种失败对应的账号状态更新不同，但对外只产出「状态 + 说明」——
+         先算出来，再统一写请求列表，免得三处各记一遍、字段还可能漂移。 */
+      let msg: string;
+      let probeStatus: ProbeSnapshot['status'];
       if (res.status === 429) {
-        const msg = `测活触发 429 限流（${detail}），已标记限流并暂停调度`;
-        const snap: ProbeSnapshot = { at: Date.now(), ttftMs, status: 'suspected', message: msg };
+        msg = `测活触发 429 限流（${detail}），已标记限流并暂停调度`;
+        probeStatus = 'suspected';
         store.update(name, {
-          lastProbe: snap,
           rateLimited: true,
           rateLimitReason: '测活收到上游 429 限流',
           health: 'rate_limited',
           healthDetail: msg,
         });
-        return {
-          account: name,
-          ok: false,
-          status: 'suspected',
-          ttftMs,
-          rateLimited: true,
-          paused: !account.record.enabled,
-          message: msg,
-        };
-      }
-
-      if (res.status === 401 || res.status === 403) {
-        const msg = `测活鉴权失败（${detail}），凭证已失效`;
-        const snap: ProbeSnapshot = { at: Date.now(), ttftMs, status: 'error', message: msg };
+      } else if (res.status === 401 || res.status === 403) {
+        msg = `测活鉴权失败（${detail}），凭证已失效`;
+        probeStatus = 'error';
         store.update(name, {
-          lastProbe: snap,
           health: 'unauthorized',
           healthDetail: msg,
         });
-        return {
-          account: name,
-          ok: false,
-          status: 'error',
-          ttftMs,
-          rateLimited: Boolean(account.record.rateLimited),
-          paused: !account.record.enabled,
-          message: msg,
-        };
+      } else {
+        msg = `测活失败（${detail}）`;
+        probeStatus = 'error';
+        store.update(name, { health: 'error', healthDetail: msg });
       }
+      const snap: ProbeSnapshot = { at: Date.now(), ttftMs, status: probeStatus, message: msg };
+      store.update(name, { lastProbe: snap });
 
-      const msg = `测活失败（${detail}）`;
-      const snap: ProbeSnapshot = { at: Date.now(), ttftMs, status: 'error', message: msg };
-      store.update(name, { lastProbe: snap, health: 'error', healthDetail: msg });
+      recordInternalRequest(opts.requests, {
+        id: reqId,
+        timestamp: start,
+        method: 'POST',
+        path: chatPath,
+        source: 'probe',
+        model,
+        stream: true,
+        status: res.status,
+        durationMs: ttftMs,
+        firstByteMs: ttftMs,
+        transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+        account: name,
+        input: { model, messages: payload.messages, raw: payload },
+        output: { text: text.slice(0, 200) || undefined },
+        error: msg,
+      });
+
       return {
         account: name,
         ok: false,
-        status: 'error',
+        status: probeStatus === 'suspected' ? 'suspected' : 'error',
         ttftMs,
-        rateLimited: Boolean(account.record.rateLimited),
+        rateLimited: res.status === 429 ? true : Boolean(account.record.rateLimited),
         paused: !account.record.enabled,
         message: msg,
       };
@@ -348,16 +453,71 @@ export async function probeAccount(
       ttftMs = Date.now() - start;
     }
 
-    return applyProbeThreshold(pool, account, ttftMs, suspectedMs, pauseMs);
+    const probeResult = applyProbeThreshold(pool, account, ttftMs, suspectedMs, pauseMs);
+    recordInternalRequest(opts.requests, {
+      id: reqId,
+      timestamp: start,
+      method: 'POST',
+      path: chatPath,
+      source: 'probe',
+      model,
+      stream: true,
+      /* paused = 阈值内没等到首字 —— 对上游来说就是超时，记 504 而不是 200。 */
+      status: probeResult.status === 'paused' ? 504 : res.status,
+      durationMs: Date.now() - start,
+      firstByteMs: ttftMs,
+      transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+      account: name,
+      input: { model, messages: payload.messages, raw: payload },
+      /* 测活拿到首字就断流了，没有完整回复 —— 记首字延迟与判定结论更有用。 */
+      output: { text: `首字响应 ${ttftMs}ms · ${probeResult.message}` },
+      error: probeResult.ok ? undefined : probeResult.message,
+    });
+    return probeResult;
   } catch (err) {
     const elapsed = Date.now() - start;
     const isAbort = (err as Error)?.name === 'AbortError' || controller.signal.aborted;
     if (isAbort || elapsed >= pauseMs) {
-      return applyProbeThreshold(pool, account, Math.max(elapsed, pauseMs + 1), suspectedMs, pauseMs);
+      /* 超时/中止：上游没在阈值内吐出首字，按网关超时记。 */
+      const probeResult = applyProbeThreshold(pool, account, Math.max(elapsed, pauseMs + 1), suspectedMs, pauseMs);
+      recordInternalRequest(opts.requests, {
+        id: reqId,
+        timestamp: start,
+        method: 'POST',
+        path: chatPath,
+        source: 'probe',
+        model,
+        stream: true,
+        status: 504,
+        durationMs: elapsed,
+        firstByteMs: null,
+        transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+        account: name,
+        input: { model, messages: payload.messages, raw: payload },
+        output: { text: probeResult.message },
+        error: probeResult.message,
+      });
+      return probeResult;
     }
     const msg = `测活网络异常：${(err as Error).message}`;
     const snap: ProbeSnapshot = { at: Date.now(), ttftMs: elapsed, status: 'error', message: msg };
     store.update(name, { lastProbe: snap, health: 'error', healthDetail: msg });
+    recordInternalRequest(opts.requests, {
+      id: reqId,
+      timestamp: start,
+      method: 'POST',
+      path: chatPath,
+      source: 'probe',
+      model,
+      stream: true,
+      status: 502,
+      durationMs: elapsed,
+      firstByteMs: null,
+      transit: { upstream: base, account: name, protocol: 'anthropic', payload },
+      account: name,
+      input: { model, messages: payload.messages, raw: payload },
+      error: msg,
+    });
     return {
       account: name,
       ok: false,

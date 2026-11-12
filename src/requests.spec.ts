@@ -88,6 +88,28 @@ describe('RequestStore', () => {
     expect(searchList.items[0].id).toBe('req-err');
   });
 
+  it('按来源筛选：反代 / 测活 / 预热可分开看', () => {
+    const store = new RequestStore();
+    store.add({ ...createSample('req-proxy'), source: 'proxy' });
+    store.add({ ...createSample('req-probe'), source: 'probe' });
+    store.add({ ...createSample('req-warmup'), source: 'warmup' });
+
+    expect(store.list({ source: 'proxy' }).items.map((i) => i.id)).toEqual(['req-proxy']);
+    expect(store.list({ source: 'probe' }).items.map((i) => i.id)).toEqual(['req-probe']);
+    expect(store.list({ source: 'warmup' }).items.map((i) => i.id)).toEqual(['req-warmup']);
+    expect(store.list({ source: 'all' }).total).toBe(3);
+  });
+
+  it('老记录没有 source 字段时按反代处理', () => {
+    const store = new RequestStore();
+    const legacy = createSample('req-legacy');
+    delete legacy.source;
+    store.add(legacy);
+
+    expect(store.list({ source: 'proxy' }).total).toBe(1);
+    expect(store.list({ source: 'probe' }).total).toBe(0);
+  });
+
   it('统计指标计算', () => {
     const store = new RequestStore();
     store.add(createSample('req-1', 0, 200));
