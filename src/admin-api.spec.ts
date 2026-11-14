@@ -362,6 +362,7 @@ describe('Admin API: 新增功能路由测试', () => {
       const accounts = await ctx.req('/admin/api/accounts');
       const a1 = accounts.body.accounts.find((a: any) => a.name === 'a1');
       expect(a1.checkinEnabled).toBe(false);
+      expect('lastReward' in a1).toBe(true);
     } finally {
       await ctx.close();
     }

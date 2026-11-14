@@ -29,6 +29,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { AccountPool, PoolAccount } from './pool.js';
+import type { AccountRecord } from './accounts.js';
 import type { MinimaxRegion } from './credential.js';
 import { MinimaxActivity, type SigninResult } from './activity.js';
 import {
@@ -609,9 +610,15 @@ export class SchedulerService {
           () => account.credential?.region ?? account.record.region,
         );
         const result = await activity.checkin();
-        this.pool.getAccountStore().update(account.record.name, {
+        const update: Partial<AccountRecord> = {
           lastCheckin: { at: Date.now(), ...result },
-        });
+        };
+        if (result.outcome === 'claimed' && result.points != null) {
+          update.lastReward = { at: Date.now(), points: result.points };
+        } else if (result.outcome === 'already' && result.points != null && !account.record.lastReward) {
+          update.lastReward = { at: Date.now(), points: result.points };
+        }
+        this.pool.getAccountStore().update(account.record.name, update);
 
         const historyItem: CheckinHistoryItem = {
           at: Date.now(),
@@ -699,9 +706,15 @@ export class SchedulerService {
           () => account.credential?.region ?? account.record.region,
         );
         const result = await activity.checkin();
-        this.pool.getAccountStore().update(account.record.name, {
+        const update: Partial<AccountRecord> = {
           lastCheckin: { at: Date.now(), ...result },
-        });
+        };
+        if (result.outcome === 'claimed' && result.points != null) {
+          update.lastReward = { at: Date.now(), points: result.points };
+        } else if (result.outcome === 'already' && result.points != null && !account.record.lastReward) {
+          update.lastReward = { at: Date.now(), points: result.points };
+        }
+        this.pool.getAccountStore().update(account.record.name, update);
 
         this.checkinHistory.unshift({
           at: Date.now(),

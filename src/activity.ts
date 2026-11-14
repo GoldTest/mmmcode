@@ -166,10 +166,11 @@ export class MinimaxActivity {
       return { outcome: 'error', points: null, streak: null, message: (err as Error).message };
     }
     if (!panel.claimable) {
+      const today = panel.days.find((d) => d.is_today);
       const already = panel.streak !== null;
       return {
         outcome: 'already',
-        points: null,
+        points: today && today.status === 3 ? today.points : null,
         streak: panel.streak,
         message: already ? `今天已签到（连续第 ${panel.streak} 天）` : '今日不可签到（活动未开始或已结束）',
       };

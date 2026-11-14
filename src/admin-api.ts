@@ -56,7 +56,7 @@ import {
   verifyAdminKey,
   SESSION_TTL_SECONDS,
 } from './admin.js';
-import { AccountStore, DEFAULT_ACCOUNT_NAME, resolveAccountDir, type PoolMode } from './accounts.js';
+import { AccountStore, DEFAULT_ACCOUNT_NAME, resolveAccountDir, type AccountRecord, type PoolMode } from './accounts.js';
 import { AccountPool, type PoolAccount } from './pool.js';
 import { maskInboundKey, type KeyRegistry } from './keys.js';
 import type { InsightsLedger } from './insights.js';
@@ -237,6 +237,11 @@ function accountView(a: PoolAccount): Record<string, unknown> {
     disabledUntil: cooling ? a.record.disabledUntil : null,
     lastUsedAt: a.record.lastUsedAt ?? null,
     lastCheckin: a.record.lastCheckin ?? null,
+    lastReward:
+      a.record.lastReward ??
+      (a.record.lastCheckin?.points != null
+        ? { at: a.record.lastCheckin.at, points: a.record.lastCheckin.points }
+        : null),
     lastCredits: a.record.lastCredits ?? null,
     notes: a.record.notes ?? '',
     createdAt: a.record.createdAt,
@@ -576,7 +581,15 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
             () => found.credential?.region ?? found.record.region,
           );
           const result = await activity.checkin();
-          store.update(name, { lastCheckin: { at: Date.now(), ...result } });
+          const update: Partial<AccountRecord> = {
+            lastCheckin: { at: Date.now(), ...result },
+          };
+          if (result.outcome === 'claimed' && result.points != null) {
+            update.lastReward = { at: Date.now(), points: result.points };
+          } else if (result.outcome === 'already' && result.points != null && !found.record.lastReward) {
+            update.lastReward = { at: Date.now(), points: result.points };
+          }
+          store.update(name, update);
           sendJson(res, 200, result);
           return true;
         }

@@ -123,6 +123,32 @@ describe('AccountStore：注册与持久化', () => {
     expect(reloaded.get('a1')?.checkinEnabled).toBe(false);
   });
 
+  it('支持记录与持久化 lastReward（上次签到奖励时间与积分）', () => {
+    const store = new AccountStore();
+    store.upsert('a1', 'cn');
+    const rewardTime = 1700000000000;
+    store.update('a1', {
+      lastCheckin: { at: rewardTime, outcome: 'claimed', points: 400, streak: 3, message: '签到成功' },
+      lastReward: { at: rewardTime, points: 400 },
+    });
+    expect(store.get('a1')?.lastReward).toEqual({ at: rewardTime, points: 400 });
+
+    const reloaded = new AccountStore();
+    expect(reloaded.get('a1')?.lastReward).toEqual({ at: rewardTime, points: 400 });
+  });
+
+  it('旧数据迁移：有 lastCheckin.points 但无 lastReward 时自动归一化', () => {
+    const store = new AccountStore();
+    store.upsert('a1', 'cn');
+    const rewardTime = 1700000000000;
+    store.update('a1', {
+      lastCheckin: { at: rewardTime, outcome: 'claimed', points: 400, streak: 3, message: '签到成功' },
+    });
+
+    const reloaded = new AccountStore();
+    expect(reloaded.get('a1')?.lastReward).toEqual({ at: rewardTime, points: 400 });
+  });
+
   it('update 不存在的账号返回 null', () => {
     const store = new AccountStore();
     expect(store.update('nope', { enabled: false })).toBeNull();

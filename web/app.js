@@ -1119,13 +1119,23 @@ function renderCheckinTable() {
     const checkinOn = a.checkinEnabled !== false;
     const checkinBadge = checkinOn ? '<span class="tag ok">已开启</span>' : '<span class="tag warn">已停用</span>';
 
+    const reward = a.lastReward || (last && last.points != null ? { at: last.at, points: last.points } : null);
+    let rewardHtml = '—';
+    if (reward && reward.points != null) {
+      const pts = reward.points > 0 ? `+${reward.points} 积分` : `${reward.points} 积分`;
+      const timeStr = reward.at ? fmtTime(reward.at) : '';
+      rewardHtml = timeStr
+        ? `<b>${pts}</b><div class="small muted">${timeStr}</div>`
+        : `<b>${pts}</b>`;
+    }
+
     tr.innerHTML = `
       <td><b>${escapeHtml(a.name)}</b></td>
       <td><span class="tag">${escapeHtml(regionTag(a.region))}</span></td>
       <td>${checkinBadge}</td>
       <td>${outcomeBadge}</td>
       <td><b>${last && last.streak != null ? last.streak + ' 天' : '—'}</b></td>
-      <td>${last && last.points != null ? '+' + last.points : '—'}</td>
+      <td>${rewardHtml}</td>
       <td class="small muted">${last && last.at ? fmtTime(last.at) : '—'}</td>
       <td><b>${credits}</b></td>
       <td></td>`;

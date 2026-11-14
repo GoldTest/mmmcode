@@ -53,7 +53,7 @@ import {
   extractAnthropicJsonUsage,
   type StreamUsage,
 } from './protocol/usage.js';
-import { AccountStore, DEFAULT_ACCOUNT_NAME } from './accounts.js';
+import { AccountStore, DEFAULT_ACCOUNT_NAME, type AccountRecord } from './accounts.js';
 import { AccountPool, classifyFailure, type PoolAccount } from './pool.js';
 import { resolveSessionKey, stripSessionFields, type RequestContext } from './session.js';
 import type { InsightsLedger } from './insights.js';
@@ -436,6 +436,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
             disabledUntil: a.record.disabledUntil ?? null,
             lastUsedAt: a.record.lastUsedAt ?? null,
             lastCheckin: a.record.lastCheckin ?? null,
+            lastReward: a.record.lastReward ?? null,
             creditsRemaining: a.record.lastCredits?.remaining ?? null,
             account: a.credential?.account ?? null,
             tokenExpiresAt: a.credential?.expiresAt ?? null,
@@ -526,9 +527,15 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
           const account = pickAccount(args[0]);
           if (!account) throw new CredentialError('没有可用账号 —— 先跑 `mmcode login`');
           const r = await activityFor(account).checkin();
-          pool.getAccountStore().update(account.record.name, {
+          const update: Partial<AccountRecord> = {
             lastCheckin: { at: Date.now(), ...r },
-          });
+          };
+          if (r.outcome === 'claimed' && r.points != null) {
+            update.lastReward = { at: Date.now(), points: r.points };
+          } else if (r.outcome === 'already' && r.points != null && !account.record.lastReward) {
+            update.lastReward = { at: Date.now(), points: r.points };
+          }
+          pool.getAccountStore().update(account.record.name, update);
           return json ? JSON.stringify(r, null, 2) : renderCheckin(r);
         },
       },

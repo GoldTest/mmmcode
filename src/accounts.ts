@@ -47,6 +47,12 @@ export interface CheckinSnapshot {
   message: string;
 }
 
+/** 一次签到奖励快照（获取到奖励的时刻与积分值）。 */
+export interface RewardSnapshot {
+  at: number;
+  points: number;
+}
+
 /** 一次积分查询的快照。 */
 export interface CreditsSnapshot {
   at: number;
@@ -114,6 +120,8 @@ export interface AccountRecord {
   lastUsedAt?: number;
   /** 上次签到结果。 */
   lastCheckin?: CheckinSnapshot;
+  /** 上次获取到的签到奖励（积分 + 获得时间）。 */
+  lastReward?: RewardSnapshot;
   /** 上次积分查询结果。 */
   lastCredits?: CreditsSnapshot;
   /** 限流标记 —— 测活超过 20s（疑似限流）或被限流时置位，该账号不参与调度。 */
@@ -297,6 +305,12 @@ export class AccountStore {
    * 这比按旧粘性顺序排优先级更贴近新模型的本意。
    */
   private normalizeRecord(raw: AccountRecord): AccountRecord {
+    const lastReward =
+      raw.lastReward && typeof raw.lastReward.at === 'number' && typeof raw.lastReward.points === 'number'
+        ? raw.lastReward
+        : raw.lastCheckin?.points != null
+          ? { at: raw.lastCheckin.at, points: raw.lastCheckin.points }
+          : undefined;
     return {
       ...raw,
       checkinEnabled: raw.checkinEnabled !== false,
@@ -305,6 +319,7 @@ export class AccountStore {
       frozenReason: typeof raw.frozenReason === 'string' ? raw.frozenReason : undefined,
       rateLimited: raw.rateLimited === true,
       rateLimitReason: typeof raw.rateLimitReason === 'string' ? raw.rateLimitReason : undefined,
+      ...(lastReward ? { lastReward } : {}),
     };
   }
 

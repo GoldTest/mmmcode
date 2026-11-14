@@ -40,6 +40,7 @@ describe('MinimaxActivity.checkin', () => {
     const r = await new MinimaxActivity(async () => 'tok').checkin();
     expect(r.outcome).toBe('already');
     expect(r.streak).toBe(3);
+    expect(r.points).toBe(400);
     expect(calls).toBe(1); // 只查了面板
   });
 
