@@ -277,6 +277,11 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
       }
 
       const account = acquired.account;
+      /* 首次选中时记录 session 绑定结果，方便排查「同一对话换号」的问题。 */
+      if (attempt === 0) {
+        const sk = sessionKey.length > 24 ? `${sessionKey.slice(0, 24)}…` : sessionKey;
+        log(`[调度] ${sk} → [${account.record.name}]${acquired.slid ? '（滑动）' : ''}`);
+      }
       if (tried.has(account.record.name)) {
         break;
       }

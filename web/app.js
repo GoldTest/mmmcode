@@ -1997,7 +1997,7 @@ function renderSystemInfo() {
   const c = state.config || {};
   const kv = $('#system-info-kv');
   kv.innerHTML = `
-    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.7.7')}</b></dd>
+    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.7.8')}</b></dd>
     <dt>管理密钥文件</dt><dd><code>${escapeHtml(c.adminKeyPath || '—')}</code></dd>
     <dt>反代入站密钥</dt><dd><code>${escapeHtml(c.apiKeyMasked || '—')}</code></dd>
     <dt>账号池状态</dt><dd>已注册 ${c.accounts || 0} 个账号，可用 ${c.available || 0} 个</dd>`;

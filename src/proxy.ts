@@ -433,6 +433,54 @@ export function createProxyHandler(
       anthropicBeta: headerStr(req.headers['anthropic-beta']),
     };
 
+    /* ── 临时诊断：打印入站请求中所有 session 相关字段 ── */
+    {
+      const diagHeaders: Record<string, string | undefined> = {};
+      for (const h of [
+        'x-mavis-session-id',
+        'mavis-session-id',
+        'x-session-id',
+        'x-session',
+        'session-id',
+        'sessionid',
+        'x-conversation-id',
+        'x-chat-id',
+      ]) {
+        const v = req.headers[h];
+        if (v) diagHeaders[h] = Array.isArray(v) ? v[0] : v;
+      }
+      const bodyFields: Record<string, unknown> = {};
+      for (const f of [
+        'session_id',
+        'sessionId',
+        'sessionid',
+        'mavis_session_id',
+        'mavisSessionId',
+        'conversation_id',
+        'chat_id',
+      ]) {
+        if (parsed[f] !== undefined) bodyFields[f] = parsed[f];
+      }
+      const meta = parsed['metadata'];
+      const metaInfo: Record<string, unknown> = {};
+      if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+        const m = meta as Record<string, unknown>;
+        if (m['session_id'] !== undefined) metaInfo['metadata.session_id'] = m['session_id'];
+        if (m['sessionId'] !== undefined) metaInfo['metadata.sessionId'] = m['sessionId'];
+        if (m['sessionid'] !== undefined) metaInfo['metadata.sessionid'] = m['sessionid'];
+        if (m['mavis_session_id'] !== undefined) metaInfo['metadata.mavis_session_id'] = m['mavis_session_id'];
+        if (m['user_id'] !== undefined) metaInfo['metadata.user_id'] = m['user_id'];
+      }
+      log(
+        `[session诊断] reqId=${reqId} ` +
+        `explicitSessionId=${ctx.sessionId ?? '(无)'} ` +
+        `headers=${JSON.stringify(diagHeaders)} ` +
+        `bodyFields=${JSON.stringify(bodyFields)} ` +
+        `metadata=${JSON.stringify(metaInfo)}`,
+      );
+    }
+    /* ── 诊断结束 ── */
+
     if (verbose) {
       log(
         `[请求] ${adapter.command} ${path} model=${modelName} messages=${parsed.messages.length} 流=${wantsStream}`,

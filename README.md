@@ -69,7 +69,7 @@ mmcode
 ```
 
 ```
-途关 · MiniMax Code 反代 v0.7.7
+途关 · MiniMax Code 反代 v0.7.8
 
 凭证    ✓ access 有效约 187 分钟（账号 01a0d156…）
 上游    https://agent.minimax.cn  (Anthropic 原生透传)
@@ -250,7 +250,7 @@ MiniMax 的国内站与海外站是**两套独立服务**，账号也分属两�
 「同一 session 的请求永远待在同一个账号上」—— 不仅多轮对话不切换账号以保住上游提示词缓存，
 **新会话开始前先发起的 `POST /v1/messages/count_tokens` 也会与随后的 `POST /v1/messages` 绑定到同一个账号**，确保同一会话全程一对一落在同一账号上。session 的识别：
 
-- 客户端显式给 `x-session-id` / `x-session` / `x-conversation-id` / `x-chat-id` 头、body 的 `session_id` / `metadata.session_id`，或 Claude Code `metadata.user_id` 中的 `__session_<id>` → **优先采用**；
+- 客户端显式给 `x-mavis-session-id`（mcode CLI 原生头）/ `x-session-id` / `x-session` / `x-conversation-id` / `x-chat-id` 头、body 的 `session_id` / `sessionId` / `sessionid` / `metadata.session_id`，或 Claude Code `metadata.user_id` 中的 `__session_<id>` → **优先采用**；
 - 没有则按「入站密钥 + 模型 + 首条用户消息」哈希推导（`count_tokens` 与对话首轮及后续重发历史的首条用户消息与模型一致，因而命中同一 `sessionKey`）。
 
 | 模式 | 行为 |
@@ -301,7 +301,7 @@ cat ~/.waygate/mmcode/admin.json
 要**固定版本**部署，把 `docker-compose.yml` 里的 `image` 改成具体版本标签：
 
 ```yaml
-image: ghcr.io/goldtest/mmmcode:0.7.7
+image: ghcr.io/goldtest/mmmcode:0.7.8
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。
