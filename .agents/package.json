@@ -1,0 +1,9 @@
+{
+  "name": "mmmcode-agents",
+  "private": true,
+  "type": "module",
+  "description": "本目录存放本地 AI 技能包。playwright 装在这里而非项目根，避免给 waygate-mmcode 的生产依赖清单引入与业务无关的重量级依赖。",
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

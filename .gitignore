@@ -19,3 +19,9 @@ dist/
 coverage/
 .vitest/
 *.tsbuildinfo
+
+# 本地 AI 技能包的临时区
+# —— 不入库：.agents/_tmp/ 是抓取技能时克隆的第三方仓库（1.6MB 起步），
+#    随下载更新即可，保留它只会污染 git diff。
+#    注意：.agents/skills/ 下的技能本体是要入库的，它是项目资产。
+.agents/_tmp/
