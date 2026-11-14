@@ -18,7 +18,7 @@
  *   POST   /admin/api/accounts/reorder   { order: [name, ...] } → 调整账号展示顺序
  *   POST   /admin/api/accounts/probe     { names? } → 批量生文测活（测首字延迟、疑似限流标记、超时暂停）
  *   POST   /admin/api/accounts/warmup    { names? } → 批量无 token 预热（count_tokens）
- *   PATCH  /admin/api/accounts/:name     { enabled?, checkinEnabled?, notes?, region?, priority?, rateLimited? }
+ *   PATCH  /admin/api/accounts/:name     { enabled?, checkinEnabled?, notes?, region?, priority?, frozen?, rateLimited? }
  *   DELETE /admin/api/accounts/:name     删除账号（含令牌文件）
  *   POST   /admin/api/accounts/:name/login    发起设备授权 → 返回短码与链接
  *   GET    /admin/api/accounts/:name/login    查授权进度（非阻塞单次轮询）
@@ -28,17 +28,30 @@
  *   GET    /admin/api/accounts/:name/doctor   单账号体检
  *   POST   /admin/api/accounts/:name/probe    单账号生文测活
  *   POST   /admin/api/accounts/:name/warmup   单账号无 token 预热
- *   GET    /admin/api/config              总体配置（调度模式/优先级分层/额度阈值/入站密钥打码）
- *   POST   /admin/api/config              { mode?, creditsThreshold? }
- *   GET    /admin/api/scheduler            调度器状态（自动签到/自动刷新/额度巡检）
- *   POST   /admin/api/scheduler/config     { autoCheckin?: { enabled?, time?, jitterMinutes?, intervalMinutes? } }
- *   POST   /admin/api/scheduler/checkin-all  立即全员签到（手动，不受时间窗口限制）
- *   POST   /admin/api/scheduler/refresh-all  立即全员刷新令牌（{ force? }）
- *   GET    /admin/api/insights             用量洞察：各账号 token 消耗（输入/输出/缓存命中）
+ *   GET    /admin/api/keys              客户端入站密钥清单（脱敏）
+ *   POST   /admin/api/keys              { name?, purpose?, expiresAt? } → 新建密钥（明文仅本次返回）
+ *   PATCH  /admin/api/keys/:id          { name?, enabled?, purpose?, expiresAt? } → 改元信息/启停
+ *   POST   /admin/api/keys/:id/rotate   轮换密钥本体（保留名字与元信息）
+ *   DELETE /admin/api/keys/:id          吊销密钥
+ *   GET    /admin/api/config             总体配置（调度模式/优先级分层/额度阈值/入站密钥打码）
+ *   POST   /admin/api/config             { mode?, creditsThreshold? }
+ *   POST   /admin/api/admin-key          { newKey } → 改管理密钥（改完所有旧会话失效）
+ *   GET    /admin/api/proxy               反代运行状态
+ *   POST   /admin/api/proxy/reset-cooldown  { name? } → 解除冷却（不带 name = 全员）
+ *   GET    /admin/api/proxy/models        拉取上游模型列表
+ *   POST   /admin/api/proxy/test          { model?, prompt? } → 在线调试
+ *   GET    /admin/api/requests            请求日志列表（?source/status/model/account/search + 分页）
+ *   GET    /admin/api/requests/:id        单条请求详情
+ *   DELETE /admin/api/requests            清空请求日志
+ *   GET    /admin/api/requests-stats      请求统计（条数/成功率/平均耗时/内存占用）
+ *   POST   /admin/api/requests-config     { maxItems?, retentionMs? } → 调整留存与缓存上限
+ *   GET    /admin/api/insights            用量洞察：各账号 token 消耗（输入/输出/缓存命中）
  *   POST   /admin/api/insights/reset      { name? } → 清空统计（不带 name = 全清）
  *   POST   /admin/api/credits/refresh     立即刷新各账号余额（按阈值冻结/解冻）
- *   POST   /admin/api/admin-key           { currentKey, newKey } → 改管理密钥
- *   GET    /admin/api/proxy                反代运行状态
+ *   GET    /admin/api/scheduler           调度器状态（自动签到/自动刷新/额度巡检）
+ *   POST   /admin/api/scheduler/config    { autoCheckin?: { enabled?, cn?, global?, intervalMinutes? } }
+ *   POST   /admin/api/scheduler/checkin-all  立即全员签到（手动，不受时间窗口限制）
+ *   POST   /admin/api/scheduler/refresh-all  立即全员刷新令牌（{ force? }）
  */
 
 import { existsSync, rmSync } from 'node:fs';
@@ -458,7 +471,8 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
       }
 
       /* ── 单账号操作 ── */
-      const accountMatch = /^accounts\/([^/]+)(?:\/(.+))?$/.exec(route);      if (accountMatch) {
+      const accountMatch = /^accounts\/([^/]+)(?:\/(.+))?$/.exec(route);
+      if (accountMatch) {
         const name = decodeURIComponent(accountMatch[1] ?? '');
         const action = accountMatch[2] ?? '';
 

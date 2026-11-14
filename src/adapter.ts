@@ -12,7 +12,7 @@
  * ## 多账号与调度（本文件的核心）
  * MiniMax **同一账号只能有一个有效会话** —— 上游 401 通常意味着「这个号在别处登过」，
  * 光重试没用。所以反代必须**手上有多个号**：
- *   · `AccountPool` 负责选号（**按优先级分层 + 同层随机 + 额度冻结**）；
+ *   · `AccountPool` 负责选号（**按优先级分层 + 同层加权随机 + 额度冻结**）；
  *   · 本文件的 `messages()` 与 `countTokens()` 共用同一套 **session 选号 + 失败重试** 逻辑：
  *     同一会话先调 `count_tokens` 再调 `messages` 会命中同一个 `sessionKey` 并一对一绑定
  *     同一个账号；遇到 401/403/429 时受调度模式约束自动换号或拒绝迁移；
@@ -464,7 +464,7 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
             '',
             `模式：${modeTag}（可用 ${pool.available().length}/${list.length}）  最小可用积分：${pool.getAccountStore().creditsThreshold()}`,
           );
-          lines.push('优先级数字越小越优先；同层账号随机分配。');
+          lines.push('优先级数字越小越优先；同层账号按剩余积分加权随机。');
           return lines.join('\n');
         },
       },

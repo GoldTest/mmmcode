@@ -2,7 +2,7 @@
 
 给 AI 编码助手（及本仓库贡献者）的**工作约定**。
 
-本项目是 MiniMax Code 的本地反代 + 多账号管理服务：协议翻译、凭证生命周期、
+本项目是 MiniMax Code 的本地反代 + 多账号管理服务：原生 Anthropic 透传、凭证生命周期、
 自动换号调度、Web 管理页。改动会直接影响 SSE 帧形状、换号逻辑与凭证安全，
 请按下面的约定行事。
 
@@ -38,13 +38,13 @@ tag 才会发布正式镜像。
 ### 标准发布流程
 
 ```bash
-# 1. 改 package.json 的 version，与 tag 对齐（v0.5.3 ↔ "version": "0.5.3"）
+# 1. 改 package.json 的 version，与 tag 对齐（v0.7.5 ↔ "version": "0.7.5"）
 # 2. 提交并推送 main
 git add -A && git commit -m "..." && git push origin main
 
 # 3. 打 tag 并推送 —— 这一步才会真正发布镜像
-git tag -a v0.5.3 -m "v0.5.3"
-git push origin v0.5.3
+git tag -a v0.7.5 -m "v0.7.5"
+git push origin v0.7.5
 ```
 
 推送 tag 后，`.github/workflows/docker.yml` 自动完成：
@@ -53,21 +53,24 @@ git push origin v0.5.3
 产出的镜像标签：
 
 ```
-ghcr.io/goldtest/mmmcode:0.5.3        ← 正式版（由 tag 触发）
+ghcr.io/goldtest/mmmcode:0.7.5        ← 正式版（由 tag 触发）
 ghcr.io/goldtest/mmmcode:latest       ← 指向最新正式版
 ghcr.io/goldtest/mmmcode:main-<sha>   ← 推 main 时的临时构建
 ```
 
 ### 部署方式（用户的实际用法）
 
-用户**通过镜像部署**，不通过 npm 安装：
+用户**主要通过镜像部署**：
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
 `docker-compose.yml` 默认使用 `ghcr.io/goldtest/mmmcode:latest`。
-要固定版本就把 `image` 改成具体版本标签（如 `ghcr.io/goldtest/mmmcode:0.5.3`）。
+要固定版本就把 `image` 改成具体版本标签（如 `ghcr.io/goldtest/mmmcode:0.7.5`）。
+
+> npm 包（`waygate-mmcode`）同步发布，但**改动镜像行为时不要只发 npm** ——
+> 用户跑的是镜像，tag 才是镜像的发布开关。
 
 ### 推 tag 前的检查清单
 
@@ -111,9 +114,9 @@ docker compose pull && docker compose up -d
 - **先读再改**：改动前读周边代码，沿用既有风格与注释密度（本仓库注释偏多，
   解释的是「为什么」而非「做了什么」）。
 - **改动要配测试**：`src/*.spec.ts` 是回归网。新增功能必须补测试，
-  尤其是账号池、凭证、协议翻译这几个核心模块。
+  尤其是账号池、凭证、用量台账这几个核心模块。
 - **别改调度语义**：调度模型是「优先级分层 + 额度冻结 + session 绑定」，
-  同层账号**随机分配**。展示顺序（如账号卡片排序）**不等于**调度优先级，
+  同层账号**按剩余积分加权随机**。展示顺序（如账号卡片排序）**不等于**调度优先级，
   不要把两者混为一谈。
 - **网页端是原生 JS**：`web/` 下无构建步骤、无框架。保持同样的风格，
   不要引入构建工具或依赖。
@@ -131,13 +134,8 @@ docker compose pull && docker compose up -d
 
 ## 验证清单
 
-提交前跑完这三项，CI 也会跑同样的三道关：
-
-```bash
-npm run typecheck
-npm test
-npm run build
-```
+提交前跑完「仓库概览」里的三条命令（`typecheck` / `test` / `build`），
+CI 也会跑同样的三道关。
 
 改动 `web/` 时额外确认：管理页能正常加载、账号卡片能渲染、
 登录/授权流程能走通（改前端逻辑容易漏掉边界情况）。

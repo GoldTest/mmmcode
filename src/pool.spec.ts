@@ -3,7 +3,7 @@
  *
  * 守五件事：
  *   ① **优先级分层**：新 session 落在最高可用层；高层全不可用了才下沉；
- *   ② **同层随机**：同层之内没有先后顺序；
+ *   ② **同层加权随机**：同层之内没有先后顺序，按剩余积分加权；
  *   ③ **额度冻结**：余额低于阈值的账号不参与调度，余额恢复即解冻；
  *   ④ **session 绑定**：同一 session 拿回同一账号（保住上游缓存）；
  *   ⑤ **两种模式**：最大缓存模式下绑定账号不可用 ⇒ 不迁移；平衡模式 ⇒ 无缝滑动。
@@ -111,7 +111,7 @@ describe('优先级分层', () => {
     if (result.ok) expect(result.account.record.name).toBe('low');
   });
 
-  it('同层之内随机分配（不会固定落在同一个号上）', () => {
+  it('同层之内加权随机分配（不会固定落在同一个号上）', () => {
     const store = new AccountStore();
     seedWithPriority(store, 'a1', 0);
     seedWithPriority(store, 'a2', 0);

@@ -24,9 +24,10 @@
  * 同一个对话的连续几轮如果落在不同账号上，上游的提示词缓存就废了（缓存按账号隔离），
  * 每轮都要重新吃一遍全量 prompt —— 又慢又烧额度。session 绑定就是为了保住这份缓存。
  *
- * ## 为什么「同层随机」而不是轮询
+ * ## 为什么「同层加权随机」而不是轮询
  * 轮询会让**第 N 个会话固定落在第 N 个号**上 —— 看着均匀，实际上把某个号的
- * 缓存优势全占了。随机分配让每个号的缓存命中率大致均衡，符合「同层无先后」的直觉。
+ * 缓存优势全占了。随机分配让每个号的缓存命中率大致均衡，符合「同层无先后」的直觉；
+ * 再按剩余积分加权，额度充裕的号多接一些新会话，额度紧张的号少接。
  *
  * ## 冷却是「持久」的
  * 冷却截止时间写在 `accounts.json` 里 —— 服务重启后依然记得「这个号刚被顶掉」，
@@ -111,8 +112,9 @@ export type AcquireResult =
  * 一次请求的用量快照。
  *
  * 由**适配器**记录（它能看到上游原始 usage），供反代层写请求日志 ——
- * 因为 Anthropic 路线经 core 重编码成 Anthropic 事件帧时，缓存字段会被丢掉，
- * 只有适配器那一层才拿得到权威值。
+ * 只有适配器那一层才拿得到权威值：原生 Anthropic 透传下，上游回报的
+ * `cache_read_input_tokens` / `cache_creation_input_tokens` 必须就地摘取，
+ * 一旦转手就会被丢掉。
  */
 export interface RequestUsage {
   promptTokens: number;
@@ -127,7 +129,7 @@ export class AccountPool {
   private readonly log: (line: string) => void;
   private readonly managers = new Map<string, MinimaxTokenManager>();
 
-  /** session key → 账号名。**进程内**即可 —— 重启后缓存绑定丢失，重新随机分配。 */
+  /** session key → 账号名。**进程内**即可 —— 重启后缓存绑定丢失，重新加权随机分配。 */
   private readonly bindings = new Map<string, string>();
   /** 反代请求 id → 实际使用的账号（给请求日志/洞察面板对账用）。 */
   private readonly requestAccounts = new Map<string, string>();
@@ -313,7 +315,7 @@ export class AccountPool {
    *   ① session 已绑定 → 绑定账号仍可用就用它；
    *      · `max-cache`：账号不可用就**不迁移**，返回 `pinned` 错误（保住缓存语义）；
    *      · `balanced`：账号不可用 → **滑动**到别的可用账号并更新绑定。
-   *   ② session 未绑定（新会话）→ 取**最高可用层**，层内随机分配，并建立绑定。
+   *   ② session 未绑定（新会话）→ 取**最高可用层**，层内按剩余积分加权随机分配，并建立绑定。
    */
   acquireForSession(sessionKey: string | null): AcquireResult {
     if (sessionKey) {

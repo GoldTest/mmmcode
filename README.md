@@ -69,7 +69,7 @@ mmcode
 ```
 
 ```
-途关 · MiniMax Code 反代 v0.6.0
+途关 · MiniMax Code 反代 v0.7.5
 
 凭证    ✓ access 有效约 187 分钟（账号 01a0d156…）
 上游    https://agent.minimax.cn  (Anthropic 原生透传)
@@ -175,7 +175,7 @@ $ mmcode keys revoke <id>
 | 启用 / 停用 | 停用的账号保留配置，但不参与调度 |
 | 删除账号 | 连同令牌文件一起清掉 |
 | 调度模式 | 「最大缓存（会话不迁移）」或「平衡（额度耗尽可滑动）」 |
-| 优先级分层 | 给账号设优先级层（数字越小越优先），同层随机分配 |
+| 优先级分层 | 给账号设优先级层（数字越小越优先），同层按剩余积分加权随机 |
 | 额度阈值 | 余额低于多少积分就**冻结**该账号（不再参与调度） |
 | **用量洞察** | 各账号的 token 消耗（输入 / 输出 / 缓存命中 / **缓存命中率**）、按模型与按天拆分 |
 | **请求详情** | 横向三栏：**请求**（入站内容）/ **中转**（上游地址 + 实际发往上游的 Anthropic 请求）/ **输出**（回复 + 输出详情 + 首字符时间） |
@@ -265,7 +265,7 @@ MiniMax 的国内站与海外站是**两套独立服务**，账号也分属两�
 3. **5xx / 网络抖动不换号** —— 那是上游整体的问题，换号只会把所有号都标记成坏。
 
 > **v1 → v2 迁移**：旧的「粘性当前账号 + 轮询策略」两个概念整体消失，
-> `accounts.json` 自动升到 v2（账号继承同一优先级 = 同层随机分配），无需手工处理。
+> `accounts.json` 自动升到 v2（账号继承同一优先级 = 同层加权随机分配），无需手工处理。
 
 ## Docker 部署
 
@@ -301,7 +301,7 @@ cat ~/.waygate/mmcode/admin.json
 要**固定版本**部署，把 `docker-compose.yml` 里的 `image` 改成具体版本标签：
 
 ```yaml
-image: ghcr.io/goldtest/mmmcode:0.6.0
+image: ghcr.io/goldtest/mmmcode:0.7.5
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。
@@ -411,7 +411,7 @@ MiniMax Code 账号池
  ✓ zhanghx101  [海外] 优先级 0  已登录  健康:healthy 冷却至 2026/11/8 3:05:00 ❄冻结（上游 429：quota exceeded）
 
 模式：最大缓存模式（可用 3/4）  最小可用积分：100
-优先级数字越小越优先；同层账号随机分配。
+优先级数字越小越优先；同层账号按剩余积分加权随机。
 ```
 
 **签到与积分**（MiniMax Code 专属）：
@@ -484,7 +484,7 @@ export CLAUDE_CODE_USE_BEDROCK="false"
 - **令牌生命周期**：access token（`mmoat_`）寿命短（约 1–4 小时），到期前 2 分钟自动刷新；refresh token（`mmort_`）刷新后会被上游**轮换**，本工具自动写回本地。
 - **模型清单**：上游的清单端点是 `/mavis/api/v1/models`（**无需鉴权**即可读）—— 本工具**真拉取**，失败时回落内置清单（4 个模型）。
 - **多账号**：每个账号一套独立令牌（`accounts/<name>/mmcode/`）+ 一条运营状态（`accounts.json`）。
-  `AccountPool` 负责选号（**优先级分层 + 同层随机 + 额度冻结 + session 1:1 绑定**），
+  `AccountPool` 负责选号（**优先级分层 + 同层加权随机 + 额度冻结 + session 1:1 绑定**），
   **冷却与冻结状态落盘**，重启不丢。
 - **用量洞察**：适配器从原生 Anthropic 响应（JSON 与 SSE `message_start` / `message_delta`）里摘出权威 usage（含 `cache_read_input_tokens` / `cache_creation_input_tokens`）记进 `insights.json` —— 各账号的
   token 消耗（输入 / 输出 / 缓存命中）按模型、按天拆分，并给出**缓存命中率**

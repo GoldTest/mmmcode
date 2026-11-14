@@ -86,7 +86,7 @@ describe('AccountStore：注册与持久化', () => {
     );
 
     const store = new AccountStore();
-    /* 旧的两个概念整体消失；账号继承同一优先级（同层随机分配）。 */
+    /* 旧的两个概念整体消失；账号继承同一优先级（同层加权随机分配）。 */
     expect(store.mode()).toBe('max-cache');
     expect(store.list().map((a) => a.priority)).toEqual([0, 0]);
     expect(store.get('old')?.region).toBe('cn');

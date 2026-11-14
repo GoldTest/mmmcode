@@ -96,7 +96,7 @@ export interface AccountRecord {
    * 优先级层 —— **数字越小越优先**（0 = 最高层）。
    *
    * 新 session 只在「最高层里还有可用账号」时分配到那一层；该层全被冻结 / 冷却
-   * 了才下沉到下一层。**同层之内没有先后顺序** —— 可用账号之间随机分配。
+   * 了才下沉到下一层。**同层之内没有先后顺序** —— 可用账号之间按剩余积分加权随机。
    */
   priority: number;
   /**
@@ -301,7 +301,7 @@ export class AccountStore {
    * v1 → v2 的迁移要点：v1 有 `active`（粘性当前账号）与 `strategy`
    * （sticky / round-robin）—— 这两个概念在新模型里**整体消失**
    * （「没有当前账号概念，只有优先级概念」）。迁移时把它们**丢弃**，
-   * 原有账号一律继承同一优先级（0），即「同层随机分配」——
+   * 原有账号一律继承同一优先级（0），即「同层加权随机分配」——
    * 这比按旧粘性顺序排优先级更贴近新模型的本意。
    */
   private normalizeRecord(raw: AccountRecord): AccountRecord {
