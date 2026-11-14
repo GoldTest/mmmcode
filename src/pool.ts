@@ -7,7 +7,9 @@
  *
  *   · **优先级**（`priority`，数字越小越优先）：账号分层。新 session 分配到
  *     「**最高层里还有可用账号**」的那一层；该层全不可用了才下沉到下一层。
- *     **同一层之内没有先后顺序** —— 可用账号之间**随机分配**。
+ *     **同一层之内按剩余积分加权随机** —— 高积分的账号获得更高的随机分配概率；
+ *     若积分未获取或一致，则退化为等概率均匀随机。
+ *     ⚠️ 这一加权只作用于新会话分配（或滑动选新号），**绝不破坏已有 session 的绑定粘性**。
  *   · **额度**（`creditsThreshold` + `frozen`）：余额低于阈值的账号被**冻结**，
  *     不参与调度；上游回 429 也立即视为额度耗尽。
  *
@@ -248,11 +250,60 @@ export class AccountPool {
       .map(([, list]) => list);
   }
 
-  /** 随机从最高层里挑一个账号（层内无先后顺序 ⇒ 随机）。 */
+  /**
+   * 计算账号在候选随机中的权重。
+   *
+   * 权重以剩余积分 `remaining` 为核心：
+   * 1. 积分高于阈值的可用账号：以剩余积分为权重（保留到正整数，至少为 1）；
+   * 2. 若账号刚添加或未拉取过账本（`remaining` 缺失）：以系统设定的 `creditsThreshold`
+   *    或 1 作为保底基线权重，避免因未拉取积分被直接饿死；
+   * 3. 保证权重始终为正数，杜绝除以 0、NaN 或负权重异常。
+   */
+  private accountWeight(account: PoolAccount): number {
+    const remaining = account.record.lastCredits?.remaining;
+    if (typeof remaining === 'number' && Number.isFinite(remaining)) {
+      return Math.max(1, Math.round(remaining));
+    }
+    const threshold = this.store.creditsThreshold();
+    return Math.max(1, Math.round(Number.isFinite(threshold) ? threshold : 1));
+  }
+
+  /**
+   * 从同优先级的候选列表里加权随机挑一个账号。
+   *
+   * 为什么加权随机：
+   * 同优先级层内，积分更充裕的账号承接更多新会话，额度较低的账号承接更少，
+   * 既保护高额度号的充裕调用，又避免低额度号过早被耗空；
+   * 当所有账号积分一致或未拉取时，平滑退化为等概率均匀随机。
+   *
+   * ★ 绝不影响 session 绑定：
+   * 已绑定的活跃会话直接返回原账号，只有新会话（或故障滑动）才走加权选号。
+   */
   private pickRandom(list: PoolAccount[]): PoolAccount | null {
     if (list.length === 0) return null;
-    const idx = Math.floor(Math.random() * list.length);
-    return list[idx] ?? null;
+    if (list.length === 1) return list[0] ?? null;
+
+    let totalWeight = 0;
+    const weights: number[] = [];
+    for (const a of list) {
+      const w = this.accountWeight(a);
+      weights.push(w);
+      totalWeight += w;
+    }
+
+    if (totalWeight <= 0 || !Number.isFinite(totalWeight)) {
+      const idx = Math.floor(Math.random() * list.length);
+      return list[idx] ?? null;
+    }
+
+    let rnd = Math.random() * totalWeight;
+    for (let i = 0; i < list.length; i++) {
+      rnd -= weights[i] ?? 0;
+      if (rnd < 0) {
+        return list[i] ?? null;
+      }
+    }
+    return list[list.length - 1] ?? null;
   }
 
   /**

@@ -125,6 +125,79 @@ describe('优先级分层', () => {
     }
     expect(picked.size).toBeGreaterThan(1);
   });
+
+  it('★ 同优先级下，高积分账号在新 session 分配时获得显著更高的被抽中概率', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a_rich', 0);
+    seedWithPriority(store, 'a_poor', 0);
+    store.setCreditsThreshold(100);
+
+    // a_rich 剩余 90,000 积分，a_poor 剩余 10,000 积分
+    store.update('a_rich', {
+      lastCredits: {
+        at: Date.now(),
+        granted: 100000,
+        remaining: 90000,
+        consumed: 10000,
+        nextExpireAt: null,
+      },
+    });
+    store.update('a_poor', {
+      lastCredits: {
+        at: Date.now(),
+        granted: 20000,
+        remaining: 10000,
+        consumed: 10000,
+        nextExpireAt: null,
+      },
+    });
+
+    const pool = new AccountPool(store);
+    const counts: Record<string, number> = { a_rich: 0, a_poor: 0 };
+    const TOTAL_SAMPLES = 300;
+
+    for (let i = 0; i < TOTAL_SAMPLES; i += 1) {
+      const r = pool.acquireForSession(`new-session-${i}`);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        counts[r.account.record.name] = (counts[r.account.record.name] ?? 0) + 1;
+      }
+    }
+
+    // 理论比例 9:1 (90% vs 10%)。高积分账号抽中次数应压倒性多于低积分账号
+    expect(counts['a_rich']).toBeGreaterThan(counts['a_poor'] * 3);
+    // 同时低积分账号也获得了保底被抽中机会（不饥饿）
+    expect(counts['a_poor']).toBeGreaterThan(0);
+  });
+
+  it('★ 会话绑定（Session Affinity）严格不受加权随机影响', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a_rich', 0);
+    seedWithPriority(store, 'a_poor', 0);
+    store.update('a_rich', {
+      lastCredits: { at: Date.now(), granted: 100000, remaining: 90000, consumed: 10000, nextExpireAt: null },
+    });
+    store.update('a_poor', {
+      lastCredits: { at: Date.now(), granted: 20000, remaining: 10000, consumed: 10000, nextExpireAt: null },
+    });
+
+    const pool = new AccountPool(store);
+
+    // 假设某个 session 先被绑定到 a_poor
+    const res1 = pool.acquireForSession('sticky-session');
+    expect(res1.ok).toBe(true);
+    const initialAccount = res1.ok ? res1.account.record.name : '';
+
+    // 后续对同一个 session 发起 50 次请求，哪怕 a_rich 积分极高，也绝不重新按加权分配，100% 锁定原账号
+    for (let i = 0; i < 50; i += 1) {
+      const res = pool.acquireForSession('sticky-session');
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.account.record.name).toBe(initialAccount);
+        expect(res.slid).toBe(false);
+      }
+    }
+  });
 });
 
 describe('额度冻结', () => {
