@@ -69,7 +69,7 @@ mmcode
 ```
 
 ```
-途关 · MiniMax Code 反代 v0.7.5
+途关 · MiniMax Code 反代 v0.7.6
 
 凭证    ✓ access 有效约 187 分钟（账号 01a0d156…）
 上游    https://agent.minimax.cn  (Anthropic 原生透传)
@@ -301,7 +301,7 @@ cat ~/.waygate/mmcode/admin.json
 要**固定版本**部署，把 `docker-compose.yml` 里的 `image` 改成具体版本标签：
 
 ```yaml
-image: ghcr.io/goldtest/mmmcode:0.7.5
+image: ghcr.io/goldtest/mmmcode:0.7.6
 ```
 
 - **一个端口**（8789）：反代、管理页、管理 API 全在里面。
