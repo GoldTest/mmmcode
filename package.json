@@ -1,6 +1,6 @@
 {
   "name": "waygate-mmcode",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "MiniMax Code 本地反代：官方 OAuth 设备授权登录，提供原生 Anthropic 兼容端点（/v1/messages 与 /v1/messages/count_tokens）",
   "keywords": [
     "minimax",
