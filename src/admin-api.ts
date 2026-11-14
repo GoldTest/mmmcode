@@ -222,8 +222,14 @@ function validateSchedulerPatch(body: Record<string, unknown>): string | null {
   return null;
 }
 
-/** 账号对外视图（**绝不回显令牌**）。 */
-function accountView(a: PoolAccount): Record<string, unknown> {
+/**
+ * 账号对外视图（**绝不回显令牌**）。
+ *
+ * `probability` = 此刻开新会话分配到该账号的概率（0~1）——
+ * 由 `AccountPool.selectionProbabilities()` 算好传进来，
+ * 保证管理页显示的算法与调度器实际用的算法**是同一套**。
+ */
+function accountView(a: PoolAccount, probability = 0): Record<string, unknown> {
   const cooling = typeof a.record.disabledUntil === 'number' && a.record.disabledUntil > Date.now();
   const frozen = a.record.frozen === true;
   return {
@@ -233,6 +239,8 @@ function accountView(a: PoolAccount): Record<string, unknown> {
     checkinEnabled: a.record.checkinEnabled !== false,
     /** 优先级层（数字越小越优先）。 */
     priority: a.record.priority,
+    /** 新会话分配到该账号的概率（0~1）。0 = 不在当前最高可用层，或不可调度。 */
+    probability,
     /** 额度冻结中（不参与调度）。 */
     frozen,
     frozenReason: a.record.frozenReason ?? null,
@@ -299,6 +307,14 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
     const route = path.slice('/admin/api/'.length).replace(/\/+$/, '');
     const method = req.method ?? 'GET';
 
+    /* 每个请求只算一次「分配概率」快照 —— 账号列表与单账号响应共用同一份。
+       惰性求值：只在真的渲染视图时才触发，避免非账号路由白跑一遍账号扫描。 */
+    let probSnapshot: Map<string, number> | null = null;
+    const probOf = (name: string): number => {
+      if (!probSnapshot) probSnapshot = ctx.pool.selectionProbabilities();
+      return probSnapshot.get(name) ?? 0;
+    };
+
     /* ── 会话相关：不要求已鉴权（否则没法登录） ── */
     if (route === 'session') {
       if (method === 'GET') {
@@ -342,7 +358,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
     try {
       /* ── 账号列表 ── */
       if (route === 'accounts' && method === 'GET') {
-        const accounts = ctx.pool.refresh().map(accountView);
+        const accounts = ctx.pool.refresh().map((a) => accountView(a, probOf(a.record.name)));
         sendJson(res, 200, {
           accounts,
           mode: store.mode(),
@@ -362,7 +378,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const region: MinimaxRegion = body.region === 'global' ? 'global' : 'cn';
         const record = store.upsert(name, region);
         const found = ctx.pool.get(name);
-        sendJson(res, 200, { ok: true, account: found ? accountView(found) : record });
+        sendJson(res, 200, { ok: true, account: found ? accountView(found, probOf(found.record.name)) : record });
         return true;
       }
 
@@ -375,7 +391,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const order = raw.filter((n): n is string => typeof n === 'string' && n.length > 0);
         const accounts = store.reorder(order).map((rec) => {
           const found = ctx.pool.get(rec.name);
-          return found ? accountView(found) : rec;
+          return found ? accountView(found, probOf(found.record.name)) : rec;
         });
         sendJson(res, 200, { ok: true, accounts });
         return true;
@@ -521,7 +537,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
             return true;
           }
           const found = ctx.pool.get(name);
-          sendJson(res, 200, { ok: true, account: found ? accountView(found) : updated });
+          sendJson(res, 200, { ok: true, account: found ? accountView(found, probOf(found.record.name)) : updated });
           return true;
         }
 
@@ -639,7 +655,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           } catch (err) {
             checks.push({ name: '令牌刷新', ok: false, detail: (err as Error).message });
           }
-          sendJson(res, 200, { name, checks, credential: accountView(found) });
+          sendJson(res, 200, { name, checks, credential: accountView(found, probOf(found.record.name)) });
           return true;
         }
 
@@ -648,7 +664,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           const found = mustFind(name);
           const result = await probeAccount(ctx.pool, found, { requests: ctx.requests });
           const refreshed = ctx.pool.get(name);
-          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed) : null });
+          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed, probOf(refreshed.record.name)) : null });
           return true;
         }
 
@@ -657,7 +673,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           const found = mustFind(name);
           const result = await warmupAccount(ctx.pool, found, { requests: ctx.requests });
           const refreshed = ctx.pool.get(name);
-          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed) : null });
+          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed, probOf(refreshed.record.name)) : null });
           return true;
         }
 

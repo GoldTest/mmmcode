@@ -433,3 +433,92 @@ describe('失败归类与冷却', () => {
     expect(pool.available().map((a) => a.record.name)).toEqual(['a1']);
   });
 });
+
+describe('分配概率（管理页展示用）', () => {
+  /** 给账号塞一份积分账本 —— 它决定该账号在同层里的权重。 */
+  function seedCredits(store: AccountStore, name: string, remaining: number): void {
+    store.update(name, {
+      lastCredits: { at: Date.now(), granted: remaining, remaining, consumed: 0, nextExpireAt: null },
+    });
+  }
+
+  it('★ 同层内按剩余积分给出概率：4000 → 2/7，10000 → 5/7', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a', 0);
+    seedWithPriority(store, 'b', 0);
+    seedCredits(store, 'a', 4000);
+    seedCredits(store, 'b', 10000);
+
+    const probs = new AccountPool(store).selectionProbabilities();
+    expect(probs.get('a')).toBeCloseTo(4000 / 14000, 10);
+    expect(probs.get('b')).toBeCloseTo(10000 / 14000, 10);
+    /* 概率之和恒为 1 —— 同一层的账号瓜分全部新会话。 */
+    expect(probs.get('a')! + probs.get('b')!).toBeCloseTo(1, 10);
+  });
+
+  it('★ 备选层（更低优先级）概率为 0 —— 高层没耗尽前轮不到它', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'high', 0);
+    seedWithPriority(store, 'low', 1);
+    seedCredits(store, 'high', 5000);
+    seedCredits(store, 'low', 5000);
+
+    const probs = new AccountPool(store).selectionProbabilities();
+    expect(probs.get('high')).toBeCloseTo(1, 10);
+    expect(probs.get('low')).toBeUndefined();
+  });
+
+  it('高层全不可用时下沉 —— 概率跟着最高可用层走', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'high', 0);
+    seedWithPriority(store, 'low', 1);
+    store.update('high', { enabled: false });
+
+    const probs = new AccountPool(store).selectionProbabilities();
+    expect(probs.has('high')).toBe(false);
+    expect(probs.get('low')).toBeCloseTo(1, 10);
+  });
+
+  it('不可调度的账号不参与分配（未登录 / 已停用）', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a', 0);
+    store.upsert('ghost'); /* 只有条目，没有 credential.json → 未登录 */
+    const probs = new AccountPool(store).selectionProbabilities();
+    expect(probs.get('a')).toBeCloseTo(1, 10);
+    expect(probs.has('ghost')).toBe(false);
+  });
+
+  it('没拉过账本时退化为等概率（权重 = 积分阈值兜底）', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a', 0);
+    seedWithPriority(store, 'b', 0);
+    const probs = new AccountPool(store).selectionProbabilities();
+    expect(probs.get('a')).toBeCloseTo(0.5, 10);
+    expect(probs.get('b')).toBeCloseTo(0.5, 10);
+  });
+
+  it('一个可用账号都没有时返回空快照', () => {
+    const store = new AccountStore();
+    expect(new AccountPool(store).selectionProbabilities().size).toBe(0);
+  });
+
+  it('★ 概率与实际抽样频率一致（抽样验证）', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a', 0);
+    seedWithPriority(store, 'b', 0);
+    seedCredits(store, 'a', 4000);
+    seedCredits(store, 'b', 10000);
+
+    const pool = new AccountPool(store);
+    const probs = pool.selectionProbabilities();
+    const counts: Record<string, number> = { a: 0, b: 0 };
+    const N = 4000;
+    for (let i = 0; i < N; i += 1) {
+      const r = pool.acquireForSession(`s-${i}`);
+      if (r.ok) counts[r.account.record.name] = (counts[r.account.record.name] ?? 0) + 1;
+    }
+    /* 抽样频率应贴近理论概率（容忍 ±5 个百分点）。 */
+    expect(counts['a']! / N).toBeCloseTo(probs.get('a')!, 1);
+    expect(counts['b']! / N).toBeCloseTo(probs.get('b')!, 1);
+  });
+});

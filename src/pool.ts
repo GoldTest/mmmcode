@@ -309,6 +309,43 @@ export class AccountPool {
   }
 
   /**
+   * 当前每个账号被「新会话」选中的概率（账号名 → 概率，0~1）。
+   *
+   * 语义：**此刻开一个新会话**（平衡模式下的故障滑动同理）落在这个账号上的概率 ——
+   * 管理页卡片上显示的就是它。
+   *
+   * 规则与 `pickRandom` **严格同源**，不允许出现第二套算法：
+   *   · 只有**最高可用层**参与竞争 —— 高层没耗尽前，低层账号概率恒为 0（它们是备选层）；
+   *   · 层内概率 = 该账号权重 ÷ 层内权重之和，权重 = 剩余积分（取整，至少 1）；
+   *   · 已经绑定的 session 不受影响 —— 绑定粘性优先于概率，概率只描述「新会话」。
+   *
+   * 返回的 Map **只含最高可用层的账号**；不在 Map 里 = 概率 0。
+   */
+  selectionProbabilities(): Map<string, number> {
+    const top = this.tiers()[0] ?? [];
+    const result = new Map<string, number>();
+    if (top.length === 0) return result;
+
+    let totalWeight = 0;
+    const weights = top.map((a) => {
+      const w = this.accountWeight(a);
+      totalWeight += w;
+      return w;
+    });
+    /* 权重恒 ≥1，totalWeight 不可能为 0 —— 这里与 `pickRandom` 保持同样的兜底。 */
+    if (totalWeight <= 0 || !Number.isFinite(totalWeight)) {
+      for (const a of top) result.set(a.record.name, 1 / top.length);
+      return result;
+    }
+    for (let i = 0; i < top.length; i++) {
+      const a = top[i];
+      if (!a) continue;
+      result.set(a.record.name, (weights[i] ?? 0) / totalWeight);
+    }
+    return result;
+  }
+
+  /**
    * 为一个 session 选账号。
    *
    * 流程：

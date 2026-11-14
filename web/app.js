@@ -479,6 +479,14 @@ async function loadAccounts() {
   }
 }
 
+/**
+ * 账号当前是否参与调度。
+ * 判定口径与后端 `unavailableReason` 一致：已停用 / 限流 / 未登录 / 冷却中 / 额度冻结。
+ */
+function isSchedulable(a) {
+  return !!(a.enabled && a.loggedIn && !a.cooling && !a.frozen && !a.rateLimited);
+}
+
 function renderAccounts() {
   const list = $('#account-list');
   list.innerHTML = '';
@@ -487,7 +495,7 @@ function renderAccounts() {
   $('#credits-threshold-input').value = String(state.creditsThreshold);
 
   // 顶栏 Badge（冻结与限流的账号不参与调度，算作不可用）
-  const availableCount = state.accounts.filter((a) => a.enabled && a.loggedIn && !a.cooling && !a.frozen && !a.rateLimited).length;
+  const availableCount = state.accounts.filter(isSchedulable).length;
   const accBadge = $('#account-badge');
   if (accBadge) {
     accBadge.textContent = `账号 ${availableCount}/${state.accounts.length} 就绪`;
@@ -495,7 +503,13 @@ function renderAccounts() {
   }
 
   for (const a of state.accounts) {
-    list.appendChild(renderAccountCard(a));
+    /* 每张卡片套一层容器 —— 容器查询的锚点：
+       卡片内部横排还是竖排，按**卡片自己的宽度**决定，而不是按视口宽度
+       （三列排布下，视口很宽但每张卡片其实很窄）。 */
+    const cell = document.createElement('div');
+    cell.className = 'card-cell';
+    cell.appendChild(renderAccountCard(a));
+    list.appendChild(cell);
   }
 }
 
@@ -588,6 +602,22 @@ function renderAccountCard(a) {
 
   const probeM = formatProbeMetric(a.lastProbe);
   const warmupM = formatWarmupMetric(a.lastWarmup);
+
+  /* 分配概率：此刻开新会话落在这个账号上的概率。
+     口径与调度器完全一致 —— 同层内按剩余积分加权随机，备选层恒为 0。
+     数值由后端算好下发（`probability`），前端不做任何二次计算。 */
+  const schedulable = isSchedulable(a);
+  const prob = typeof a.probability === 'number' && Number.isFinite(a.probability) ? a.probability : 0;
+  const probPct = Math.max(0, Math.min(1, prob)) * 100;
+  const probText = !schedulable ? '—' : probPct > 0 ? probPct.toFixed(1) + '%' : '0%';
+  const probCls = schedulable && probPct > 0 ? '' : 'dim';
+  const probWidth = schedulable ? probPct.toFixed(2) : '0';
+  const probTitle = !schedulable
+    ? '当前不可调度（未登录 / 已停用 / 冷却中 / 额度冻结 / 限流），不参与分配。'
+    : probPct > 0
+      ? '此刻开新会话落在这个账号的概率 = 该账号剩余积分 ÷ 同层剩余积分之和（同层按剩余积分加权随机）。已绑定的会话不受影响。'
+      : `备选层 P${a.priority ?? 0}：更高优先级的层还有可用账号，暂时不会被分配（高层耗尽后才顶上）。`;
+
   const metrics = document.createElement('div');
   metrics.className = 'card-metrics';
   metrics.innerHTML = `
@@ -614,6 +644,11 @@ function renderAccountCard(a) {
     <div class="card-metric-item" title="${a.lastWarmup ? escapeHtml(a.lastWarmup.message) : '点击预热（不消耗 token）'}">
       <span class="card-metric-label">预热耗时</span>
       <span class="card-metric-val ${warmupM.cls}">${escapeHtml(warmupM.text)}</span>
+    </div>
+    <div class="card-metric-item prob" title="${escapeHtml(probTitle)}">
+      <span class="card-metric-label">分配概率</span>
+      <span class="card-metric-val ${probCls}">${probText}</span>
+      <span class="prob-bar"><i style="width:${probWidth}%"></i></span>
     </div>`;
   card.appendChild(metrics);
 
@@ -1962,7 +1997,7 @@ function renderSystemInfo() {
   const c = state.config || {};
   const kv = $('#system-info-kv');
   kv.innerHTML = `
-    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.7.6')}</b></dd>
+    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.7.7')}</b></dd>
     <dt>管理密钥文件</dt><dd><code>${escapeHtml(c.adminKeyPath || '—')}</code></dd>
     <dt>反代入站密钥</dt><dd><code>${escapeHtml(c.apiKeyMasked || '—')}</code></dd>
     <dt>账号池状态</dt><dd>已注册 ${c.accounts || 0} 个账号，可用 ${c.available || 0} 个</dd>`;

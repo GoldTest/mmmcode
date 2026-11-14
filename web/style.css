@@ -190,8 +190,12 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 }
 /* 账号卡片：**限制账户部分最大高度**，内置平滑滚动；卡片紧凑美观、信息全面。 */
 .cards-account {
-  grid-template-columns: 1fr;
-  max-height: 540px;
+  /* 宽屏三列 → 中屏两列 → 窄屏一列。
+     为什么不用 auto-fill：auto-fill 会随视口无上限地加列，列数不可控；
+     这里显式写死三档，卡片内部再按**卡片自己的宽度**决定怎么排（见 .card-cell）。 */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  max-height: min(70vh, 760px);
   overflow-y: auto;
   overflow-x: hidden;
   gap: 10px;
@@ -202,6 +206,28 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 .cards-account::-webkit-scrollbar-track { background: transparent; }
 .cards-account::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
 .cards-account::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
+
+/* 卡片外层：容器查询的锚点。
+   为什么需要它：卡片内部该横排还是竖排，取决于**卡片自己有多宽**，
+   而不是视口多宽 —— 视口 1900px 时三列排布下每张卡片也只有 600px 宽。 */
+.card-cell {
+  container-type: inline-size;
+  /* flex：让卡片撑满格子 —— 同一行的卡片高度一致，按钮才能都贴在底部。 */
+  display: flex;
+  min-width: 0;
+}
+.card-cell > .card-account {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 账号列表的列数：宽屏三列 → 中屏两列 → 窄屏一列。 */
+@media (max-width: 1500px) {
+  .cards-account { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 1000px) {
+  .cards-account { grid-template-columns: 1fr; }
+}
 .card {
   background: var(--bg-soft);
   border: 1px solid var(--line);
@@ -238,12 +264,19 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 .card-metrics b { color: var(--fg); font-weight: 500; }
 .card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
 
-/* ───────── 账号卡片（紧凑三栏布局） ───────── */
+/* ───────── 账号卡片（默认竖排，卡片够宽时切回三栏） ───────── */
 .card-account {
   display: grid;
-  grid-template-columns: minmax(220px, 1.05fr) minmax(300px, 1.45fr) minmax(220px, auto);
-  grid-template-areas: "head metrics actions";
-  align-items: center;
+  /* 默认竖排（head → metrics → actions）—— 多列排布下卡片只有几百像素宽，
+     竖排是唯一不挤的形态。中间那行是 1fr：多出来的空间留在指标与按钮之间，
+     按钮因此永远贴在卡片底部。 */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+  grid-template-areas:
+    "head"
+    "metrics"
+    "actions";
+  align-items: start;
   column-gap: 18px;
   row-gap: 10px;
   padding: 12px 16px;
@@ -278,6 +311,8 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px 12px;
   align-content: center;
+  /* 竖排时指标区只占自身高度，多余空间留给它与按钮之间（按钮贴底）。 */
+  align-self: start;
   padding: 6px 10px;
   background: var(--bg);
   border: 1px solid var(--line);
@@ -305,6 +340,31 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 .card-account .card-metric-val.ok { color: var(--ok); }
 .card-account .card-metric-val.warn { color: var(--warn); }
 .card-account .card-metric-val.err { color: var(--err); }
+/* 不可调度 / 备选层的概率是「灰」的 —— 不该跟真正在抢流量的号一样醒目 */
+.card-account .card-metric-val.dim { color: var(--fg-dim); }
+
+/* 分配概率行：占满一整行，右侧挂一条概率条 ——
+   各账号的分配份额横向对比一眼可见，比纯数字好读。 */
+.card-account .card-metric-item.prob {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.card-account .prob-bar {
+  flex: 1;
+  min-width: 40px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.card-account .prob-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
 
 .card-account .card-priority {
   display: inline-flex;
@@ -314,29 +374,39 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 }
 .card-account .card-actions {
   grid-area: actions;
-  align-self: center;
-  justify-content: flex-end;
+  /* 竖排时按钮贴左、贴卡片底部（竖排的 1fr 行把余量吃掉了）。 */
+  align-self: end;
+  justify-content: flex-start;
   margin-top: 0;
   padding-top: 0;
-  max-width: 340px;
+  max-width: none;
 }
 .card-account .card-order { display: inline-flex; gap: 4px; }
 .card-account button.icon-only { padding: 4px 8px; font-size: 13px; line-height: 1; }
 
-@media (max-width: 980px) {
+/* 卡片自己够宽时切回横排三栏：标题 | 指标 | 操作。
+   阈值 830px = 卡片内容区（去掉内边距）至少装得下 200 + 380 + 180 + 两道 18px 间距。
+   用**容器查询**而不是媒体查询：横排与否取决于卡片宽度，
+   视口宽度和卡片宽度在多列排布下根本不是一回事。 */
+@container (min-width: 830px) {
   .card-account {
-    grid-template-columns: 1fr;
-    grid-template-areas:
-      "head"
-      "metrics"
-      "actions";
+    grid-template-columns: minmax(200px, 1fr) minmax(380px, 1.45fr) minmax(180px, auto);
+    grid-template-rows: auto;
+    grid-template-areas: "head metrics actions";
+    align-items: center;
   }
+  .card-account .card-metrics { align-self: center; }
+  .card-account .card-actions {
+    align-self: center;
+    justify-content: flex-end;
+    max-width: 340px;
+  }
+}
+
+/* 卡片很窄时指标区降为两列 —— 三列会把「上次签到」「预热耗时」这类值挤到省略号。 */
+@container (max-width: 560px) {
   .card-account .card-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .card-account .card-actions {
-    justify-content: flex-start;
-    max-width: none;
   }
 }
 
@@ -664,16 +734,7 @@ pre.code-block {
 @media (max-width: 768px) {
   main { padding: 12px; }
   .cards { grid-template-columns: 1fr; }
-  /* 账号卡片在窄屏下堆叠成单列。 */
-  .card-account {
-    grid-template-columns: 1fr;
-    grid-template-areas:
-      "head"
-      "metrics"
-      "prio"
-      "actions";
-  }
-  .card-account .card-actions { justify-content: flex-start; }
+  /* 账号卡片的竖排/横排由容器查询按**卡片宽度**决定，这里不再重复覆盖。 */
   .kv { grid-template-columns: 1fr; gap: 4px 0; }
   .kv dd { margin-bottom: 8px; }
   .nav-tabs { padding: 0 12px; justify-content: center; }

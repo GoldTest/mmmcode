@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, request as httpRequest } from 'node:http';
 import { createAdminApi, SESSION_COOKIE } from './admin-api.js';
-import { AccountStore } from './accounts.js';
+import { AccountStore, accountDir } from './accounts.js';
 import { AccountPool } from './pool.js';
 import { KeyRegistry } from './keys.js';
 import { SessionStore, ensureAdminKey } from './admin.js';
@@ -363,6 +363,47 @@ describe('Admin API: 新增功能路由测试', () => {
       const a1 = accounts.body.accounts.find((a: any) => a.name === 'a1');
       expect(a1.checkinEnabled).toBe(false);
       expect('lastReward' in a1).toBe(true);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('★ GET /admin/api/accounts 下发每个账号的新会话分配概率', async () => {
+    const ctx = await setupServer();
+    try {
+      /* 两个同优先级账号，剩余积分 4000 / 10000 —— 分配概率应为 2/7 与 5/7。 */
+      for (const name of ['p_poor', 'p_rich']) {
+        const dir = accountDir(name);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(
+          join(dir, 'credential.json'),
+          JSON.stringify({
+            accessToken: `mmoat_${name}`,
+            refreshToken: `mmort_${name}`,
+            expiresAt: Date.now() + 3_600_000,
+            region: 'cn',
+          }),
+        );
+      }
+      const store = ctx.pool.getAccountStore();
+      store.upsert('p_poor');
+      store.upsert('p_rich');
+      store.update('p_poor', {
+        lastCredits: { at: Date.now(), granted: 4000, remaining: 4000, consumed: 0, nextExpireAt: null },
+      });
+      store.update('p_rich', {
+        lastCredits: { at: Date.now(), granted: 10000, remaining: 10000, consumed: 0, nextExpireAt: null },
+      });
+
+      const res = await ctx.req('/admin/api/accounts');
+      expect(res.status).toBe(200);
+      const poor = res.body.accounts.find((a: any) => a.name === 'p_poor');
+      const rich = res.body.accounts.find((a: any) => a.name === 'p_rich');
+      expect(poor.loggedIn).toBe(true);
+      expect(poor.probability).toBeCloseTo(4000 / 14000, 10);
+      expect(rich.probability).toBeCloseTo(10000 / 14000, 10);
+      /* 概率只对「新会话」生效，绝不能回显任何令牌。 */
+      expect(JSON.stringify(res.body)).not.toContain('mmoat_');
     } finally {
       await ctx.close();
     }
