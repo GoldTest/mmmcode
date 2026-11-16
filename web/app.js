@@ -37,12 +37,39 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-function toast(message, kind = '') {
+/**
+ * 底部提示条。
+ *
+ * undo 传入（{ label, run }）时会在提示条里挂一个「撤销」按钮 ——
+ * 破坏性操作（清空请求缓存 / 清空统计）之后必须给一条退路，
+ * 而不是只弹一句「已清空」就完了。
+ */
+function toast(message, kind = '', undo = null) {
   const el = $('#toast');
-  el.textContent = message;
+  el.textContent = '';
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
   el.className = 'toast ' + kind;
+  if (undo) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = undo.label;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await undo.run();
+      } catch (err) {
+        toast('撤销失败：' + err.message, 'err');
+      } finally {
+        el.classList.add('hidden');
+      }
+    });
+    el.appendChild(btn);
+  }
   clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.add('hidden'), 3200);
+  /* 带撤销的提示多留一会儿 —— 用户得有时间读完再决定。 */
+  el._t = setTimeout(() => el.classList.add('hidden'), undo ? 12000 : 3200);
 }
 
 async function copyText(text) {
@@ -84,7 +111,7 @@ function makeCopyBtn(getText, label = '复制') {
     const ok = await copyText(text);
     if (ok) {
       btn.classList.add('copied');
-      btn.textContent = '✓ 已复制';
+      btn.textContent = '已复制';
       setTimeout(() => {
         btn.classList.remove('copied');
         btn.textContent = label;
@@ -179,6 +206,34 @@ function closeModal() {
   }
 }
 
+/**
+ * 破坏性操作的二次确认框。
+ *
+ * 为什么不用浏览器的原生 confirm()：原生弹窗不在页面的视觉体系里，
+ * 文字没法强调「会发生什么」，用户只能盲点「确定」。
+ * 这里把「要做什么 / 会影响多少数据」讲清楚，再把危险按钮放在右边。
+ */
+function confirmAction({ title, message, confirmText = '确认', danger = true, onConfirm }) {
+  openModal(
+    title,
+    `<p class="confirm-title">${escapeHtml(title)}</p>
+     <p class="confirm-text">${escapeHtml(message)}</p>`,
+    `<button class="ghost" data-close>取消</button>
+     <button class="${danger ? 'danger' : 'primary'}" id="btn-confirm-action">${escapeHtml(confirmText)}</button>`,
+  );
+  const btn = $('#btn-confirm-action');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    closeModal();
+    try {
+      await onConfirm();
+    } catch (err) {
+      toast('操作失败：' + err.message, 'err');
+    }
+  });
+}
+
 function openRequestModal(record) {
   state.currentRequestDetail = record;
   $('#req-modal-title').textContent = `请求详情 · ${record.id}`;
@@ -189,7 +244,7 @@ function openRequestModal(record) {
   // 格式化输入信息
   let inputHtml = '';
   if (record.input && record.input.messages && Array.isArray(record.input.messages)) {
-    inputHtml = '<div style="margin-bottom:8px;"><b>对话上下文（Messages）：</b></div>';
+    inputHtml = '<div class="block-title">对话上下文（Messages）：</div>';
     for (const msg of record.input.messages) {
       const role = String(msg.role || 'user').toLowerCase();
       const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
@@ -220,14 +275,14 @@ function openRequestModal(record) {
   }
   if (record.output && record.output.toolCalls && record.output.toolCalls.length > 0) {
     outputHtml += `
-      <div style="margin-top:8px;"><b>工具调用（Tool Calls）：</b></div>
+      <div class="block-title spaced">工具调用（Tool Calls）：</div>
       <pre class="code-block">${escapeHtml(JSON.stringify(record.output.toolCalls, null, 2))}</pre>`;
   }
   if (record.error) {
     outputHtml += `
-      <div class="msg-bubble system" style="border-color:rgba(248,81,73,0.4);background:rgba(248,81,73,0.06);">
-        <div class="msg-role" style="color:var(--err)">错误信息</div>
-        <div class="msg-text" style="color:var(--err)">${escapeHtml(record.error)}</div>
+      <div class="msg-bubble system is-error">
+        <div class="msg-role is-error">错误信息</div>
+        <div class="msg-text is-error">${escapeHtml(record.error)}</div>
       </div>`;
   }
   if (!outputHtml) {
@@ -262,7 +317,7 @@ function openRequestModal(record) {
         <dt>出站协议</dt><dd>${escapeHtml(transit.protocol || '—')}</dd>
       </dl>
       <details open>
-        <summary class="small muted" style="cursor:pointer;">实际发给上游的请求</summary>
+        <summary class="details-summary">实际发给上游的请求</summary>
         <pre class="code-block">${escapeHtml(JSON.stringify(transit.payload ?? null, null, 2))}</pre>
       </details>`
     : '<p class="muted small">本次请求没有中转记录 —— 可能未到达上游。</p>';
@@ -282,7 +337,7 @@ function openRequestModal(record) {
 
   const bodyHtml = `
     <!-- 基本指标 -->
-    <div class="card-metrics" style="background:var(--bg-soft);padding:12px;border-radius:8px;border:1px solid var(--line);">
+    <div class="card-metrics req-metrics">
       <div>请求状态 <b>${statusBadge}</b></div>
       <div>请求来源 <b>${requestSourceTag(record.source)}</b></div>
       <div>首字符时间 <b>${firstByteStr}</b></div>
@@ -293,9 +348,9 @@ function openRequestModal(record) {
       <div>客户端密钥 <b>${escapeHtml(record.keyName || '默认')} (${escapeHtml(record.keyMasked || '—')})</b></div>
       <div>来源 IP <b>${escapeHtml(record.clientIp || '—')}</b></div>
       <div>流式模式 <b>${record.stream ? 'SSE 流式' : '单次返回'}</b></div>
-      <div style="grid-column: span 2;">Token 用量 ${usageStr}</div>
+      <div class="span-2">Token 用量 ${usageStr}</div>
       <div>缓存命中率 <b>${(hitRate * 100).toFixed(1)}%</b></div>
-      <div style="grid-column: span 2;">请求时间 <b>${fmtTime(record.timestamp)}</b></div>
+      <div class="span-2">请求时间 <b>${fmtTime(record.timestamp)}</b></div>
     </div>
 
     <!-- 横向三栏：请求 / 中转 / 输出 -->
@@ -305,7 +360,7 @@ function openRequestModal(record) {
         <div class="req-col-body">
           ${inputHtml}
           <details>
-            <summary class="small muted" style="cursor:pointer;">查看完整入站 JSON</summary>
+            <summary class="details-summary">查看完整入站 JSON</summary>
             <pre class="code-block">${escapeHtml(JSON.stringify(record.input, null, 2))}</pre>
           </details>
         </div>
@@ -324,7 +379,7 @@ function openRequestModal(record) {
           ${outputHtml}
           ${outDetailHtml}
           <details>
-            <summary class="small muted" style="cursor:pointer;">查看完整输出 JSON</summary>
+            <summary class="details-summary">查看完整输出 JSON</summary>
             <pre class="code-block">${escapeHtml(JSON.stringify(record.output, null, 2))}</pre>
           </details>
         </div>
@@ -355,6 +410,7 @@ $('#req-modal-btn-close').addEventListener('click', closeRequestModal);
 async function boot() {
   try {
     const session = await api('/admin/api/session');
+    renderTopbarVersion(session.version);
     if (session.authenticated) {
       showApp();
       return;
@@ -364,6 +420,42 @@ async function boot() {
     showLogin();
     $('#login-error').textContent = '无法连接服务：' + err.message;
     $('#login-error').classList.remove('hidden');
+  }
+}
+
+/**
+ * 顶栏版本号。
+ *
+ * 为什么要显示版本：这个页面是给**自部署**用的 —— 用户看到界面异常时，
+ * 第一件事就是确认「我跑的是哪个版本」。版本号直接摆在顶栏，不用去翻 README。
+ */
+function renderTopbarVersion(version) {
+  const el = $('#topbar-version');
+  if (!el) return;
+  el.textContent = version ? 'v' + version : '版本未知';
+}
+
+/**
+ * 顶栏服务状态。
+ *
+ * 用**文字**而不是小圆点：深色底上一个色块很难读懂，
+ * 「3/5 个账号可调度」这种文案一眼就知道当前能不能用。
+ */
+function renderTopbarStatus() {
+  const wrap = $('#topbar-status');
+  const text = $('#topbar-status-text');
+  if (!wrap || !text) return;
+
+  const total = state.accounts.length;
+  const usable = state.accounts.filter(isSchedulable).length;
+
+  wrap.classList.remove('is-ok', 'is-warn', 'is-err');
+  if (total === 0) {
+    wrap.classList.add('is-warn');
+    text.textContent = '尚未登记账号';
+  } else {
+    wrap.classList.add(usable === 0 ? 'is-err' : usable < total ? 'is-warn' : 'is-ok');
+    text.innerHTML = `<b>${usable}/${total}</b> 个账号可调度`;
   }
 }
 
@@ -446,6 +538,36 @@ $$('.tab-btn').forEach((btn) => {
   });
 });
 
+/* ───────────────────────── 代码片段复制 ─────────────────────────
+   代码块是横向可滚的，窄屏里根本看不全 —— 必须给一个「一键复制」，
+   否则用户只能横向拖着一行行地看。 */
+$$('[data-copy-target]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const target = document.getElementById(btn.dataset.copyTarget);
+    const text = target ? target.textContent : '';
+    if (!text.trim()) {
+      toast('没有可复制的内容', 'err');
+      return;
+    }
+    const ok = await copyText(text);
+    if (ok) {
+      btn.textContent = '已复制';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.classList.remove('copied');
+        btn.textContent = '复制';
+      }, 1400);
+    } else {
+      toast('复制失败 —— 请手动选中复制', 'err');
+    }
+  });
+});
+
+/* 空状态里的「刷新」—— 让用户知道「刷新一下也许就有了」。 */
+$('#btn-empty-insights-refresh').addEventListener('click', async () => {
+  await loadInsights();
+});
+
 /* ───────────────────────── 全量刷新 ───────────────────────── */
 
 async function refreshAll() {
@@ -520,9 +642,9 @@ function checkExpiringCreditsPrompt() {
 
   const bodyHtml = `
     <div>
-      <p style="margin:0 0 10px;line-height:1.5;">检测到以下账号存在 <b>3 天内即将到期</b> 的积分额度：</p>
-      <div class="table-wrap" style="max-height:180px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;margin-bottom:12px;">
-        <table style="font-size:12px;">
+      <p class="block-title">检测到以下账号存在 <b>3 天内即将到期</b> 的积分额度：</p>
+      <div class="table-wrap scroll-box short">
+        <table>
           <thead>
             <tr>
               <th>账号名</th>
@@ -533,8 +655,8 @@ function checkExpiringCreditsPrompt() {
           <tbody>${rows}</tbody>
         </table>
       </div>
-      <p class="small muted" style="margin:0;">
-        💡 开启<b>「蹬额度模式」</b>后，新会话将 100% 优先分配给这些临期账号加快消耗；即使额度耗尽也会保持在该模式下，持续按到期先后优先调度。
+      <p class="small muted no-margin">
+        开启<b>「蹬额度模式」</b>后，新会话将 100% 优先分配给这些临期账号加快消耗；即使额度耗尽也会保持在该模式下，持续按到期先后优先调度。
       </p>
     </div>`;
 
@@ -542,7 +664,7 @@ function checkExpiringCreditsPrompt() {
     <button class="ghost" data-close>暂不开启</button>
     <button id="btn-confirm-enable-burn" class="primary">立即开启蹬额度模式</button>`;
 
-  openModal('⚠️ 临期积分提醒', bodyHtml, footHtml);
+  openModal('临期积分提醒', bodyHtml, footHtml);
 
   $('#btn-confirm-enable-burn')?.addEventListener('click', async (e) => {
     e.target.disabled = true;
@@ -570,7 +692,11 @@ function isSchedulable(a) {
 function renderAccounts() {
   const list = $('#account-list');
   list.innerHTML = '';
-  $('#accounts-empty').classList.toggle('hidden', state.accounts.length > 0);
+  /* 容器与空态**二选一**渲染：容器留着但里面是空的，页面上就会出现
+     一条来历不明的空白带（看着像加载失败）。 */
+  const hasAccounts = state.accounts.length > 0;
+  list.classList.toggle('hidden', !hasAccounts);
+  $('#accounts-empty').classList.toggle('hidden', hasAccounts);
   $('#mode-select').value = state.mode;
   $('#credits-threshold-input').value = String(state.creditsThreshold);
 
@@ -580,13 +706,7 @@ function renderAccounts() {
     burnBanner.classList.toggle('hidden', state.mode !== 'burn');
   }
 
-  // 顶栏 Badge（冻结与限流的账号不参与调度，算作不可用）
-  const availableCount = state.accounts.filter(isSchedulable).length;
-  const accBadge = $('#account-badge');
-  if (accBadge) {
-    accBadge.textContent = `账号 ${availableCount}/${state.accounts.length} 就绪`;
-    accBadge.className = 'badge ' + (availableCount > 0 ? 'ok' : 'warn');
-  }
+  renderTopbarStatus();
 
   for (const a of state.accounts) {
     /* 每张卡片套一层容器 —— 容器查询的锚点：
@@ -748,7 +868,7 @@ function renderAccountCard(a) {
     actions.appendChild(mkBtn('重新授权', 'primary sm', () => startLogin(a.name, a.region)));
   }
 
-  actions.appendChild(mkBtn('⚡ 测活', 'ghost sm', async (btn) => {
+  actions.appendChild(mkBtn('测活', 'ghost sm', async (btn) => {
     btn.disabled = true;
     btn.textContent = '测活中…';
     try {
@@ -760,11 +880,11 @@ function renderAccountCard(a) {
       toast('测活失败：' + err.message, 'err');
     } finally {
       btn.disabled = false;
-      btn.textContent = '⚡ 测活';
+      btn.textContent = '测活';
     }
   }));
 
-  actions.appendChild(mkBtn('🔥 预热', 'ghost sm', async (btn) => {
+  actions.appendChild(mkBtn('预热', 'ghost sm', async (btn) => {
     btn.disabled = true;
     btn.textContent = '预热中…';
     try {
@@ -776,7 +896,7 @@ function renderAccountCard(a) {
       toast('预热失败：' + err.message, 'err');
     } finally {
       btn.disabled = false;
-      btn.textContent = '🔥 预热';
+      btn.textContent = '预热';
     }
   }));
 
@@ -816,8 +936,13 @@ function renderAccountCard(a) {
     btn.disabled = true;
     try {
       const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/doctor`);
-      const rows = r.checks.map((c) => `<div>${c.ok ? '✓' : '✕'} ${escapeHtml(c.name)}: ${escapeHtml(c.detail)}</div>`).join('');
-      openModal(`体检结果 · ${a.name}`, `<div style="font-size:13px;line-height:1.8;">${rows}</div>`);
+      const rows = r.checks
+        .map(
+          (c) =>
+            `<div><span class="${c.ok ? 'text-ok' : 'text-err'}">${c.ok ? '通过' : '未通过'}</span> · ${escapeHtml(c.name)}：${escapeHtml(c.detail)}</div>`,
+        )
+        .join('');
+      openModal(`体检结果 · ${a.name}`, `<div class="check-list">${rows}</div>`);
       await loadAccounts();
     } catch (err) {
       toast('体检失败：' + err.message, 'err');
@@ -872,10 +997,10 @@ function renderAccountCard(a) {
         }).join('');
 
         grantsHtml = `
-          <div style="margin-top:16px;">
-            <div style="font-weight:600;margin-bottom:8px;">积分批次明细与有效期（共 ${grants.length} 笔）：</div>
-            <div class="table-wrap" style="max-height:260px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;">
-              <table style="font-size:12px;">
+          <div class="block-title spaced">
+            <div class="block-title">积分批次明细与有效期（共 ${grants.length} 笔）：</div>
+            <div class="table-wrap scroll-box">
+              <table>
                 <thead>
                   <tr>
                     <th>序号</th>
@@ -895,7 +1020,7 @@ function renderAccountCard(a) {
 
       openModal(
         `积分账本 · ${a.name}`,
-        `<div class="kv" style="padding:0">
+        `<div class="kv kv-flush">
           <dt>剩余可用积分</dt><dd><b>${r.remaining}</b></dd>
           <dt>已消耗积分</dt><dd>${r.consumed}</dd>
           <dt>累计发放积分</dt><dd>${r.granted}</dd>
@@ -931,20 +1056,29 @@ function renderAccountCard(a) {
   /* 调整展示顺序 —— 只改卡片排列，不影响调度优先级。 */
   const orderBtns = document.createElement('div');
   orderBtns.className = 'card-order';
-  orderBtns.appendChild(mkBtn('↑', 'ghost sm icon-only', (btn) => moveAccount(a.name, -1, btn)));
-  orderBtns.appendChild(mkBtn('↓', 'ghost sm icon-only', (btn) => moveAccount(a.name, 1, btn)));
+  orderBtns.appendChild(mkBtn('上移', 'ghost sm', (btn) => moveAccount(a.name, -1, btn)));
+  orderBtns.appendChild(mkBtn('下移', 'ghost sm', (btn) => moveAccount(a.name, 1, btn)));
   actions.appendChild(orderBtns);
 
-  actions.appendChild(mkBtn('删除', 'danger sm', async () => {
-    if (!confirm(`确定删除账号「${a.name}」？\n其令牌文件将一并删除。`)) return;
-    try {
-      await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, { method: 'DELETE' });
-      toast(`账号 ${a.name} 已删除`, 'ok');
-      await loadAccounts();
-    } catch (err) {
-      toast('删除失败：' + err.message, 'err');
-    }
-  }));
+  actions.appendChild(
+    mkBtn('删除', 'danger sm', () => {
+      /* 删除账号会连带删掉令牌文件 —— 没有服务端快照可回退，
+         所以这里必须走二次确认，把后果说清楚。 */
+      confirmAction({
+        title: `删除账号 ${a.name}`,
+        message:
+          `将删除账号「${a.name}」及其本地令牌文件，账号池中的会话绑定也会一并失效。` +
+          '此操作不可撤销。',
+        confirmText: '删除账号',
+        onConfirm: async () => {
+          await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, { method: 'DELETE' });
+          toast(`账号 ${a.name} 已删除`, 'ok');
+          await loadAccounts();
+          await loadInsights();
+        },
+      });
+    }),
+  );
 
   card.appendChild(actions);
 
@@ -1062,18 +1196,22 @@ $('#btn-probe-all').addEventListener('click', async (e) => {
         (errCount ? `，异常 ${errCount} 个` : '');
       toast(summary, suspectedCount + pausedCount + errCount > 0 ? 'err' : 'ok');
 
+      /* 状态用文字标签而不是 emoji 图标 —— emoji 在各平台字形不一，
+         而且一行里混着彩色图标会盖住真正要读的信息。 */
+      const STATUS_LABEL = { ok: '正常', suspected: '疑似限流', paused: '超时暂停', error: '异常' };
+      const STATUS_CLS = { ok: 'text-ok', suspected: 'text-warn', paused: 'text-err', error: 'text-err' };
       const detailRows = results.map((r) => {
-        const icon = r.status === 'ok' ? '✓' : r.status === 'suspected' ? '⚠️' : r.status === 'paused' ? '🛑' : '✕';
-        return `<div style="padding:4px 0;border-bottom:1px solid var(--line);">${icon} <b>${escapeHtml(r.account)}</b>：${escapeHtml(r.message)}</div>`;
+        const status = r.status || 'error';
+        return `<div class="check-list-item"><span class="${STATUS_CLS[status] || 'text-err'}">${STATUS_LABEL[status] || '异常'}</span><b>${escapeHtml(r.account)}</b>：${escapeHtml(r.message)}</div>`;
       }).join('');
-      openModal('批量测活结果', `<div style="font-size:13px;line-height:1.6;">${detailRows}</div>`);
+      openModal('批量测活结果', `<div class="check-list">${detailRows}</div>`);
     }
     await loadAccounts();
   } catch (err) {
     toast('批量测活失败：' + err.message, 'err');
   } finally {
     btn.disabled = false;
-    btn.textContent = '⚡ 批量测活';
+    btn.textContent = '批量测活';
   }
 });
 
@@ -1097,7 +1235,7 @@ $('#btn-warmup-all').addEventListener('click', async (e) => {
     toast('批量预热失败：' + err.message, 'err');
   } finally {
     btn.disabled = false;
-    btn.textContent = '🔥 批量预热';
+    btn.textContent = '批量预热';
   }
 });
 
@@ -1137,8 +1275,13 @@ $('#btn-refresh-accounts').addEventListener('click', async () => {
   toast('账号池已刷新', 'ok');
 });
 
-// 新增账号
-$('#btn-add').addEventListener('click', () => {
+/**
+ * 新增账号弹窗。
+ *
+ * 抽成函数是有原因的：**空状态里的「新增账号」按钮要复用同一个弹窗** ——
+ * 空状态是用户的第一入口，不能自己另写一套交互。
+ */
+function openAddAccountModal() {
   openModal(
     '新增账号',
     `<label class="field">账号名
@@ -1171,7 +1314,10 @@ $('#btn-add').addEventListener('click', () => {
     }
   });
   $('#new-name').focus();
-});
+}
+
+$('#btn-add').addEventListener('click', openAddAccountModal);
+$('#btn-empty-add-account').addEventListener('click', openAddAccountModal);
 
 // OAuth 授权流程
 async function startLogin(name, region) {
@@ -1192,9 +1338,9 @@ async function startLogin(name, region) {
     `授权登录 · ${name} (${regionLabel})`,
     `<p class="muted">请在浏览器打开下面的链接完成 MiniMax <b>${regionLabel}</b> 账号授权：</p>
      <div class="usercode">${escapeHtml(res.userCode)}</div>
-     <p style="text-align:center;margin:12px 0;"><a href="${escapeHtml(res.verificationUriComplete)}" target="_blank" rel="noopener" class="primary" style="padding:6px 16px;border-radius:6px;display:inline-block;text-decoration:none;color:#fff;background:var(--accent);">打开 ${regionLabel} 授权页面 ↗</a></p>
+     <p class="auth-link-row"><a href="${escapeHtml(res.verificationUriComplete)}" target="_blank" rel="noopener" class="primary">打开 ${regionLabel} 授权页面</a></p>
      <div class="progress"><i></i></div>
-     <p id="login-status" class="muted small" style="text-align:center">正在监听授权完成中…</p>`,
+     <p id="login-status" class="muted small center">正在监听授权完成中…</p>`,
     '<button class="ghost" data-close>关闭</button>',
   );
 
@@ -1208,7 +1354,7 @@ async function startLogin(name, region) {
     }
     const el = $('#login-status');
     if (status.status === 'ok') {
-      if (el) el.textContent = '✓ 授权成功，正在刷新…';
+      if (el) el.textContent = '授权成功，正在刷新…';
       closeModal();
       toast(`账号 ${name} 授权成功`, 'ok');
       await loadAccounts();
@@ -1427,7 +1573,7 @@ function renderTokensTable() {
       btn.disabled = true;
       try {
         const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/doctor`);
-        toast(`体检完成：${r.checks.map((c) => c.name + (c.ok ? '✓' : '✕')).join(' ')}`, 'ok');
+        toast(`体检完成：${r.checks.map((c) => c.name + (c.ok ? ' 通过' : ' 未通过')).join('，')}`, 'ok');
         await loadAccounts();
       } catch (err) {
         toast('体检失败：' + err.message, 'err');
@@ -1488,7 +1634,10 @@ async function loadKeys() {
 function renderKeys() {
   const list = $('#key-list');
   list.innerHTML = '';
-  $('#keys-empty').classList.toggle('hidden', state.keys.length > 0);
+  /* 与账号列表同一套规则：容器与空态二选一，别留空白带。 */
+  const hasKeys = state.keys.length > 0;
+  list.classList.toggle('hidden', !hasKeys);
+  $('#keys-empty').classList.toggle('hidden', hasKeys);
 
   for (const k of state.keys) {
     const row = document.createElement('div');
@@ -1501,7 +1650,7 @@ function renderKeys() {
     nameEl.className = 'key-name';
     nameEl.innerHTML =
       `<span>${escapeHtml(k.name)}</span>` +
-      (k.primary ? '<span class="star" title="主密钥">★ 主密钥</span>' : '') +
+      (k.primary ? '<span class="tag warn" title="主密钥">主密钥</span>' : '') +
       (k.enabled ? '' : '<span class="tag warn">已停用</span>');
     main.appendChild(nameEl);
 
@@ -1630,7 +1779,12 @@ curl ${baseUrl}/v1/messages/count_tokens \\
   if (anthropicEl) anthropicEl.textContent = anthropicSnippet;
 }
 
-$('#btn-new-key').addEventListener('click', () => {
+/**
+ * 生成新客户端密钥的弹窗。
+ *
+ * 同「新增账号」：抽成函数是为了让空状态里的「生成新密钥」按钮复用它。
+ */
+function openNewKeyModal() {
   openModal(
     '生成新客户端密钥',
     `<label class="field">密钥名称
@@ -1657,7 +1811,7 @@ $('#btn-new-key').addEventListener('click', () => {
       openModal(
         '新密钥已就绪',
         `<p class="muted">请复制生成的密钥并填入客户端：</p>
-         <div class="usercode" style="font-size:14px;word-break:break-all;letter-spacing:0">${escapeHtml(r.key.key)}</div>
+         <div class="usercode key">${escapeHtml(r.key.key)}</div>
          <p class="small muted">名称：${escapeHtml(r.key.name)} · ID：${escapeHtml(r.key.id)}</p>`,
         `<button class="ghost" data-close>关闭</button><span class="copy-slot2"></span>`,
       );
@@ -1668,7 +1822,10 @@ $('#btn-new-key').addEventListener('click', () => {
     }
   });
   $('#key-name').focus();
-});
+}
+
+$('#btn-new-key').addEventListener('click', openNewKeyModal);
+$('#btn-empty-new-key').addEventListener('click', openNewKeyModal);
 
 $('#btn-refresh-keys').addEventListener('click', async () => {
   await loadKeys();
@@ -1680,13 +1837,6 @@ $('#btn-refresh-keys').addEventListener('click', async () => {
 async function loadConfig() {
   try {
     state.config = await api('/admin/api/config');
-    const upstreamLabel = $('#upstream-label');
-    if (upstreamLabel) upstreamLabel.textContent = state.config.proxy ? state.config.proxy.upstream : '';
-    const badge = $('#proxy-badge');
-    if (badge) {
-      badge.textContent = `反代 :${state.config.proxy ? state.config.proxy.port : '—'}`;
-      badge.className = 'badge ok';
-    }
     renderProxyDetails();
     renderClientSetup();
     renderSystemInfo();
@@ -1759,7 +1909,7 @@ function renderCooldownTable() {
       <td><b>${escapeHtml(a.name)}</b></td>
       <td><span class="tag warn">${escapeHtml(a.health)}</span></td>
       <td class="small muted">${fmtTime(a.disabledUntil)}</td>
-      <td><b style="color:var(--warn)">${countdownStr}</b></td>
+      <td><b class="text-warn">${countdownStr}</b></td>
       <td class="small">${escapeHtml(a.healthDetail || '请求异常导致冷却')}</td>
       <td></td>`;
 
@@ -1856,11 +2006,11 @@ $('#btn-send-test').addEventListener('click', async (btn) => {
     $('#test-result-box').classList.remove('hidden');
     if (r.ok) {
       $('#test-result-status').innerHTML =
-        `<span style="color:var(--ok)">✓ 请求成功</span> · 耗时 <b>${r.durationMs} ms</b> · 账号: <b>${escapeHtml(r.account || '默认')}</b>`;
+        `<span class="text-ok">请求成功</span> · 耗时 <b>${r.durationMs} ms</b> · 账号: <b>${escapeHtml(r.account || '默认')}</b>`;
       $('#test-result-output').textContent = r.response || '（无响应正文）';
     } else {
       $('#test-result-status').innerHTML =
-        `<span style="color:var(--err)">✕ 请求失败</span> · 耗时 <b>${r.durationMs} ms</b>`;
+        `<span class="text-err">请求失败</span> · 耗时 <b>${r.durationMs} ms</b>`;
       $('#test-result-output').textContent = r.error || '未知错误';
     }
   } catch (err) {
@@ -1939,14 +2089,19 @@ function requestSourceTag(source) {
 
 function renderRequestsTable() {
   const tbody = $('#requests-table-body');
-  if (!state.requests || state.requests.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="11" class="muted">暂无请求记录</td></tr>';
+  /* 空的时候整张表藏掉，换成一段说明 —— 只留一行「暂无请求记录」的表，
+     看着像接口挂了。 */
+  const hasRequests = !!(state.requests && state.requests.length > 0);
+  $('#requests-table-wrap').classList.toggle('hidden', !hasRequests);
+  $('#requests-empty').classList.toggle('hidden', hasRequests);
+  if (!hasRequests) {
+    tbody.innerHTML = '';
     return;
   }
   tbody.innerHTML = '';
   for (const item of state.requests) {
     const tr = document.createElement('tr');
-    tr.style.cursor = 'pointer';
+    tr.className = 'row-clickable';
 
     const isOk = item.status >= 200 && item.status < 300;
     const badgeCls = isOk ? 'ok' : item.status === 401 || item.status === 429 ? 'warn' : 'err';
@@ -2063,16 +2218,32 @@ $('#btn-save-cache-config').addEventListener('click', async () => {
   }
 });
 
-$('#btn-clear-requests').addEventListener('click', async () => {
-  if (!confirm('确定清空所有已缓存的请求记录？清空后无法恢复。')) return;
-  try {
-    await api('/admin/api/requests', { method: 'DELETE' });
-    toast('已清空所有请求记录缓存', 'ok');
-    await loadRequests();
-    await loadRequestStats();
-  } catch (err) {
-    toast('清空失败：' + err.message, 'err');
-  }
+$('#btn-clear-requests').addEventListener('click', () => {
+  /* 破坏性操作：二次确认 + 事后可撤销。
+     服务端在清空前留了一份快照，所以这里能给出「撤销」——
+     没有退路的清空按钮不该出现在工具条里。 */
+  const count = state.requests.length;
+  confirmAction({
+    title: '清空请求缓存',
+    message:
+      `将删除当前缓存中的全部 ${count} 条请求记录（含入站内容、中转过程与 token 用量）。` +
+      '清空后可在提示条里点「撤销」恢复，撤销窗口为 10 分钟。',
+    confirmText: '清空',
+    onConfirm: async () => {
+      const res = await api('/admin/api/requests', { method: 'DELETE' });
+      await loadRequests();
+      await loadRequestStats();
+      toast('已清空所有请求记录缓存', 'ok', res.undoable ? {
+        label: '撤销',
+        run: async () => {
+          const r = await api('/admin/api/requests/undo', { method: 'POST' });
+          await loadRequests();
+          await loadRequestStats();
+          toast(r.ok ? '已恢复清空前的请求记录' : r.note || '没有可撤销的清空操作', r.ok ? 'ok' : 'err');
+        },
+      } : null);
+    },
+  });
 });
 
 $('#btn-export-requests').addEventListener('click', async () => {
@@ -2159,7 +2330,7 @@ function renderSystemInfo() {
   const c = state.config || {};
   const kv = $('#system-info-kv');
   kv.innerHTML = `
-    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.7.8')}</b></dd>
+    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.8.0')}</b></dd>
     <dt>管理密钥文件</dt><dd><code>${escapeHtml(c.adminKeyPath || '—')}</code></dd>
     <dt>反代入站密钥</dt><dd><code>${escapeHtml(c.apiKeyMasked || '—')}</code></dd>
     <dt>账号池状态</dt><dd>已注册 ${c.accounts || 0} 个账号，可用 ${c.available || 0} 个</dd>`;
@@ -2287,11 +2458,11 @@ function renderInsights() {
   // 表格
   const tbody = $('#insights-table-body');
   tbody.innerHTML = '';
-  $('#insights-empty').classList.toggle('hidden', list.length > 0);
-  if (list.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无用量记录</td></tr>';
-    return;
-  }
+  /* 空的时候连表头一起藏掉 —— 一张只有表头的空表 + 一句提示，看起来像加载失败。 */
+  const hasInsights = list.length > 0;
+  $('#insights-table-wrap').classList.toggle('hidden', !hasInsights);
+  $('#insights-empty').classList.toggle('hidden', hasInsights);
+  if (!hasInsights) return;
 
   for (const acc of list) {
     const accTotal = acc.totalTokens || 0;
@@ -2324,18 +2495,28 @@ function renderInsights() {
       <td></td>`;
 
     const tdAction = tr.querySelector('td:last-child');
-    tdAction.appendChild(mkBtn('清除该账号', 'ghost sm', async (btn) => {
-      btn.disabled = true;
-      try {
-        await api('/admin/api/insights/reset', { method: 'POST', body: { name: acc.name } });
-        toast(`已清除账号 ${acc.name} 的用量统计`, 'ok');
-        await loadInsights();
-      } catch (err) {
-        toast('清除失败：' + err.message, 'err');
-      } finally {
-        btn.disabled = false;
-      }
-    }));
+    tdAction.appendChild(
+      mkBtn('清除该账号', 'ghost sm', () => {
+        /* 单账号清除同样是破坏性操作 —— 确认 + 撤销。 */
+        confirmAction({
+          title: `清除账号 ${acc.name} 的用量统计`,
+          message: `将清空该账号的累计用量（请求 ${fmtInt(acc.requests)} 次、token ${fmtInt(acc.totalTokens)}）。清除后可在提示条里点「撤销」恢复。`,
+          confirmText: '清除',
+          onConfirm: async () => {
+            const res = await api('/admin/api/insights/reset', { method: 'POST', body: { name: acc.name } });
+            await loadInsights();
+            toast(`已清除账号 ${acc.name} 的用量统计`, 'ok', res.undoable ? {
+              label: '撤销',
+              run: async () => {
+                const r = await api('/admin/api/insights/undo', { method: 'POST' });
+                await loadInsights();
+                toast(r.ok ? '已恢复该账号的用量统计' : r.note || '没有可撤销的清空操作', r.ok ? 'ok' : 'err');
+              },
+            } : null);
+          },
+        });
+      }),
+    );
     tbody.appendChild(tr);
 
     // 每行下面展开「按模型」「按天」小节
@@ -2354,7 +2535,7 @@ function renderInsightDetailRow(acc) {
   const models = Object.entries(acc.byModel || {}).sort((a, b) => b[1].totalTokens - a[1].totalTokens);
   const modelMax = models.length > 0 ? models[0][1].totalTokens : 0;
   const modelHtml = models.length === 0
-    ? '<p class="muted small" style="margin:0;">暂无模型维度数据</p>'
+    ? '<p class="muted small no-margin">暂无模型维度数据</p>'
     : `<table class="sub-table">
         <thead><tr><th>模型</th><th>请求数</th><th>总 Token</th><th>占比</th></tr></thead>
         <tbody>${models.map(([name, m]) => `
@@ -2371,7 +2552,7 @@ function renderInsightDetailRow(acc) {
   const days = Object.entries(acc.byDay || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1)).slice(-14);
   const dayMax = days.length > 0 ? days.reduce((m, d) => Math.max(m, d[1].totalTokens || 0), 0) : 0;
   const dayHtml = days.length === 0
-    ? '<p class="muted small" style="margin:0;">暂无按天数据</p>'
+    ? '<p class="muted small no-margin">暂无按天数据</p>'
     : `<table class="sub-table">
         <thead><tr><th>日期</th><th>请求数</th><th>总 Token</th><th>占比</th></tr></thead>
         <tbody>${days.map(([day, d]) => `
@@ -2404,15 +2585,28 @@ $('#btn-insights-refresh').addEventListener('click', async () => {
   toast('用量洞察已刷新', 'ok');
 });
 
-$('#btn-insights-reset-all').addEventListener('click', async () => {
-  if (!confirm('确定清空所有账号的用量统计？该操作不可恢复。')) return;
-  try {
-    await api('/admin/api/insights/reset', { method: 'POST', body: {} });
-    toast('已清空全部用量统计', 'ok');
-    await loadInsights();
-  } catch (err) {
-    toast('清空失败：' + err.message, 'err');
-  }
+$('#btn-insights-reset-all').addEventListener('click', () => {
+  /* 同「清空请求缓存」：确认 + 撤销。 */
+  const count = (state.insights || []).length;
+  confirmAction({
+    title: '清空用量统计',
+    message:
+      `将清空 ${count} 个账号的累计用量统计（请求数、token 消耗、缓存命中率）。` +
+      '清空后可在提示条里点「撤销」恢复，撤销窗口为 10 分钟。',
+    confirmText: '清空',
+    onConfirm: async () => {
+      const res = await api('/admin/api/insights/reset', { method: 'POST', body: {} });
+      await loadInsights();
+      toast('已清空全部用量统计', 'ok', res.undoable ? {
+        label: '撤销',
+        run: async () => {
+          const r = await api('/admin/api/insights/undo', { method: 'POST' });
+          await loadInsights();
+          toast(r.ok ? '已恢复清空前的用量统计' : r.note || '没有可撤销的清空操作', r.ok ? 'ok' : 'err');
+        },
+      } : null);
+    },
+  });
 });
 
 /* 启动系统 */

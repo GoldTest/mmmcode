@@ -90,6 +90,14 @@ const MAX_DAYS = 90;
 /** 落盘节流间隔（ms）—— 高频请求下别每次都写盘。 */
 const FLUSH_THROTTLE_MS = 2_000;
 
+/**
+ * 「撤销清空统计」的快照存活时长（ms）—— 10 分钟。
+ *
+ * 与 `requests.ts` 的 UNDO_TTL_MS 对齐：两个「清空」入口的撤销窗口一致，
+ * 用户不用记两套规则。
+ */
+const UNDO_TTL_MS = 10 * 60 * 1000;
+
 function emptyInsight(): AccountInsight {
   return {
     requests: 0,
@@ -113,6 +121,68 @@ function dayKey(ts: number): string {
 }
 
 /**
+ * 合并两份账号用量 —— 「撤销清空」时用。
+ *
+ * 为什么是**累加**而不是覆盖：撤销时当前台账里可能已经有清空之后新记的账，
+ * 覆盖会把那段新数据抹掉，累加才既不丢旧的也不丢新的。
+ *
+ * session key 取并集：sessions 字段本身就是 sessionKeys 的长度，
+ * 并集之后要回填 —— 不回填会出现「keys 有 5 个但 sessions 显示 3」的错账。
+ */
+function mergeInsight(base: AccountInsight, extra: AccountInsight): AccountInsight {
+  const byModel: Record<string, { requests: number; totalTokens: number }> = {};
+  for (const [k, v] of Object.entries(base.byModel)) byModel[k] = { ...v };
+  for (const [k, v] of Object.entries(extra.byModel)) {
+    const cur = byModel[k] ?? { requests: 0, totalTokens: 0 };
+    byModel[k] = { requests: cur.requests + v.requests, totalTokens: cur.totalTokens + v.totalTokens };
+  }
+
+  const byDay: Record<string, DayUsage> = {};
+  for (const [k, v] of Object.entries(base.byDay)) byDay[k] = { ...v };
+  for (const [k, v] of Object.entries(extra.byDay)) {
+    const cur = byDay[k] ?? { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0 };
+    byDay[k] = {
+      requests: cur.requests + v.requests,
+      promptTokens: cur.promptTokens + v.promptTokens,
+      completionTokens: cur.completionTokens + v.completionTokens,
+      cachedTokens: cur.cachedTokens + v.cachedTokens,
+      totalTokens: cur.totalTokens + v.totalTokens,
+    };
+  }
+
+  const sessionKeys = Array.from(new Set([...base.sessionKeys, ...extra.sessionKeys]));
+  if (sessionKeys.length > MAX_SESSION_KEYS) sessionKeys.splice(0, sessionKeys.length - MAX_SESSION_KEYS);
+
+  return {
+    requests: base.requests + extra.requests,
+    sessions: sessionKeys.length,
+    promptTokens: base.promptTokens + extra.promptTokens,
+    completionTokens: base.completionTokens + extra.completionTokens,
+    cachedTokens: base.cachedTokens + extra.cachedTokens,
+    totalTokens: base.totalTokens + extra.totalTokens,
+    firstUsedAt: minTs(base.firstUsedAt, extra.firstUsedAt),
+    lastUsedAt: maxTs(base.lastUsedAt, extra.lastUsedAt),
+    byModel,
+    byDay,
+    sessionKeys,
+  };
+}
+
+/** 两个时间戳取较早者（null 视为无穷大）。 */
+function minTs(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.min(a, b);
+}
+
+/** 两个时间戳取较晚者（null 视为负无穷）。 */
+function maxTs(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
+}
+
+/**
  * 缓存命中率 = **缓存命中的 token / 输入 token**。
  *
  * 分母是「输入 token 总数」（原始输入 + 缓存写入 + 缓存读取）—— 也就是
@@ -133,6 +203,8 @@ export class InsightsLedger {
   private readonly filePath: string;
   private lastFlush = 0;
   private flushTimer: NodeJS.Timeout | null = null;
+  /** 最近一次「清空统计」之前的快照 —— 支持撤销（见 `resetAll`）。 */
+  private undoSnapshot: { accounts: Record<string, AccountInsight>; at: number; scope: 'all' | 'one' } | null = null;
 
   constructor(opts: { filePath?: string } = {}) {
     this.filePath = opts.filePath ?? insightsFilePath();
@@ -321,7 +393,14 @@ export class InsightsLedger {
 
   /** 清掉某个账号的统计。 */
   resetAccount(name: string): boolean {
-    if (!(name in this.data.accounts)) return false;
+    const existing = this.data.accounts[name];
+    if (!existing) return false;
+    /* 单账号清除也要留快照 —— 否则「清除该账号」就是一条没有退路的路。 */
+    this.undoSnapshot = {
+      accounts: { [name]: structuredClone(existing) },
+      at: Date.now(),
+      scope: 'one',
+    };
     delete this.data.accounts[name];
     this.flush();
     return true;
@@ -329,7 +408,43 @@ export class InsightsLedger {
 
   /** 清空全部统计。 */
   resetAll(): void {
+    /* 清空前留一份快照 —— 管理页的「清空统计」是破坏性操作，要能撤销。
+       深拷贝一份（不是引用）：resetAll 之后 data.accounts 被整体换掉，
+       但 record() 会继续往**同一个** accounts 对象里写，
+       留引用会让快照跟着一起变。 */
+    this.undoSnapshot = { accounts: structuredClone(this.data.accounts), at: Date.now(), scope: 'all' };
     this.data.accounts = {};
     this.flush();
+  }
+
+  /**
+   * 回退最近一次「清空统计」。
+   *
+   * 成功返回 true；没有可用快照（过期 / 从未清空过）返回 false。
+   */
+  undoResetAll(): boolean {
+    const snap = this.undoSnapshot;
+    if (!snap) return false;
+    if (Date.now() - snap.at > UNDO_TTL_MS) {
+      this.undoSnapshot = null;
+      return false;
+    }
+    this.undoSnapshot = null;
+    /* 合并而不是整体覆盖 —— 清空之后、撤销之前如果又有新请求进来，
+       那些新用量不能被「撤销」抹掉。
+       合并口径：数值累加、按模型/按天子表累加、session key 取并集。 */
+    for (const [name, old] of Object.entries(snap.accounts)) {
+      const cur = this.data.accounts[name];
+      this.data.accounts[name] = cur ? mergeInsight(old, cur) : old;
+    }
+    this.flush();
+    return true;
+  }
+
+  /** 当前是否还有可撤销的「清空统计」。 */
+  canUndoReset(): boolean {
+    const snap = this.undoSnapshot;
+    if (!snap) return false;
+    return Date.now() - snap.at <= UNDO_TTL_MS;
   }
 }

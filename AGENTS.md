@@ -38,13 +38,13 @@ tag 才会发布正式镜像。
 ### 标准发布流程
 
 ```bash
-# 1. 改 package.json 的 version，与 tag 对齐（v0.7.8 ↔ "version": "0.7.8"）
+# 1. 改 package.json 的 version，与 tag 对齐（v0.8.0 ↔ "version": "0.8.0"）
 # 2. 提交并推送 main
 git add -A && git commit -m "..." && git push origin main
 
 # 3. 打 tag 并推送 —— 这一步才会真正发布镜像
-git tag -a v0.7.8 -m "v0.7.8"
-git push origin v0.7.8
+git tag -a v0.8.0 -m "v0.8.0"
+git push origin v0.8.0
 ```
 
 推送 tag 后，`.github/workflows/docker.yml` 自动完成：
@@ -53,7 +53,7 @@ git push origin v0.7.8
 产出的镜像标签：
 
 ```
-ghcr.io/goldtest/mmmcode:0.7.8        ← 正式版（由 tag 触发）
+ghcr.io/goldtest/mmmcode:0.8.0        ← 正式版（由 tag 触发）
 ghcr.io/goldtest/mmmcode:latest       ← 指向最新正式版
 ghcr.io/goldtest/mmmcode:main-<sha>   ← 推 main 时的临时构建
 ```
@@ -67,7 +67,7 @@ docker compose pull && docker compose up -d
 ```
 
 `docker-compose.yml` 默认使用 `ghcr.io/goldtest/mmmcode:latest`。
-要固定版本就把 `image` 改成具体版本标签（如 `ghcr.io/goldtest/mmmcode:0.7.8`）。
+要固定版本就把 `image` 改成具体版本标签（如 `ghcr.io/goldtest/mmmcode:0.8.0`）。
 
 > npm 包（`waygate-mmcode`）同步发布，但**改动镜像行为时不要只发 npm** ——
 > 用户跑的是镜像，tag 才是镜像的发布开关。

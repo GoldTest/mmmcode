@@ -458,6 +458,59 @@ describe('Admin API: 新增功能路由测试', () => {
     }
   });
 
+  it('★ POST /admin/api/requests/undo 撤销清空请求日志', async () => {
+    const ctx = await setupServer();
+    try {
+      ctx.requests.add({
+        id: 'req-undo-1',
+        timestamp: Date.now(),
+        method: 'POST',
+        path: '/v1/messages',
+        stream: false,
+        status: 200,
+        durationMs: 80,
+      });
+
+      const del = await ctx.req('/admin/api/requests', { method: 'DELETE' });
+      expect(del.status).toBe(200);
+      expect(del.body.undoable).toBe(true);
+      expect(ctx.requests.list().total).toBe(0);
+
+      const undo = await ctx.req('/admin/api/requests/undo', { method: 'POST' });
+      expect(undo.status).toBe(200);
+      expect(undo.body.ok).toBe(true);
+      expect(ctx.requests.list().total).toBe(1);
+
+      /* 撤销只能用一次 —— 再撤应该干净地失败，而不是把数据清空。 */
+      const again = await ctx.req('/admin/api/requests/undo', { method: 'POST' });
+      expect(again.body.ok).toBe(false);
+      expect(ctx.requests.list().total).toBe(1);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('★ POST /admin/api/insights/undo 撤销清空统计', async () => {
+    const ctx = await setupServer();
+    try {
+      ctx.insights.record({ account: 'a1', promptTokens: 100, completionTokens: 20, cachedTokens: 0 });
+
+      const reset = await ctx.req('/admin/api/insights/reset', { method: 'POST', body: {} });
+      expect(reset.status).toBe(200);
+      expect(reset.body.undoable).toBe(true);
+
+      const undo = await ctx.req('/admin/api/insights/undo', { method: 'POST' });
+      expect(undo.status).toBe(200);
+      expect(undo.body.ok).toBe(true);
+
+      const after = await ctx.req('/admin/api/insights');
+      expect(after.body.accounts.length).toBe(1);
+      expect(after.body.accounts[0].totalTokens).toBe(120);
+    } finally {
+      await ctx.close();
+    }
+  });
+
   it('POST /admin/api/credits/refresh 刷新余额（未登录账号标记失败但不影响整体）', async () => {
     const ctx = await setupServer();
     try {

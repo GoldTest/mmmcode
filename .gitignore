@@ -20,6 +20,9 @@ coverage/
 .vitest/
 *.tsbuildinfo
 
+# 界面评审的临时截图（不是项目资产，不入库）
+.ui-review/
+
 # 本地 AI 技能包的临时区
 # —— 不入库：.agents/_tmp/ 是抓取技能时克隆的第三方仓库（1.6MB 起步），
 #    随下载更新即可，保留它只会污染 git diff。

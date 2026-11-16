@@ -144,6 +144,22 @@ export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000; // 默认保留 24 小�
 export const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 
 /**
+ * 「撤销清空」的快照存活时长（ms）—— 10 分钟。
+ *
+ * 为什么有 TTL：快照常驻内存，忘了撤销就白占一份。
+ * 10 分钟足够用户看清提示并点下「撤销」，也足够短到不会长期占内存。
+ */
+export const UNDO_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 「撤销清空」快照的体积上限（字节）—— 32MB。
+ *
+ * 超过这个量就不留快照（清空照做，只是不给撤销按钮）——
+ * 一份 32MB 的快照会直接顶掉请求缓存预算的另一半，不划算。
+ */
+export const UNDO_MAX_BYTES = 32 * 1024 * 1024;
+
+/**
  * 落盘节流间隔（ms）。
  *
  * ★ 之前是 2 秒 —— 而每次落盘都要把**整个** items 数组 `JSON.stringify` 一遍。
@@ -176,6 +192,15 @@ export class RequestStore {
   private readonly dataPath?: string;
   private lastFlush = 0;
   private flushTimer: NodeJS.Timeout | null = null;
+  /**
+   * 最近一次「清空请求缓存」之前的快照 —— 支持撤销。
+   *
+   * 为什么留**服务端**而不是让前端回传：一条记录可能几百 KB（客户端请求体），
+   * 全量回传既慢又会把内存峰值翻倍；服务端自己留一份最省。
+   * 只保留**一份**（不是栈）—— 连续两次清空时后者覆盖前者，
+   * 免得内存里堆着多份历史快照。
+   */
+  private undoSnapshot: { items: RequestRecord[]; at: number } | null = null;
 
   constructor(configPath?: string, dataPath?: string) {
     this.configPath = configPath;
@@ -365,12 +390,61 @@ export class RequestStore {
 
   /**
    * 清空所有缓存的请求。
+   *
+   * ★ 清空前会留一份快照（`undoClear()` 可回退）——
+   *   「清空请求缓存」是破坏性操作，管理页一旦误点，数据就没了；
+   *   留一份服务端快照，前端就能在提示里给出「撤销」按钮。
+   *   快照只留**一份**且有 TTL/体积上限，详见 `undoSnapshot`。
    */
   clear(): void {
+    /* 快照有体积上限 —— 超出就不留（撤销不可用，但清空照做）。 */
+    if (this.bytes <= UNDO_MAX_BYTES) {
+      this.undoSnapshot = { items: this.items, at: Date.now() };
+    } else {
+      this.undoSnapshot = null;
+    }
     this.items = [];
     this.sizes.clear();
     this.bytes = 0;
     this.saveData();
+  }
+
+  /**
+   * 回退最近一次「清空请求缓存」。
+   *
+   * 成功返回 true；没有可用快照（过期 / 超限 / 从未清空过）返回 false。
+   */
+  undoClear(): boolean {
+    const snap = this.undoSnapshot;
+    if (!snap) return false;
+    if (Date.now() - snap.at > UNDO_TTL_MS) {
+      this.undoSnapshot = null;
+      return false;
+    }
+    this.undoSnapshot = null;
+    /* 合并而不是整体覆盖 —— 清空之后、撤销之前如果又来了新请求，
+       那些记录不能被「复活」操作抹掉。
+       顺序：items 是**新 → 旧**（add 用 unshift），所以新的在前、快照里的旧记录在后。 */
+    this.items = [...this.items, ...snap.items];
+    /* totalLogged 是「历史累计条数」，清空不影响它，撤销也不该改 —— 改了就等于漏计。 */
+    /* 字节记账要按恢复出来的记录重算 —— 记录内容没变，但记账不能留旧值。 */
+    this.sizes.clear();
+    this.bytes = 0;
+    for (const item of this.items) {
+      const bytes = approxBytes(item);
+      this.sizes.set(item.id, bytes);
+      this.bytes += bytes;
+    }
+    this.prune();
+    this.saveData();
+    return true;
+  }
+
+  /** 当前是否还有可撤销的「清空」操作。 */
+  canUndoClear(): boolean {
+    const snap = this.undoSnapshot;
+    if (!snap) return false;
+    return Date.now() - snap.at <= UNDO_TTL_MS;
   }
 
   /**

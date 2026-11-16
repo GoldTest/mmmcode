@@ -42,11 +42,13 @@
  *   POST   /admin/api/proxy/test          { model?, prompt? } → 在线调试
  *   GET    /admin/api/requests            请求日志列表（?source/status/model/account/search + 分页）
  *   GET    /admin/api/requests/:id        单条请求详情
- *   DELETE /admin/api/requests            清空请求日志
+ *   DELETE /admin/api/requests            清空请求日志（可撤销，见 requests/undo）
+ *   POST   /admin/api/requests/undo       撤销上一次「清空请求日志」
  *   GET    /admin/api/requests-stats      请求统计（条数/成功率/平均耗时/内存占用）
  *   POST   /admin/api/requests-config     { maxItems?, retentionMs? } → 调整留存与缓存上限
  *   GET    /admin/api/insights            用量洞察：各账号 token 消耗（输入/输出/缓存命中）
- *   POST   /admin/api/insights/reset      { name? } → 清空统计（不带 name = 全清）
+ *   POST   /admin/api/insights/reset      { name? } → 清空统计（不带 name = 全清，可撤销）
+ *   POST   /admin/api/insights/undo       撤销上一次「清空统计」
  *   POST   /admin/api/credits/refresh     立即刷新各账号余额（按阈值冻结/解冻）
  *   GET    /admin/api/scheduler           调度器状态（自动签到/自动刷新/额度巡检）
  *   POST   /admin/api/scheduler/config    { autoCheckin?: { enabled?, cn?, global?, intervalMinutes? } }
@@ -904,7 +906,18 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         }
         if (name) ctx.insights.resetAccount(name);
         else ctx.insights.resetAll();
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, { ok: true, undoable: ctx.insights.canUndoReset() });
+        return true;
+      }
+
+      /* ── 洞察：撤销清空统计 ── */
+      if (route === 'insights/undo' && method === 'POST') {
+        if (!ctx.insights) {
+          sendJson(res, 200, { ok: false, note: '台账未启用' });
+          return true;
+        }
+        const ok = ctx.insights.undoResetAll();
+        sendJson(res, 200, { ok, note: ok ? '已恢复清空前的统计' : '没有可撤销的清空操作' });
         return true;
       }
 
@@ -929,7 +942,14 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
       /* ── 清空请求日志 ── */
       if (route === 'requests' && method === 'DELETE') {
         ctx.requests?.clear();
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, { ok: true, undoable: ctx.requests?.canUndoClear() ?? false });
+        return true;
+      }
+
+      /* ── 撤销清空请求日志 ── */
+      if (route === 'requests/undo' && method === 'POST') {
+        const ok = ctx.requests?.undoClear() ?? false;
+        sendJson(res, 200, { ok, note: ok ? '已恢复清空前的请求记录' : '没有可撤销的清空操作' });
         return true;
       }
 
