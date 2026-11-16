@@ -124,6 +124,8 @@ export interface RequestUsage {
   totalTokens: number;
 }
 
+export const BURN_EXPIRING_WINDOW_MS = 3 * 24 * 3600 * 1000;
+
 export class AccountPool {
   private readonly store: AccountStore;
   private readonly log: (line: string) => void;
@@ -309,20 +311,56 @@ export class AccountPool {
   }
 
   /**
+   * 蹬额度候选账号：在所有可用账号中，筛选出有临近到期积分（nextExpireAt > now 且距离现在 <= 3 天，且 remaining > 0）的账号，
+   * 并按 nextExpireAt 升序（最早过期的排在最前）。
+   */
+  burningCandidates(now = Date.now()): PoolAccount[] {
+    const usable = this.available();
+    const expiring = usable.filter((a) => {
+      if (a.record.frozen === true) return false;
+      const exp = a.record.lastCredits?.nextExpireAt;
+      const rem = a.record.lastCredits?.remaining;
+      return (
+        typeof exp === 'number' &&
+        exp > now &&
+        exp - now <= BURN_EXPIRING_WINDOW_MS &&
+        typeof rem === 'number' &&
+        rem > 0
+      );
+    });
+    if (expiring.length === 0) return [];
+    // 按最近到期时间升序排序
+    expiring.sort((a, b) => {
+      const expA = a.record.lastCredits!.nextExpireAt!;
+      const expB = b.record.lastCredits!.nextExpireAt!;
+      if (expA !== expB) return expA - expB;
+      // 若到期时间相同，剩余积分少的排在前面优先消耗
+      return (a.record.lastCredits?.remaining ?? 0) - (b.record.lastCredits?.remaining ?? 0);
+    });
+    // 取最早到期时刻那一批（如同一天到期的）
+    const minExpire = expiring[0]?.record.lastCredits?.nextExpireAt;
+    if (minExpire === undefined) return expiring;
+    // 允许同一到期时刻的一组账号参与候选
+    return expiring.filter((a) => a.record.lastCredits?.nextExpireAt === minExpire);
+  }
+
+  /**
    * 当前每个账号被「新会话」选中的概率（账号名 → 概率，0~1）。
    *
-   * 语义：**此刻开一个新会话**（平衡模式下的故障滑动同理）落在这个账号上的概率 ——
+   * 语义：**此刻开一个新会话**（平衡模式/蹬额度模式下的故障滑动同理）落在这个账号上的概率 ——
    * 管理页卡片上显示的就是它。
    *
    * 规则与 `pickRandom` **严格同源**，不允许出现第二套算法：
-   *   · 只有**最高可用层**参与竞争 —— 高层没耗尽前，低层账号概率恒为 0（它们是备选层）；
+   *   · 蹬额度模式（burn）：若存在临期账号，新会话 100% 只分配给临期账号组（若多个，按权重均分或加权）；
+   *     若无临期账号，平滑回退到最高可用层；
+   *   · 普通模式（max-cache / balanced）：只有**最高可用层**参与竞争；
    *   · 层内概率 = 该账号权重 ÷ 层内权重之和，权重 = 剩余积分（取整，至少 1）；
    *   · 已经绑定的 session 不受影响 —— 绑定粘性优先于概率，概率只描述「新会话」。
-   *
-   * 返回的 Map **只含最高可用层的账号**；不在 Map 里 = 概率 0。
    */
   selectionProbabilities(): Map<string, number> {
-    const top = this.tiers()[0] ?? [];
+    const isBurn = this.mode() === 'burn';
+    const burnGroup = isBurn ? this.burningCandidates() : [];
+    const top = burnGroup.length > 0 ? burnGroup : (this.tiers()[0] ?? []);
     const result = new Map<string, number>();
     if (top.length === 0) return result;
 
@@ -351,8 +389,10 @@ export class AccountPool {
    * 流程：
    *   ① session 已绑定 → 绑定账号仍可用就用它；
    *      · `max-cache`：账号不可用就**不迁移**，返回 `pinned` 错误（保住缓存语义）；
-   *      · `balanced`：账号不可用 → **滑动**到别的可用账号并更新绑定。
-   *   ② session 未绑定（新会话）→ 取**最高可用层**，层内按剩余积分加权随机分配，并建立绑定。
+   *      · `balanced` / `burn`：账号不可用 → **滑动**到别的可用账号并更新绑定。
+   *   ② session 未绑定（新会话）→
+   *      · `burn` 模式：优先挑选有临期积分的账号（最早失效优先）；若无则取最高可用层；
+   *      · `max-cache` / `balanced` 模式：取最高可用层，层内按剩余积分加权随机分配，并建立绑定。
    */
   acquireForSession(sessionKey: string | null): AcquireResult {
     if (sessionKey) {
@@ -374,11 +414,14 @@ export class AccountPool {
             pinnedAccount: boundName,
             detail:
               `会话绑定的账号 [${boundName}] 当前不可用（${reason}）。` +
-              '最大缓存模式不会把会话迁到别的账号 —— 换到「平衡」模式即可无缝滑动，或给该账号重新授权。',
+              '最大缓存模式不会把会话迁到别的账号 —— 换到「平衡」或「蹬额度」模式即可无缝滑动，或给该账号重新授权。',
           };
         }
-        /* 平衡模式：滑动到别的账号（优先最高可用层，该层空了就下沉）。 */
-        const slid = this.pickRandom(this.tiers()[0] ?? []);
+        /* 平衡模式 / 蹬额度模式：滑动到别的账号（优先蹬额度组或最高可用层）。 */
+        const isBurn = this.mode() === 'burn';
+        const burnGroup = isBurn ? this.burningCandidates() : [];
+        const candidatePool = burnGroup.length > 0 ? burnGroup : (this.tiers()[0] ?? []);
+        const slid = this.pickRandom(candidatePool);
         if (slid) {
           this.bindSession(sessionKey, slid.record.name);
           this.log(`会话 ${shortKey(sessionKey)} 的账号 [${boundName}] 不可用，已滑到 [${slid.record.name}]`);
@@ -387,10 +430,15 @@ export class AccountPool {
       }
     }
 
-    /* 新会话（或平衡模式下无可滑的号）→ 最高可用层，层内随机。 */
-    const tiers = this.tiers();
-    const top = tiers[0] ?? [];
-    const picked = this.pickRandom(top);
+    /* 新会话（或滑动时备选）→ 蹬额度模式优先临期账号，否则最高可用层 */
+    const isBurn = this.mode() === 'burn';
+    let burnGroup = isBurn ? this.burningCandidates() : [];
+    if (isBurn && burnGroup.length === 0) {
+      // 临期额度已经耗尽，自动退出蹬额度模式
+      this.checkAndAutoExitBurnMode();
+    }
+    const candidatePool = burnGroup.length > 0 ? burnGroup : (this.tiers()[0] ?? []);
+    const picked = this.pickRandom(candidatePool);
     if (!picked) {
       return {
         ok: false,
@@ -538,6 +586,22 @@ export class AccountPool {
   }
 
   /**
+   * 检查蹬额度模式是否需要自动退出。
+   * 当处于 `burn` 模式且当前已无任何未过期且有剩余额度的临期账号时，
+   * 自动切回 `balanced` 模式，并记录日志。
+   */
+  checkAndAutoExitBurnMode(now = Date.now()): boolean {
+    if (this.mode() !== 'burn') return false;
+    const candidates = this.burningCandidates(now);
+    if (candidates.length === 0) {
+      this.store.setMode('balanced');
+      this.log('所有临期积分额度已消耗完毕，自动退出「蹬额度模式」，恢复为「平衡模式」');
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * 按余额刷新额度状态。
    *
    * 余额 < 阈值 → 冻结（无限期，等下次刷新）；余额 >= 阈值 → 解冻。
@@ -548,23 +612,38 @@ export class AccountPool {
     if (!record) return false;
     const threshold = this.store.creditsThreshold();
     const record0 = record;
+    let changed = false;
     if (remaining < threshold) {
       const reason = `余额 ${remaining} < 阈值 ${threshold}`;
-      if (record0.frozen === true && record0.frozenReason === reason) return false;
-      this.store.update(name, {
-        frozen: true,
-        frozenReason: reason,
-        frozenUntil: undefined,
-      });
-      this.log(`账号 [${name}] 额度冻结：${reason}`);
-      return true;
-    }
-    if (record0.frozen === true) {
-      this.store.update(name, { frozen: false, frozenReason: undefined, frozenUntil: undefined });
+      const lastCreds = record0.lastCredits;
+      const creditsPatch = lastCreds ? { lastCredits: { ...lastCreds, remaining } } : {};
+      if (!(record0.frozen === true && record0.frozenReason === reason)) {
+        this.store.update(name, {
+          frozen: true,
+          frozenReason: reason,
+          frozenUntil: undefined,
+          ...creditsPatch,
+        });
+        this.log(`账号 [${name}] 额度冻结：${reason}`);
+        changed = true;
+      } else if (lastCreds && lastCreds.remaining !== remaining) {
+        this.store.update(name, creditsPatch);
+      }
+    } else if (record0.frozen === true) {
+      const lastCreds = record0.lastCredits;
+      const creditsPatch = lastCreds ? { lastCredits: { ...lastCreds, remaining } } : {};
+      this.store.update(name, { frozen: false, frozenReason: undefined, frozenUntil: undefined, ...creditsPatch });
       this.log(`账号 [${name}] 额度恢复（余额 ${remaining} ≥ 阈值 ${threshold}），已解冻`);
-      return true;
+      changed = true;
+    } else {
+      const lastCreds = record0.lastCredits;
+      if (lastCreds && lastCreds.remaining !== remaining) {
+        this.store.update(name, { lastCredits: { ...lastCreds, remaining } });
+      }
     }
-    return false;
+    // 检查是否在蹬额度模式下，若额度耗尽且无临期号则自动退出
+    this.checkAndAutoExitBurnMode();
+    return changed;
   }
 
   /** 请求成功：清冷却、标健康、记使用时间。 */

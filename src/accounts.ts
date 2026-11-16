@@ -143,8 +143,10 @@ export interface AccountRecord {
  *     最大化上游提示词缓存命中（同账号才有缓存）。
  *   · `balanced`（平衡）：绑定期间行为同 max-cache；但当该账号额度耗尽 /
  *     不可用时，session **无缝滑到**别的可用账号上。
+ *   · `burn`（蹬额度 / 消耗临期）：新会话**优先分配给有临近到期积分（且剩余积分 > 0）的账号**；
+ *     若多个账号临期，按最早到期时刻优先；无临期账号时回退到最高可用层加权分配。
  */
-export type PoolMode = 'max-cache' | 'balanced';
+export type PoolMode = 'max-cache' | 'balanced' | 'burn';
 
 export interface AccountsFile {
   version: number;
@@ -268,9 +270,11 @@ export class AccountStore {
             .filter((a) => a && typeof a.name === 'string')
             .map((a) => this.normalizeRecord(a))
         : [];
+      const validMode =
+        parsed.mode === 'balanced' || parsed.mode === 'burn' ? parsed.mode : 'max-cache';
       const migrated: AccountsFile = {
         version: FILE_VERSION,
-        mode: parsed.mode === 'balanced' ? 'balanced' : 'max-cache',
+        mode: validMode,
         creditsThreshold:
           typeof parsed.creditsThreshold === 'number' && Number.isFinite(parsed.creditsThreshold) && parsed.creditsThreshold >= 0
             ? parsed.creditsThreshold

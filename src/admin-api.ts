@@ -718,7 +718,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
 
       if (route === 'config' && method === 'POST') {
         const body = await readJsonBody(req);
-        if (body.mode === 'max-cache' || body.mode === 'balanced') {
+        if (body.mode === 'max-cache' || body.mode === 'balanced' || body.mode === 'burn') {
           store.setMode(body.mode as PoolMode);
         }
         if (typeof body.creditsThreshold === 'number' && Number.isFinite(body.creditsThreshold)) {

@@ -389,7 +389,12 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
       const tag = r === 'global' ? ' (海外 Global)' : ' (国内 China)';
       const total = pool.all().length;
       const usable = pool.available().length;
-      const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
+      const modeTag =
+        pool.mode() === 'burn'
+          ? '蹬额度模式'
+          : pool.mode() === 'balanced'
+            ? '平衡模式'
+            : '最大缓存模式';
       const base = opts.baseUrl?.replace(/\/+$/, '') ?? getAgentBase(r);
       return `${base}${tag}  (Anthropic 协议)  可用账号 ${usable}/${total} · ${modeTag}`;
     },
@@ -464,7 +469,12 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
               ` ${mark} ${a.name}  [${regionTag}]  优先级 ${a.priority}  ${a.loggedIn ? '已登录' : '未登录'}  健康:${a.health}${cooling}${frozen}${checkin}${credits}`,
             );
           }
-          const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
+          const modeTag =
+            pool.mode() === 'burn'
+              ? '蹬额度模式'
+              : pool.mode() === 'balanced'
+                ? '平衡模式'
+                : '最大缓存模式';
           lines.push(
             '',
             `模式：${modeTag}（可用 ${pool.available().length}/${list.length}）  最小可用积分：${pool.getAccountStore().creditsThreshold()}`,
@@ -576,7 +586,12 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
         };
       }
       const usable = pool.available();
-      const modeTag = pool.mode() === 'balanced' ? '平衡模式' : '最大缓存模式';
+      const modeTag =
+        pool.mode() === 'burn'
+          ? '蹬额度模式'
+          : pool.mode() === 'balanced'
+            ? '平衡模式'
+            : '最大缓存模式';
       const parts = accounts.map((a) => {
         const regionTag = a.record.region === 'global' ? '海外' : '国内';
         const state = a.credential
@@ -683,7 +698,12 @@ export function createMmcodeAdapter(opts: MmcodeAdapterOptions = {}): MmcodeAdap
               ` 额度冻结，不参与调度（阈值 ${pool.getAccountStore().creditsThreshold()} 积分）`,
           });
         }
-        const modeTag = pool.mode() === 'balanced' ? '平衡模式（额度耗尽可无缝滑动）' : '最大缓存模式（会话不迁移）';
+        const modeTag =
+          pool.mode() === 'burn'
+            ? '蹬额度模式（优先消耗临近到期积分）'
+            : pool.mode() === 'balanced'
+              ? '平衡模式（额度耗尽可无缝滑动）'
+              : '最大缓存模式（会话不迁移）';
         checks.push({ name: '调度模式', ok: true, detail: modeTag });
       }
       return checks;

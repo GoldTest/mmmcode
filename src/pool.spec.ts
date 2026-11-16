@@ -362,6 +362,44 @@ describe('两种模式', () => {
       expect(second.slid).toBe(false);
     }
   });
+
+  it('★ 蹬额度模式（burn）：新会话优先分配给临期账号，概率 100% 倾斜到临期组', () => {
+    const store = new AccountStore();
+    seedWithPriority(store, 'a_rich', 0); // 10000 积分，晚到期
+    seedWithPriority(store, 'a_urgent', 0); // 200 积分，明天到期
+    seedWithPriority(store, 'a_normal', 0); // 无到期时间
+
+    const now = Date.now();
+    store.update('a_rich', {
+      lastCredits: { at: now, granted: 10000, remaining: 10000, consumed: 0, nextExpireAt: now + 30 * 86400000 },
+    });
+    store.update('a_urgent', {
+      lastCredits: { at: now, granted: 500, remaining: 200, consumed: 300, nextExpireAt: now + 86400000 },
+    });
+    store.update('a_normal', {
+      lastCredits: { at: now, granted: 1000, remaining: 1000, consumed: 0, nextExpireAt: null },
+    });
+
+    const pool = new AccountPool(store);
+    store.setMode('burn');
+
+    // 临期组只有 a_urgent，概率必须为 1 (100%)
+    const probs = pool.selectionProbabilities();
+    expect(probs.get('a_urgent')).toBe(1);
+    expect(probs.get('a_rich')).toBeUndefined();
+    expect(probs.get('a_normal')).toBeUndefined();
+
+    // 新会话必中 a_urgent
+    const acquired = pool.acquireForSession('s-burn-1');
+    expect(acquired.ok).toBe(true);
+    if (acquired.ok) {
+      expect(acquired.account.record.name).toBe('a_urgent');
+    }
+
+    // 当临期账号额度耗尽（比如刷新余额为 0 或低于阈值），自动退出蹬额度模式
+    pool.applyCreditsBalance('a_urgent', 0);
+    expect(store.mode()).toBe('balanced');
+  });
 });
 
 describe('失败归类与冷却', () => {

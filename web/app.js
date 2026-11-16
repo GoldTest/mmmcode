@@ -474,9 +474,89 @@ async function loadAccounts() {
     renderCheckinTable();
     renderTokensTable();
     renderCooldownTable();
+    checkExpiringCreditsPrompt();
   } catch (err) {
     toast('加载账号列表失败：' + err.message, 'err');
   }
+}
+
+/**
+ * 检查是否有 3 天内临近到期的积分，并在用户进入时弹窗提醒开启「蹬额度模式」。
+ */
+function checkExpiringCreditsPrompt() {
+  // 如果当前已经是蹬额度模式，无需再次提示
+  if (state.mode === 'burn') return;
+  // 会话内只提醒一次，避免频繁刷新时重复打扰
+  if (sessionStorage.getItem('dismiss_burn_prompt')) return;
+
+  const now = Date.now();
+  const threeDaysMs = 3 * 24 * 3600 * 1000;
+  const expiringAccounts = [];
+
+  for (const a of state.accounts || []) {
+    const exp = a.lastCredits?.nextExpireAt;
+    const rem = a.lastCredits?.remaining;
+    if (typeof exp === 'number' && exp > now && exp - now <= threeDaysMs && typeof rem === 'number' && rem > 0) {
+      expiringAccounts.push({
+        name: a.name,
+        remaining: rem,
+        nextExpireAt: exp,
+      });
+    }
+  }
+
+  if (expiringAccounts.length === 0) return;
+
+  // 记录提示已弹出
+  sessionStorage.setItem('dismiss_burn_prompt', '1');
+
+  const rows = expiringAccounts.map((a) => `
+    <tr>
+      <td><b>${escapeHtml(a.name)}</b></td>
+      <td><b>${a.remaining}</b></td>
+      <td class="warn"><b>${fmtTime(a.nextExpireAt)}</b></td>
+    </tr>
+  `).join('');
+
+  const bodyHtml = `
+    <div>
+      <p style="margin:0 0 10px;line-height:1.5;">检测到以下账号存在 <b>3 天内即将到期</b> 的积分额度：</p>
+      <div class="table-wrap" style="max-height:180px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;margin-bottom:12px;">
+        <table style="font-size:12px;">
+          <thead>
+            <tr>
+              <th>账号名</th>
+              <th>剩余积分</th>
+              <th>失效时间</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <p class="small muted" style="margin:0;">
+        💡 开启<b>「蹬额度模式」</b>后，新会话将 100% 优先分配给这些临期账号加快消耗；当全部临期额度用完后，系统将<b>自动切回平衡模式</b>。
+      </p>
+    </div>`;
+
+  const footHtml = `
+    <button class="ghost" data-close>暂不开启</button>
+    <button id="btn-confirm-enable-burn" class="primary">立即开启蹬额度模式</button>`;
+
+  openModal('⚠️ 临期积分提醒', bodyHtml, footHtml);
+
+  $('#btn-confirm-enable-burn')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      await api('/admin/api/config', { method: 'POST', body: { mode: 'burn' } });
+      toast('已开启蹬额度模式！新会话将优先消耗临期账号', 'ok');
+      closeModal();
+      await loadAccounts();
+    } catch (err) {
+      toast('开启失败：' + err.message, 'err');
+    } finally {
+      e.target.disabled = false;
+    }
+  });
 }
 
 /**
@@ -760,14 +840,62 @@ function renderAccountCard(a) {
     btn.disabled = true;
     try {
       const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/credits`);
+      const now = Date.now();
+      const grants = Array.isArray(r.grants) ? r.grants : [];
+      let grantsHtml = '';
+      if (grants.length > 0) {
+        const rows = grants.map((g, idx) => {
+          const isExpired = g.expireAt && g.expireAt <= now;
+          const statusTag = isExpired
+            ? '<span class="tag muted">已过期</span>'
+            : g.remaining > 0
+              ? '<span class="tag ok">生效中</span>'
+              : '<span class="tag">已用完</span>';
+          const expireStr = g.expireAt ? fmtTime(g.expireAt) : '永不过期';
+          const grantedStr = g.grantedAt ? fmtTime(g.grantedAt) : '—';
+          return `
+            <tr>
+              <td>#${idx + 1}</td>
+              <td><b>+${g.granted}</b></td>
+              <td><b>${g.remaining}</b></td>
+              <td>${g.consumed}</td>
+              <td class="small muted">${grantedStr}</td>
+              <td class="small ${isExpired ? 'muted' : 'warn'}"><b>${expireStr}</b></td>
+              <td>${statusTag}</td>
+            </tr>`;
+        }).join('');
+
+        grantsHtml = `
+          <div style="margin-top:16px;">
+            <div style="font-weight:600;margin-bottom:8px;">积分批次明细与有效期（共 ${grants.length} 笔）：</div>
+            <div class="table-wrap" style="max-height:260px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;">
+              <table style="font-size:12px;">
+                <thead>
+                  <tr>
+                    <th>序号</th>
+                    <th>发放额度</th>
+                    <th>剩余积分</th>
+                    <th>已消耗</th>
+                    <th>发放时间</th>
+                    <th>失效时间</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+          </div>`;
+      }
+
       openModal(
         `积分账本 · ${a.name}`,
         `<div class="kv" style="padding:0">
-          <dt>剩余积分</dt><dd><b>${r.remaining}</b></dd>
+          <dt>剩余可用积分</dt><dd><b>${r.remaining}</b></dd>
           <dt>已消耗积分</dt><dd>${r.consumed}</dd>
           <dt>累计发放积分</dt><dd>${r.granted}</dd>
           <dt>最近到期时间</dt><dd>${r.nextExpireAt ? fmtTime(r.nextExpireAt) : '—'}</dd>
-        </div>`,
+        </div>
+        ${grantsHtml}`,
       );
       await loadAccounts();
     } catch (err) {
@@ -1554,7 +1682,12 @@ function renderProxyDetails() {
   const c = state.config;
   if (!c) return;
   const p = c.proxy || {};
-  const modeText = c.mode === 'balanced' ? '平衡模式（额度耗尽可无缝滑动）' : '最大缓存模式（会话不迁移）';
+  const modeText =
+    c.mode === 'burn'
+      ? '蹬额度模式（优先消耗临近到期积分）'
+      : c.mode === 'balanced'
+        ? '平衡模式（额度耗尽可无缝滑动）'
+        : '最大缓存模式（会话不迁移）';
   $('#proxy-detail-kv').innerHTML = `
     <dt>公开监听 Base URL</dt><dd><code>${escapeHtml(p.baseUrl || '—')}</code></dd>
     <dt>外部服务端口</dt><dd><b>${escapeHtml(p.port || '—')}</b></dd>
@@ -2079,8 +2212,19 @@ function renderInsights() {
 
   // 概览数字
   const modeBadge = $('#insight-mode-badge');
-  modeBadge.textContent = state.insightsMode === 'balanced' ? '平衡模式' : '最大缓存模式';
-  modeBadge.className = 'badge ' + (state.insightsMode === 'balanced' ? 'info' : 'ok');
+  modeBadge.textContent =
+    state.insightsMode === 'burn'
+      ? '蹬额度模式'
+      : state.insightsMode === 'balanced'
+        ? '平衡模式'
+        : '最大缓存模式';
+  modeBadge.className =
+    'badge ' +
+    (state.insightsMode === 'burn'
+      ? 'warn'
+      : state.insightsMode === 'balanced'
+        ? 'info'
+        : 'ok');
 
   $('#insight-stat-requests').textContent = fmtInt(totals.requests);
   $('#insight-stat-sessions').textContent = fmtInt(totals.sessions);
