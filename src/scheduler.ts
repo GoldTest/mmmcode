@@ -615,7 +615,7 @@ export class SchedulerService {
         };
         if (result.outcome === 'claimed' && result.points != null) {
           update.lastReward = { at: Date.now(), points: result.points };
-        } else if (result.outcome === 'already' && result.points != null && !account.record.lastReward) {
+        } else if (result.outcome === 'already' && result.points != null && (!account.record.lastReward || !account.record.lastReward.points)) {
           update.lastReward = { at: Date.now(), points: result.points };
         }
         this.pool.getAccountStore().update(account.record.name, update);
@@ -711,7 +711,7 @@ export class SchedulerService {
         };
         if (result.outcome === 'claimed' && result.points != null) {
           update.lastReward = { at: Date.now(), points: result.points };
-        } else if (result.outcome === 'already' && result.points != null && !account.record.lastReward) {
+        } else if (result.outcome === 'already' && result.points != null && (!account.record.lastReward || !account.record.lastReward.points)) {
           update.lastReward = { at: Date.now(), points: result.points };
         }
         this.pool.getAccountStore().update(account.record.name, update);
@@ -744,12 +744,12 @@ export class SchedulerService {
   }
 
   /** 某区域对应的签到计划（国内 / 海外两套）。 */
-  private scheduleFor(region: MinimaxRegion): CheckinSchedule {
+  scheduleFor(region: MinimaxRegion): CheckinSchedule {
     return this.config.autoCheckin[region] ?? this.config.autoCheckin.cn;
   }
 
   /** 该账号今天是否已经签到成功（claimed / already 都算 —— 上游说「今天已签」也是签过了）。 */
-  private checkedInToday(account: PoolAccount, now: number): boolean {
+  checkedInToday(account: PoolAccount, now: number): boolean {
     const last = account.record.lastCheckin;
     if (!last?.at) return false;
     const region = account.record.region ?? 'cn';
@@ -766,7 +766,7 @@ export class SchedulerService {
    * · 固定时间（jitter = 0）→ 就是 `time` 那一刻（按该区域的时区）；
    * · 有随机窗口 → `time` 前后各取一个该账号当天的专属随机偏移。
    */
-  private accountDueAt(accountName: string, region: MinimaxRegion, dateKey: string): number {
+  accountDueAt(accountName: string, region: MinimaxRegion, dateKey: string): number {
     const schedule = this.scheduleFor(region);
     const parsed = parseHhMm(schedule.time) ?? { hour: 8, minute: 0 };
     const jitterMs = Math.max(0, schedule.jitterMinutes) * 60_000;
@@ -778,6 +778,27 @@ export class SchedulerService {
       offsetMs,
       timeZone: schedule.timezone,
     });
+  }
+
+  /**
+   * 计算指定账号下一次计划签到时间（epoch ms）。
+   * 若今天已签过，则提前安排明天的签到时刻；
+   * 若今天尚未签过，且当前时间尚未超过今日应签时刻，则返回今日应签时刻；
+   * 若今天尚未签过但已超过应签时刻（待补签），若有重试退避则返回重试时间，否则返回当前应签时刻。
+   */
+  nextAccountDueAt(account: PoolAccount, now: number = Date.now()): number | null {
+    if (!this.config.autoCheckin.enabled || account.record.checkinEnabled === false) return null;
+    const region = account.record.region ?? 'cn';
+    const schedule = this.scheduleFor(region);
+    const todayKey = zonedDateKey(now, schedule.timezone);
+    const tomorrowKey = nextDateKey(todayKey);
+
+    if (this.checkedInToday(account, now)) {
+      return this.accountDueAt(account.record.name, region, tomorrowKey);
+    }
+    const dueAt = this.accountDueAt(account.record.name, region, todayKey);
+    const attempted = this.lastCheckinAttempt.get(account.record.name);
+    return attempted === undefined ? dueAt : Math.max(dueAt, attempted + CHECKIN_RETRY_DELAY_MS);
   }
 
   /** 某区域今日的签到窗口（给管理页展示）。 */

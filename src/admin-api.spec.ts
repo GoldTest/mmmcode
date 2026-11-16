@@ -590,4 +590,30 @@ describe('Admin API: 新增功能路由测试', () => {
       await new Promise<void>((done) => server.close(() => done()));
     }
   });
+
+  it('GET /admin/api/accounts 返回包含 nextCheckinAt 字段', async () => {
+    const ctx = await setupServer();
+    try {
+      const d = accountDir('acc_due');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_due',
+          refreshToken: 'refresh_due',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      ctx.pool.getAccountStore().upsert('acc_due', 'cn');
+
+      const res = await ctx.req('/admin/api/accounts');
+      expect(res.status).toBe(200);
+      const acc = res.body.accounts.find((a: any) => a.name === 'acc_due');
+      expect(acc).toBeDefined();
+      expect(acc.nextCheckinAt).toBeTypeOf('number');
+    } finally {
+      await ctx.close();
+    }
+  });
 });

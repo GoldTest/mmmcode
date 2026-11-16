@@ -1136,7 +1136,7 @@ async function loadScheduler() {
 function renderCheckinTable() {
   const tbody = $('#checkin-table-body');
   if (!state.accounts || state.accounts.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="muted">还没有账号</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="muted">还没有账号</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -1164,6 +1164,13 @@ function renderCheckinTable() {
         : `<b>${pts}</b>`;
     }
 
+    let nextCheckinHtml = '—';
+    if (!checkinOn) {
+      nextCheckinHtml = '<span class="small muted">已停用</span>';
+    } else if (a.nextCheckinAt) {
+      nextCheckinHtml = `<span class="small">${fmtTime(a.nextCheckinAt)}</span>`;
+    }
+
     tr.innerHTML = `
       <td><b>${escapeHtml(a.name)}</b></td>
       <td><span class="tag">${escapeHtml(regionTag(a.region))}</span></td>
@@ -1172,6 +1179,7 @@ function renderCheckinTable() {
       <td><b>${last && last.streak != null ? last.streak + ' 天' : '—'}</b></td>
       <td>${rewardHtml}</td>
       <td class="small muted">${last && last.at ? fmtTime(last.at) : '—'}</td>
+      <td>${nextCheckinHtml}</td>
       <td><b>${credits}</b></td>
       <td></td>`;
 

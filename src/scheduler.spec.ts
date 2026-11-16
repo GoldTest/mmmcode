@@ -298,6 +298,65 @@ describe('SchedulerService', () => {
       expect(region.nextRunAt!).toBeGreaterThanOrEqual(winStart);
       expect(region.nextRunAt!).toBeLessThanOrEqual(winEnd);
 
+      /* nextAccountDueAt 测试：提前计算该账号的下次签到时刻 */
+      const acc = pool.get('acc_cn')!;
+      const nextDue = scheduler.nextAccountDueAt(acc);
+      expect(nextDue).toBe(region.nextRunAt);
+
+      scheduler.stop();
+    } finally {
+      if (origHome === undefined) delete process.env.MMCODE_HOME;
+      else process.env.MMCODE_HOME = origHome;
+    }
+  });
+
+  it('nextAccountDueAt：今天已签时排到明天，已停用时返回 null', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-12T00:00:00Z')); // 北京时间 08:00
+
+    const dir = mkdtempSync(join(tmpdir(), 'mmcode-test-'));
+    const store = new AccountStore({ filePath: join(dir, 'accounts.json') });
+    const origHome = process.env.MMCODE_HOME;
+    process.env.MMCODE_HOME = dir;
+    try {
+      const { accountDir } = await import('./accounts.js');
+      const d = accountDir('acc_cn');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_cn',
+          refreshToken: 'refresh_cn',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      store.upsert('acc_cn', 'cn');
+
+      const pool = new AccountPool(store);
+      const scheduler = new SchedulerService(pool, { configPath: join(dir, 'scheduler.json') });
+      scheduler.updateConfig({
+        autoCheckin: { cn: { time: '08:00', jitterMinutes: 0, timezone: 'Asia/Shanghai' } },
+      });
+
+      const acc = pool.get('acc_cn')!;
+      // 未签到时应为今天 08:00
+      expect(scheduler.nextAccountDueAt(acc)).toBe(new Date('2026-11-12T00:00:00Z').getTime());
+
+      // 模拟已签到
+      store.update('acc_cn', {
+        lastCheckin: { at: Date.now(), outcome: 'claimed', points: 400, streak: 1, message: '签到成功' },
+      });
+      // 重新从 pool 中获取更新后的账号对象
+      const updatedAcc = pool.get('acc_cn')!;
+      // 今天已签完，应排到明天 08:00
+      expect(scheduler.nextAccountDueAt(updatedAcc)).toBe(new Date('2026-11-13T00:00:00Z').getTime());
+
+      // 停用签到
+      store.update('acc_cn', { checkinEnabled: false });
+      const disabledAcc = pool.get('acc_cn')!;
+      expect(scheduler.nextAccountDueAt(disabledAcc)).toBeNull();
+
       scheduler.stop();
     } finally {
       if (origHome === undefined) delete process.env.MMCODE_HOME;
