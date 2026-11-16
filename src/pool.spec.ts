@@ -396,9 +396,11 @@ describe('两种模式', () => {
       expect(acquired.account.record.name).toBe('a_urgent');
     }
 
-    // 当临期账号额度耗尽（比如刷新余额为 0 或低于阈值），自动退出蹬额度模式
+    // 当 3 天内临期账号额度耗尽（被冻结），下一次会轮到 a_rich（下一个最早到期的），但模式保持为 burn 不退出
     pool.applyCreditsBalance('a_urgent', 0);
-    expect(store.mode()).toBe('balanced');
+    expect(store.mode()).toBe('burn');
+    const probsAfter = pool.selectionProbabilities();
+    expect(probsAfter.get('a_rich')).toBe(1);
   });
 });
 

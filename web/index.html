@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MiniMax Code 本地反代管理</title>
-<link rel="stylesheet" href="./style.css?v=0.7.10">
-<link rel="stylesheet" href="./keys.css?v=0.7.10">
+<link rel="stylesheet" href="./style.css?v=0.7.11">
+<link rel="stylesheet" href="./keys.css?v=0.7.11">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔑</text></svg>">
 </head>
 <body>
@@ -27,6 +27,17 @@
 
 <!-- ─────────── 主界面 ─────────── -->
 <div id="app-view" class="hidden">
+  <!-- 蹬额度模式提示横幅 -->
+  <div id="burn-mode-banner" class="burn-banner hidden">
+    <div class="burn-banner-content">
+      <span class="burn-banner-icon">🔥</span>
+      <span class="burn-banner-text">
+        当前正处于 <b>蹬额度模式</b>：新会话优先分配给临近到期积分账号。
+      </span>
+      <button id="btn-exit-burn-banner" class="sm ghost">恢复平衡模式</button>
+    </div>
+  </div>
+
   <!-- Tab 导航 -->
   <nav class="nav-tabs" id="nav-tabs">
     <button class="tab-btn active" data-tab="tab-accounts">
@@ -613,6 +624,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="./app.js?v=0.7.10"></script>
+<script src="./app.js?v=0.7.11"></script>
 </body>
 </html>

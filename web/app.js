@@ -534,7 +534,7 @@ function checkExpiringCreditsPrompt() {
         </table>
       </div>
       <p class="small muted" style="margin:0;">
-        💡 开启<b>「蹬额度模式」</b>后，新会话将 100% 优先分配给这些临期账号加快消耗；当全部临期额度用完后，系统将<b>自动切回平衡模式</b>。
+        💡 开启<b>「蹬额度模式」</b>后，新会话将 100% 优先分配给这些临期账号加快消耗；即使额度耗尽也会保持在该模式下，持续按到期先后优先调度。
       </p>
     </div>`;
 
@@ -573,6 +573,12 @@ function renderAccounts() {
   $('#accounts-empty').classList.toggle('hidden', state.accounts.length > 0);
   $('#mode-select').value = state.mode;
   $('#credits-threshold-input').value = String(state.creditsThreshold);
+
+  // 蹬额度模式顶部横幅
+  const burnBanner = $('#burn-mode-banner');
+  if (burnBanner) {
+    burnBanner.classList.toggle('hidden', state.mode !== 'burn');
+  }
 
   // 顶栏 Badge（冻结与限流的账号不参与调度，算作不可用）
   const availableCount = state.accounts.filter(isSchedulable).length;
@@ -1005,6 +1011,21 @@ $('#mode-select').addEventListener('change', async (e) => {
   } catch (err) {
     toast('切换失败：' + err.message, 'err');
     await loadAccounts();
+  }
+});
+
+// 蹬额度模式横幅中的“恢复平衡模式”按钮
+$('#btn-exit-burn-banner')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    await api('/admin/api/config', { method: 'POST', body: { mode: 'balanced' } });
+    toast('已恢复为平衡调度模式', 'ok');
+    await loadAccounts();
+  } catch (err) {
+    toast('切换模式失败：' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
   }
 });
 

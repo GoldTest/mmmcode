@@ -311,8 +311,8 @@ export class AccountPool {
   }
 
   /**
-   * 蹬额度候选账号：在所有可用账号中，筛选出有临近到期积分（nextExpireAt > now 且距离现在 <= 3 天，且 remaining > 0）的账号，
-   * 并按 nextExpireAt 升序（最早过期的排在最前）。
+   * 蹬额度候选账号：在所有可用账号中，筛选出有未过期积分（nextExpireAt > now 且 remaining > 0）的账号，
+   * 优先筛选出临近 3 天内到期的账号；若没有 3 天内到期的，则在所有有到期时间的账号中按最早到期优先排序。
    */
   burningCandidates(now = Date.now()): PoolAccount[] {
     const usable = this.available();
@@ -320,17 +320,18 @@ export class AccountPool {
       if (a.record.frozen === true) return false;
       const exp = a.record.lastCredits?.nextExpireAt;
       const rem = a.record.lastCredits?.remaining;
-      return (
-        typeof exp === 'number' &&
-        exp > now &&
-        exp - now <= BURN_EXPIRING_WINDOW_MS &&
-        typeof rem === 'number' &&
-        rem > 0
-      );
+      return typeof exp === 'number' && exp > now && typeof rem === 'number' && rem > 0;
     });
     if (expiring.length === 0) return [];
-    // 按最近到期时间升序排序
-    expiring.sort((a, b) => {
+
+    // 若有 3 天内即将到期的账号，严格优先只在这批 3 天临期账号中选
+    const urgent = expiring.filter(
+      (a) => a.record.lastCredits!.nextExpireAt! - now <= BURN_EXPIRING_WINDOW_MS,
+    );
+    const poolList = urgent.length > 0 ? urgent : expiring;
+
+    // 按最近到期时间升序排序（最早失效优先）
+    poolList.sort((a, b) => {
       const expA = a.record.lastCredits!.nextExpireAt!;
       const expB = b.record.lastCredits!.nextExpireAt!;
       if (expA !== expB) return expA - expB;
@@ -338,10 +339,9 @@ export class AccountPool {
       return (a.record.lastCredits?.remaining ?? 0) - (b.record.lastCredits?.remaining ?? 0);
     });
     // 取最早到期时刻那一批（如同一天到期的）
-    const minExpire = expiring[0]?.record.lastCredits?.nextExpireAt;
-    if (minExpire === undefined) return expiring;
-    // 允许同一到期时刻的一组账号参与候选
-    return expiring.filter((a) => a.record.lastCredits?.nextExpireAt === minExpire);
+    const minExpire = poolList[0]?.record.lastCredits?.nextExpireAt;
+    if (minExpire === undefined) return poolList;
+    return poolList.filter((a) => a.record.lastCredits?.nextExpireAt === minExpire);
   }
 
   /**
@@ -352,7 +352,7 @@ export class AccountPool {
    *
    * 规则与 `pickRandom` **严格同源**，不允许出现第二套算法：
    *   · 蹬额度模式（burn）：若存在临期账号，新会话 100% 只分配给临期账号组（若多个，按权重均分或加权）；
-   *     若无临期账号，平滑回退到最高可用层；
+   *     若无临期账号，平滑回退到最高可用层；保持在 burn 模式，不自动退出；
    *   · 普通模式（max-cache / balanced）：只有**最高可用层**参与竞争；
    *   · 层内概率 = 该账号权重 ÷ 层内权重之和，权重 = 剩余积分（取整，至少 1）；
    *   · 已经绑定的 session 不受影响 —— 绑定粘性优先于概率，概率只描述「新会话」。
@@ -391,7 +391,7 @@ export class AccountPool {
    *      · `max-cache`：账号不可用就**不迁移**，返回 `pinned` 错误（保住缓存语义）；
    *      · `balanced` / `burn`：账号不可用 → **滑动**到别的可用账号并更新绑定。
    *   ② session 未绑定（新会话）→
-   *      · `burn` 模式：优先挑选有临期积分的账号（最早失效优先）；若无则取最高可用层；
+   *      · `burn` 模式：优先挑选有临期积分的账号（最早失效优先）；若无则取最高可用层，持续保持在 burn 模式；
    *      · `max-cache` / `balanced` 模式：取最高可用层，层内按剩余积分加权随机分配，并建立绑定。
    */
   acquireForSession(sessionKey: string | null): AcquireResult {
@@ -430,13 +430,9 @@ export class AccountPool {
       }
     }
 
-    /* 新会话（或滑动时备选）→ 蹬额度模式优先临期账号，否则最高可用层 */
+    /* 新会话（或滑动时备选）→ 蹬额度模式优先临期账号，若无临期账号则平滑回退到最高可用层（不退出模式） */
     const isBurn = this.mode() === 'burn';
-    let burnGroup = isBurn ? this.burningCandidates() : [];
-    if (isBurn && burnGroup.length === 0) {
-      // 临期额度已经耗尽，自动退出蹬额度模式
-      this.checkAndAutoExitBurnMode();
-    }
+    const burnGroup = isBurn ? this.burningCandidates() : [];
     const candidatePool = burnGroup.length > 0 ? burnGroup : (this.tiers()[0] ?? []);
     const picked = this.pickRandom(candidatePool);
     if (!picked) {
@@ -586,22 +582,6 @@ export class AccountPool {
   }
 
   /**
-   * 检查蹬额度模式是否需要自动退出。
-   * 当处于 `burn` 模式且当前已无任何未过期且有剩余额度的临期账号时，
-   * 自动切回 `balanced` 模式，并记录日志。
-   */
-  checkAndAutoExitBurnMode(now = Date.now()): boolean {
-    if (this.mode() !== 'burn') return false;
-    const candidates = this.burningCandidates(now);
-    if (candidates.length === 0) {
-      this.store.setMode('balanced');
-      this.log('所有临期积分额度已消耗完毕，自动退出「蹬额度模式」，恢复为「平衡模式」');
-      return true;
-    }
-    return false;
-  }
-
-  /**
    * 按余额刷新额度状态。
    *
    * 余额 < 阈值 → 冻结（无限期，等下次刷新）；余额 >= 阈值 → 解冻。
@@ -641,8 +621,6 @@ export class AccountPool {
         this.store.update(name, { lastCredits: { ...lastCreds, remaining } });
       }
     }
-    // 检查是否在蹬额度模式下，若额度耗尽且无临期号则自动退出
-    this.checkAndAutoExitBurnMode();
     return changed;
   }
 
