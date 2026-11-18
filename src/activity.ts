@@ -256,7 +256,11 @@ export class MinimaxActivity {
       );
     }
     const sum = (pick: (g: CreditGrant) => number): number => round2(grants.reduce((s, g) => s + pick(g), 0));
-    const future = grants.filter((g) => g.expireAt > Date.now()).map((g) => g.expireAt);
+    /* 只统计仍有剩余（remaining > 0）且尚未过期的批次：
+       已经耗尽的旧批次即使还没到过期时间，也不该拉低 nextExpireAt，
+       否则蹬额度模式会把「旧积分已用完、只剩新积分」的账号误判为最临期账号。 */
+    const now = Date.now();
+    const future = grants.filter((g) => g.remaining > 0 && g.expireAt > now).map((g) => g.expireAt);
     return {
       granted: sum((g) => g.granted),
       remaining: sum((g) => g.remaining),

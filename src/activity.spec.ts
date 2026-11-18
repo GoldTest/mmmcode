@@ -66,6 +66,27 @@ describe('MinimaxActivity.credits', () => {
     expect(l.nextExpireAt).toBeGreaterThan(Date.now());
   });
 
+  it('nextExpireAt 忽略已耗尽（remaining=0）的旧批次', async () => {
+    const now = Date.now();
+    const oldExpire = now + 86400000;
+    const newExpire = now + 10 * 86400000;
+    stub({ base_resp: { status_code: 0 }, details: [
+      { credit_type: 2, granted_amount: 800, remaining_amount: 0, consumed_amount: 800, granted_at_ms: 1, expire_at_ms: oldExpire },
+      { credit_type: 2, granted_amount: 200, remaining_amount: 200, consumed_amount: 0, granted_at_ms: 2, expire_at_ms: newExpire },
+    ] });
+    const l = await new MinimaxActivity(async () => 'tok').credits();
+    expect(l.remaining).toBe(200);
+    expect(l.nextExpireAt).toBe(newExpire);
+
+    // 全部批次都已耗尽时，nextExpireAt 应为 null
+    stub({ base_resp: { status_code: 0 }, details: [
+      { credit_type: 2, granted_amount: 800, remaining_amount: 0, consumed_amount: 800, granted_at_ms: 1, expire_at_ms: oldExpire },
+    ] });
+    const lEmpty = await new MinimaxActivity(async () => 'tok').credits();
+    expect(lEmpty.remaining).toBe(0);
+    expect(lEmpty.nextExpireAt).toBeNull();
+  });
+
   it('金额缺失的批次被跳过（不编造）', async () => {
     stub({ base_resp: { status_code: 0 }, details: [
       { granted_amount: 800, remaining_amount: 100, consumed_amount: 700 },   // 完整
