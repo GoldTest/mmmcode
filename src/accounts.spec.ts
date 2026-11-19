@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AccountStore, accountDir, accountsFilePath, defaultAccountDir } from './accounts.js';
+import { AccountStore, accountDir, accountsFilePath, defaultAccountDir, recordCheckinDay, sanitizeCheckinDays, CHECKIN_LEDGER_DAYS } from './accounts.js';
 
 let root = '';
 const origHome = process.env.MMCODE_HOME;
@@ -237,5 +237,75 @@ describe('AccountStore：调整顺序', () => {
     const rec = store.get('a1');
     expect(rec?.priority).toBe(5);
     expect(rec?.health).toBe('unauthorized');
+  });
+});
+
+/**
+ * 签到台账（按天）—— 回答「昨天签没签 / 什么时候签的 / 拿到多少积分」的唯一依据。
+ *
+ * 守两件事：
+ *   ① 同一天合并，且**成功是粘性的**（签成后再失败不能把「今天签了」抹掉）；
+ *   ② 只保留最近 N 天，且坏数据（手改过的 accounts.json）不会污染页面。
+ */
+describe('签到台账：按天记录', () => {
+  const attempt = (over: Partial<{ at: number; outcome: 'claimed' | 'already' | 'unavailable' | 'error'; points: number | null; streak: number | null; message: string }> = {}) => ({
+    at: 1_700_000_000_000,
+    outcome: 'claimed' as const,
+    points: 100,
+    streak: 3,
+    message: '签到成功',
+    ...over,
+  });
+
+  it('同一天合并成一条：outcome 取最后一次，signed 保持成功', () => {
+    let days = recordCheckinDay(undefined, '2026-11-19', attempt());
+    expect(days['2026-11-19']?.signed).toBe(true);
+    expect(days['2026-11-19']?.signedAt).toBe(1_700_000_000_000);
+    expect(days['2026-11-19']?.points).toBe(100);
+
+    /* 当天后来又失败一次 —— 「今天签了」不能被抹掉。 */
+    days = recordCheckinDay(days, '2026-11-19', attempt({ at: 1_700_000_600_000, outcome: 'error', points: null, message: '上游 5xx' }));
+    expect(days['2026-11-19']?.signed).toBe(true);
+    expect(days['2026-11-19']?.signedAt).toBe(1_700_000_000_000);
+    /* 但「最后一次尝试」确实是异常 —— 页面上要能看到。 */
+    expect(days['2026-11-19']?.outcome).toBe('error');
+    expect(days['2026-11-19']?.at).toBe(1_700_000_600_000);
+    /* 积分沿用当天成功那次的。 */
+    expect(days['2026-11-19']?.points).toBe(100);
+  });
+
+  it('只保留最近 CHECKIN_LEDGER_DAYS 天', () => {
+    let days: Record<string, any> = {};
+    for (let i = 1; i <= 12; i++) {
+      const key = `2026-11-${String(i).padStart(2, '0')}`;
+      days = recordCheckinDay(days, key, attempt({ at: 1_700_000_000_000 + i * 86_400_000 }));
+    }
+    expect(Object.keys(days).length).toBe(CHECKIN_LEDGER_DAYS);
+    /* 留下的是最近的几天。 */
+    expect(days['2026-11-12']).toBeDefined();
+    expect(days['2026-11-01']).toBeUndefined();
+  });
+
+  it('坏数据会被清洗掉（日期键不合法 / outcome 不认识 / at 非数字）', () => {
+    const days = sanitizeCheckinDays({
+      '2026-11-19': { at: 1, outcome: 'claimed', signed: true, points: 5, message: 'ok' },
+      'not-a-date': { at: 1, outcome: 'claimed' },
+      '2026-11-18': { at: 'x', outcome: 'claimed' },
+      '2026-11-17': { at: 1, outcome: 'weird' },
+      '2026-11-16': { at: 1, outcome: 'error', message: 'boom' },
+    });
+    expect(Object.keys(days)).toEqual(['2026-11-19', '2026-11-16']);
+    expect(days['2026-11-19']?.points).toBe(5);
+    expect(days['2026-11-16']?.signed).toBe(false);
+  });
+
+  it('台账会跟着账号一起落盘（重启后还在 —— 这是「昨天签没签」能回看的前提）', () => {
+    const store = new AccountStore({ filePath: join(root, 'accounts.json') });
+    store.upsert('a1');
+    store.update('a1', {
+      checkinDays: recordCheckinDay(undefined, '2026-11-19', attempt()),
+    });
+    const reopened = new AccountStore({ filePath: join(root, 'accounts.json') });
+    expect(reopened.get('a1')?.checkinDays?.['2026-11-19']?.signed).toBe(true);
   });
 });

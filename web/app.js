@@ -13,6 +13,8 @@
 
 const state = {
   accounts: [],
+  /** 签到列表是否只显示「有问题的账号」（昨天没签上 / 最近一次报错）。 */
+  checkinOnlyIssues: false,
   mode: 'max-cache',
   creditsThreshold: 100,
   insights: null,
@@ -410,7 +412,6 @@ $('#req-modal-btn-close').addEventListener('click', closeRequestModal);
 async function boot() {
   try {
     const session = await api('/admin/api/session');
-    renderTopbarVersion(session.version);
     if (session.authenticated) {
       showApp();
       return;
@@ -424,40 +425,11 @@ async function boot() {
 }
 
 /**
- * 顶栏版本号。
+ * 页面级的服务状态（原来在顶栏，顶栏删了以后不再单独显示）。
  *
- * 为什么要显示版本：这个页面是给**自部署**用的 —— 用户看到界面异常时，
- * 第一件事就是确认「我跑的是哪个版本」。版本号直接摆在顶栏，不用去翻 README。
+ * 为什么不再显示：账号是否可调度，在「账号」页的卡片（分配概率 / 健康状态）
+ * 与「反代」Tab 的拓扑里都有完整的一份；顶栏那条 56px 的横条只为重复一遍。
  */
-function renderTopbarVersion(version) {
-  const el = $('#topbar-version');
-  if (!el) return;
-  el.textContent = version ? 'v' + version : '版本未知';
-}
-
-/**
- * 顶栏服务状态。
- *
- * 用**文字**而不是小圆点：深色底上一个色块很难读懂，
- * 「3/5 个账号可调度」这种文案一眼就知道当前能不能用。
- */
-function renderTopbarStatus() {
-  const wrap = $('#topbar-status');
-  const text = $('#topbar-status-text');
-  if (!wrap || !text) return;
-
-  const total = state.accounts.length;
-  const usable = state.accounts.filter(isSchedulable).length;
-
-  wrap.classList.remove('is-ok', 'is-warn', 'is-err');
-  if (total === 0) {
-    wrap.classList.add('is-warn');
-    text.textContent = '尚未登记账号';
-  } else {
-    wrap.classList.add(usable === 0 ? 'is-err' : usable < total ? 'is-warn' : 'is-ok');
-    text.innerHTML = `<b>${usable}/${total}</b> 个账号可调度`;
-  }
-}
 
 function showLogin() {
   $('#login-view').classList.remove('hidden');
@@ -488,26 +460,11 @@ $('#login-form').addEventListener('submit', async (e) => {
   }
 });
 
-const btnLogout = $('#btn-logout');
-if (btnLogout) {
-  btnLogout.addEventListener('click', async () => {
-    await api('/admin/api/session', { method: 'DELETE' }).catch(() => {});
-    showLogin();
-  });
-}
-
+/* 退出登录 —— 入口在「设置 → 系统运行环境信息」底部（顶栏已删）。 */
 $('#btn-bottom-logout').addEventListener('click', async () => {
   await api('/admin/api/session', { method: 'DELETE' }).catch(() => {});
   showLogin();
 });
-
-const btnTopRefresh = $('#btn-top-refresh');
-if (btnTopRefresh) {
-  btnTopRefresh.addEventListener('click', async () => {
-    await refreshAll();
-    toast('所有数据已刷新', 'ok');
-  });
-}
 
 /* ───────────────────────── Tab 页切换 ───────────────────────── */
 
@@ -593,6 +550,7 @@ async function loadAccounts() {
     state.mode = data.mode || 'max-cache';
     state.creditsThreshold = typeof data.creditsThreshold === 'number' ? data.creditsThreshold : 100;
     renderAccounts();
+    renderCheckinOverview();
     renderCheckinTable();
     renderTokensTable();
     renderCooldownTable();
@@ -689,6 +647,27 @@ function isSchedulable(a) {
   return !!(a.enabled && a.loggedIn && !a.cooling && !a.frozen && !a.rateLimited);
 }
 
+/**
+ * 账号卡片上的「上次签到」文案 —— 直接显示 outcome 英文（claimed/error）
+ * 对用户没有意义，这里统一翻成中文并带上色彩语义。
+ */
+function checkinMetricText(last) {
+  if (!last) return '—';
+  if (last.outcome === 'claimed') return '新签得积分';
+  if (last.outcome === 'already') return '已签到';
+  if (last.outcome === 'unavailable') return '暂不可签';
+  if (last.outcome === 'error') return '签到异常';
+  return '—';
+}
+
+/** 卡片上「上次签到」的颜色语义：正常灰、签成绿、异常红。 */
+function checkinMetricCls(last) {
+  if (!last) return '';
+  if (last.outcome === 'claimed' || last.outcome === 'already') return 'ok';
+  if (last.outcome === 'error' || last.outcome === 'unavailable') return 'err';
+  return '';
+}
+
 function renderAccounts() {
   const list = $('#account-list');
   list.innerHTML = '';
@@ -705,8 +684,6 @@ function renderAccounts() {
   if (burnBanner) {
     burnBanner.classList.toggle('hidden', state.mode !== 'burn');
   }
-
-  renderTopbarStatus();
 
   for (const a of state.accounts) {
     /* 每张卡片套一层容器 —— 容器查询的锚点：
@@ -839,9 +816,9 @@ function renderAccountCard(a) {
       <span class="card-metric-label">剩余积分</span>
       <span class="card-metric-val">${a.lastCredits ? a.lastCredits.remaining : '—'}</span>
     </div>
-    <div class="card-metric-item">
+    <div class="card-metric-item" title="${a.lastCheckin ? escapeHtml(a.lastCheckin.message || '') : '还没签过'}">
       <span class="card-metric-label">上次签到</span>
-      <span class="card-metric-val">${a.lastCheckin ? escapeHtml(a.lastCheckin.outcome) : '—'}</span>
+      <span class="card-metric-val ${checkinMetricCls(a.lastCheckin)}">${escapeHtml(checkinMetricText(a.lastCheckin))}</span>
     </div>
     <div class="card-metric-item" title="${a.lastProbe ? escapeHtml(a.lastProbe.message) : '点击测活测试生文首字延迟'}">
       <span class="card-metric-label">测活首字</span>
@@ -1377,7 +1354,30 @@ async function startLogin(name, region) {
   state.pollTimer = setTimeout(poll, 1500);
 }
 
-/* ───────────────────────── 自动签到表格与调度 ───────────────────────── */
+/* ───────────────────────── 自动签到：紧凑列表与调度 ───────────────────────── */
+
+/** 相对时间描述（"还有 3 小时 12 分" / "12 分钟前"）。 */
+function fmtRelative(ts) {
+  if (!ts) return '';
+  const diff = ts - Date.now();
+  const abs = Math.abs(diff);
+  const mins = Math.round(abs / 60000);
+  const hours = Math.floor(mins / 60);
+  const days = Math.floor(hours / 24);
+  let text;
+  if (days >= 1) text = `${days} 天 ${hours % 24} 小时`;
+  else if (hours >= 1) text = `${hours} 小时 ${mins % 60} 分`;
+  else text = `${mins} 分`;
+  return diff >= 0 ? `还有 ${text}` : `${text}前`;
+}
+
+/** 紧凑时间格式 "MM-DD HH:mm" —— 列表窄，省掉年份与秒。 */
+function fmtDayTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
 
 /** 签到计划的一句话描述（国内 / 海外各一句）。 */
 function formatCheckinSchedule(st) {
@@ -1393,6 +1393,272 @@ function formatCheckinSchedule(st) {
   return cn || global || `每日定时 ${st.time || ''}`;
 }
 
+/**
+ * 账号的签到摘要 —— 兼容老后端（没有 checkinSummary 时用旧字段兜底）。
+ *
+ * 为什么要兜底：前端可能被更新得比后端早（静态资源与镜像版本不同步），
+ * 这时至少还能显示「上次签到时间 / 下次计划签到」，不至于整块空白。
+ */
+function summaryOf(a) {
+  if (a.checkinSummary) return a.checkinSummary;
+  const last = a.lastCheckin || null;
+  return {
+    todayKey: '',
+    yesterdayKey: '',
+    yesterday: null,
+    today: null,
+    last: last
+      ? {
+          at: last.at,
+          outcome: last.outcome,
+          signed: last.outcome === 'claimed' || last.outcome === 'already',
+          signedAt: last.at,
+          points: last.points,
+          streak: last.streak,
+          message: last.message,
+        }
+      : null,
+    lastError:
+      last && (last.outcome === 'error' || last.outcome === 'unavailable')
+        ? { at: last.at, outcome: last.outcome, message: last.message }
+        : null,
+    nextAt: a.nextCheckinAt ?? null,
+    signedToday: false,
+  };
+}
+
+/**
+ * 概览 chip 条 —— 一行放下四个答案：昨天签没签、今天到哪了、下次什么时候签、有没有异常。
+ *
+ * 数据来自每个账号的 `checkinSummary`（后端按**该账号所属时区**算好），
+ * 所以「昨天」对国内号与海外号各自成立。
+ */
+function renderCheckinOverview() {
+  const accounts = (state.accounts || []).filter((a) => a.checkinEnabled !== false);
+  const summaries = accounts.map((a) => ({ a, s: summaryOf(a) }));
+
+  /** 写一枚 chip（主文案 + 颜色 + 注解）。 */
+  const chip = (id, subId, value, cls, sub) => {
+    const b = $(id);
+    b.textContent = value;
+    b.className = cls || '';
+    $(subId).textContent = sub || '';
+  };
+
+  /* ── 昨天签到 ──
+     ⚠️ 「没有记录」也算**没签上** —— 服务当时没跑起来的账号，
+     对「自动化有没有在跑」这个问题的答案就是「没签」。
+     但要把两种情况分开说：有记录但没签上（有异常信息）vs 压根没记录（服务没跑）。 */
+  const signedYesterday = summaries.filter((x) => x.s.yesterday && x.s.yesterday.signed);
+  const failedYesterday = summaries.filter((x) => x.s.yesterday && !x.s.yesterday.signed);
+  const noRecordYesterday = summaries.filter((x) => !x.s.yesterday);
+  const missedYesterday = failedYesterday.length + noRecordYesterday.length;
+  if (!summaries.length) {
+    chip('#ov-yesterday', '#ov-yesterday-sub', '—', 'muted', '没有参与自动签到的账号');
+  } else {
+    const notes = [];
+    if (failedYesterday.length) notes.push(`${failedYesterday.length} 个没签上`);
+    if (noRecordYesterday.length) notes.push(`${noRecordYesterday.length} 个无记录`);
+    chip(
+      '#ov-yesterday',
+      '#ov-yesterday-sub',
+      `${signedYesterday.length}/${summaries.length} 已签`,
+      signedYesterday.length === summaries.length ? 'ok' : 'warn',
+      missedYesterday ? notes.join(' · ') : '昨天全部按时签到',
+    );
+  }
+
+  /* ── 今日进度 ── */
+  const signedToday = summaries.filter((x) => x.s.signedToday).length;
+  const pending = summaries.length - signedToday;
+  chip(
+    '#ov-today',
+    '#ov-today-sub',
+    summaries.length ? `${signedToday}/${summaries.length}` : '—',
+    summaries.length && signedToday === summaries.length ? 'ok' : '',
+    pending ? `${pending} 个待签` : '今天的签到已全部完成',
+  );
+
+  /* ── 下次计划签到 ──
+     时刻落在过去 = 今天的窗口已过但还没签上 → 这不是「下次」，是「待补签」。 */
+  const nexts = summaries
+    .map((x) => x.s.nextAt)
+    .filter((t) => typeof t === 'number' && t > 0)
+    .sort((a, b) => a - b);
+  if (!nexts.length) {
+    chip('#ov-next', '#ov-next-sub', '—', 'muted', '没有排定的签到计划');
+  } else if (nexts[0] <= Date.now()) {
+    chip('#ov-next', '#ov-next-sub', '待补签', 'warn', `原定 ${fmtDayTime(nexts[0])}`);
+  } else {
+    chip('#ov-next', '#ov-next-sub', fmtDayTime(nexts[0]), '', fmtRelative(nexts[0]));
+  }
+
+  /* ── 异常账号 ── */
+  const errored = summaries.filter((x) => x.s.lastError);
+  chip(
+    '#ov-errors',
+    '#ov-errors-sub',
+    errored.length ? `${errored.length} 个` : '0 个',
+    errored.length ? 'err' : 'ok',
+    errored.length
+      ? errored.map((x) => x.a.name).slice(0, 2).join('、') + (errored.length > 2 ? ' 等' : '')
+      : '没有账号签到异常',
+  );
+}
+
+/**
+ * 签到明细 —— **每账号一行**，不用表格。
+ *
+ * 横向四段：账号（状态点 + 名称 + 近 7 天小格子）｜昨天（签到时刻 + 积分）
+ * ｜下次（计划签到时刻）｜异常（最近一次错误），末尾是操作按钮。
+ */
+function renderCheckinTable() {
+  const list = $('#checkin-list');
+  if (!state.accounts || state.accounts.length === 0) {
+    list.innerHTML = '<div class="ckin-empty">还没有账号</div>';
+    return;
+  }
+
+  /* 「仅看异常」筛选：只留昨天没签上或最近一次出错的账号 —— 账号多的时候省事。 */
+  const onlyIssues = state.checkinOnlyIssues === true;
+  const rows = state.accounts.filter((a) => {
+    if (!onlyIssues) return true;
+    const s = summaryOf(a);
+    return Boolean(s.lastError) || Boolean(s.yesterday && !s.yesterday.signed);
+  });
+  if (!rows.length) {
+    list.innerHTML = `<div class="ckin-empty">${onlyIssues ? '没有异常账号 —— 一切正常' : '还没有账号'}</div>`;
+    return;
+  }
+
+  list.innerHTML = '';
+  for (const a of rows) {
+    const s = summaryOf(a);
+    const on = a.checkinEnabled !== false;
+    const y = s.yesterday;
+    const err = s.lastError;
+
+    /* 状态点：一枚点说明「昨天签没签」 —— 比一个字省地方。 */
+    let dotCls = 'off';
+    let dotTip = '自动签到已停用';
+    if (on) {
+      if (y && y.signed) {
+        dotCls = 'ok';
+        dotTip = '昨天已签到';
+      } else if (y) {
+        dotCls = 'err';
+        dotTip = '昨天没签上';
+      } else {
+        dotCls = 'warn';
+        dotTip = '昨天无记录（服务当时未运行）';
+      }
+    }
+
+    /* 昨天：签到时刻 + 拿到的积分。 */
+    let whenHtml;
+    if (!on) {
+      whenHtml = '<span class="ckin-pts none">已停用</span>';
+    } else if (y && y.signed) {
+      const pts =
+        y.points != null
+          ? `<span class="ckin-pts">${y.points > 0 ? '+' : ''}${y.points}</span>`
+          : '<span class="ckin-pts none">无积分</span>';
+      whenHtml = `<span class="ckin-time">${fmtDayTime(y.signedAt)}</span>${pts}`;
+    } else if (y) {
+      whenHtml = `<span class="ckin-pts err">昨天${y.outcome === 'error' ? '异常' : '未签上'}</span>`;
+    } else {
+      whenHtml = '<span class="ckin-pts none">昨天无记录</span>';
+    }
+
+    /* 下次计划签到 —— 时刻已过 = 今天还没签上，等后台补签。 */
+    let nextHtml;
+    let nextCls = 'ckin-next';
+    if (!on) {
+      nextHtml = '<span class="muted">已停用</span>';
+    } else if (!s.nextAt) {
+      nextHtml = '<span class="muted">—</span>';
+    } else if (s.nextAt <= Date.now()) {
+      nextCls += ' overdue';
+      nextHtml = `待补签 <em>原定 ${fmtDayTime(s.nextAt)}</em>`;
+    } else {
+      nextHtml = `下次 ${fmtDayTime(s.nextAt)} <em>${fmtRelative(s.nextAt)}</em>`;
+    }
+
+    /* 最近一次异常 —— 原文截断，悬停看全文。 */
+    const errHtml = err
+      ? `<span class="ckin-err has" title="${escapeHtml(err.message || '')}">${escapeHtml((err.message || '异常').slice(0, 18))}</span>`
+      : '<span class="ckin-err">—</span>';
+
+    const row = document.createElement('div');
+    row.className = 'ckin-row' + (err ? ' is-err' : '');
+    row.innerHTML = `
+      <span class="ckin-name" title="${escapeHtml(a.name)}">
+        <span class="ckin-dot ${dotCls}" title="${escapeHtml(dotTip)}"></span>
+        <b>${escapeHtml(a.name)}</b>
+        <span class="ckin-region">${escapeHtml(a.region === 'global' ? '海外' : '国内')}</span>
+        ${renderCheckinDays(a.checkinDays || {})}
+      </span>
+      <span class="ckin-when">${whenHtml}</span>
+      <span class="${nextCls}">${nextHtml}</span>
+      ${errHtml}
+      <span class="ckin-ops"></span>`;
+
+    const ops = row.querySelector('.ckin-ops');
+
+    /* 停用 / 启用自动签到 */
+    ops.appendChild(mkBtn(on ? '停用' : '启用', 'ghost sm', async (btn) => {
+      btn.disabled = true;
+      try {
+        await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
+          method: 'PATCH',
+          body: { checkinEnabled: !on },
+        });
+        toast(`账号 [${a.name}] 自动签到已${on ? '停用' : '启用'}`, 'ok');
+        await loadAccounts();
+        await loadScheduler();
+      } catch (err) {
+        toast('操作失败：' + err.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    }));
+
+    /* 立即签到 */
+    ops.appendChild(mkBtn('签到', 'ghost sm', async (btn) => {
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/checkin`, { method: 'POST' });
+        toast(r.message || '签到成功', r.outcome === 'error' ? 'err' : 'ok');
+        await loadAccounts();
+        await loadScheduler();
+      } catch (err) {
+        toast('签到失败：' + err.message, 'err');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '签到';
+      }
+    }));
+    list.appendChild(row);
+  }
+}
+
+/** 近 7 天的签到小格子（绿=签到、灰=没签、红=异常）。 */
+function renderCheckinDays(days) {
+  const keys = Object.keys(days).sort();
+  if (!keys.length) return '';
+  const items = keys.slice(-7);
+  const dots = items
+    .map((k) => {
+      const d = days[k];
+      const cls = d.signed ? 'ok' : d.outcome === 'error' || d.outcome === 'unavailable' ? 'err' : 'warn';
+      const tip = `${k} ${d.signed ? '已签到' : '未签上'}${d.points != null ? `（${d.points} 积分）` : ''}`;
+      return `<span class="day-dot ${cls}" title="${escapeHtml(tip)}"></span>`;
+    })
+    .join('');
+  return `<span class="day-dots" title="近 ${items.length} 天签到情况">${dots}</span>`;
+}
+
 async function loadScheduler() {
   try {
     const s = await api('/admin/api/scheduler');
@@ -1400,7 +1666,18 @@ async function loadScheduler() {
     if (s.autoCheckin) {
       $('#checkin-status-badge').textContent = s.autoCheckin.enabled ? '后台自动运行中' : '已暂停';
       $('#checkin-status-badge').className = 'badge ' + (s.autoCheckin.enabled ? 'ok' : 'warn');
-      $('#checkin-next-time').textContent = formatCheckinSchedule(s.autoCheckin);
+      /* 头部显示「下一次什么时候签」—— 这是用户最常看的一个数。
+         具体计划（国内/海外各几点、随机窗口）放在设置页，这里不重复占位。 */
+      const nexts = (state.accounts || [])
+        .map((a) => a.nextCheckinAt)
+        .filter((t) => typeof t === 'number' && t > 0)
+        .sort((a, b) => a - b);
+      $('#checkin-next-time').textContent = !nexts.length
+        ? formatCheckinSchedule(s.autoCheckin)
+        : nexts[0] <= Date.now()
+          /* 时刻已过 = 今天的窗口错过还没签上 —— 这是「待补签」，不是「下次」。 */
+          ? `待补签（原定 ${fmtDayTime(nexts[0])}）`
+          : `下次签到 ${fmtDayTime(nexts[0])}（${fmtRelative(nexts[0])}）`;
       $('#setting-checkin-enabled').checked = s.autoCheckin.enabled;
       const regions = s.autoCheckin.regions || {};
       for (const [region, fallbackTz, fallbackTime] of [
@@ -1421,6 +1698,7 @@ async function loadScheduler() {
       $('#setting-refresh-interval').value = s.autoRefresh.intervalMinutes;
       $('#setting-refresh-margin').value = s.autoRefresh.marginMinutes;
     }
+    renderCheckinOverview();
     renderCheckinTable();
     renderTokensTable();
   } catch {
@@ -1428,95 +1706,13 @@ async function loadScheduler() {
   }
 }
 
-function renderCheckinTable() {
-  const tbody = $('#checkin-table-body');
-  if (!state.accounts || state.accounts.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="muted">还没有账号</td></tr>';
-    return;
-  }
-  tbody.innerHTML = '';
-  for (const a of state.accounts) {
-    const tr = document.createElement('tr');
-    const last = a.lastCheckin;
-    const outcome = last ? last.outcome : '未签到';
-    let outcomeBadge = '<span class="tag">未签</span>';
-    if (outcome === 'claimed') outcomeBadge = '<span class="tag ok">今日新签得积分</span>';
-    else if (outcome === 'already') outcomeBadge = '<span class="tag ok">今日已签到</span>';
-    else if (outcome === 'unavailable') outcomeBadge = '<span class="tag warn">暂不可签</span>';
-    else if (outcome === 'error') outcomeBadge = '<span class="tag err">签到异常</span>';
-
-    const credits = a.lastCredits ? `${a.lastCredits.remaining} / ${a.lastCredits.granted}` : '—';
-    const checkinOn = a.checkinEnabled !== false;
-    const checkinBadge = checkinOn ? '<span class="tag ok">已开启</span>' : '<span class="tag warn">已停用</span>';
-
-    const reward = a.lastReward || (last && last.points != null ? { at: last.at, points: last.points } : null);
-    let rewardHtml = '—';
-    if (reward && reward.points != null) {
-      const pts = reward.points > 0 ? `+${reward.points} 积分` : `${reward.points} 积分`;
-      const timeStr = reward.at ? fmtTime(reward.at) : '';
-      rewardHtml = timeStr
-        ? `<b>${pts}</b><div class="small muted">${timeStr}</div>`
-        : `<b>${pts}</b>`;
-    }
-
-    let nextCheckinHtml = '—';
-    if (!checkinOn) {
-      nextCheckinHtml = '<span class="small muted">已停用</span>';
-    } else if (a.nextCheckinAt) {
-      nextCheckinHtml = `<span class="small">${fmtTime(a.nextCheckinAt)}</span>`;
-    }
-
-    tr.innerHTML = `
-      <td><b>${escapeHtml(a.name)}</b></td>
-      <td><span class="tag">${escapeHtml(regionTag(a.region))}</span></td>
-      <td>${checkinBadge}</td>
-      <td>${outcomeBadge}</td>
-      <td><b>${last && last.streak != null ? last.streak + ' 天' : '—'}</b></td>
-      <td>${rewardHtml}</td>
-      <td class="small muted">${last && last.at ? fmtTime(last.at) : '—'}</td>
-      <td>${nextCheckinHtml}</td>
-      <td><b>${credits}</b></td>
-      <td></td>`;
-
-    const tdAction = tr.querySelector('td:last-child');
-    tdAction.style.display = 'flex';
-    tdAction.style.gap = '6px';
-    tdAction.style.alignItems = 'center';
-
-    /* 停用/启用自动签到 */
-    tdAction.appendChild(mkBtn(checkinOn ? '停用签到' : '启用签到', 'ghost sm', async (btn) => {
-      btn.disabled = true;
-      try {
-        await api(`/admin/api/accounts/${encodeURIComponent(a.name)}`, {
-          method: 'PATCH',
-          body: { checkinEnabled: !checkinOn },
-        });
-        toast(`账号 [${a.name}] 自动签到已${checkinOn ? '停用' : '启用'}`, 'ok');
-        await loadAccounts();
-        await loadScheduler();
-      } catch (err) {
-        toast('操作失败：' + err.message, 'err');
-      } finally {
-        btn.disabled = false;
-      }
-    }));
-
-    tdAction.appendChild(mkBtn('立即签到', 'ghost sm', async (btn) => {
-      btn.disabled = true;
-      try {
-        const r = await api(`/admin/api/accounts/${encodeURIComponent(a.name)}/checkin`, { method: 'POST' });
-        toast(r.message || '签到成功', r.outcome === 'error' ? 'err' : 'ok');
-        await loadAccounts();
-        await loadScheduler();
-      } catch (err) {
-        toast('签到失败：' + err.message, 'err');
-      } finally {
-        btn.disabled = false;
-      }
-    }));
-    tbody.appendChild(tr);
-  }
-}
+/* 「仅看异常」—— 账号多的时候，一键过滤出没签上/报错的那些。 */
+$('#btn-checkin-only-issues').addEventListener('click', () => {
+  state.checkinOnlyIssues = !state.checkinOnlyIssues;
+  const btn = $('#btn-checkin-only-issues');
+  btn.className = 'ghost sm' + (state.checkinOnlyIssues ? ' on' : '');
+  renderCheckinTable();
+});
 
 $('#btn-checkin-all').addEventListener('click', async (btn) => {
   btn.disabled = true;
@@ -2330,7 +2526,7 @@ function renderSystemInfo() {
   const c = state.config || {};
   const kv = $('#system-info-kv');
   kv.innerHTML = `
-    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.8.0')}</b></dd>
+    <dt>项目版本</dt><dd><b>v${escapeHtml(c.version || '0.9.0')}</b></dd>
     <dt>管理密钥文件</dt><dd><code>${escapeHtml(c.adminKeyPath || '—')}</code></dd>
     <dt>反代入站密钥</dt><dd><code>${escapeHtml(c.apiKeyMasked || '—')}</code></dd>
     <dt>账号池状态</dt><dd>已注册 ${c.accounts || 0} 个账号，可用 ${c.available || 0} 个</dd>`;

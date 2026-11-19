@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +10,7 @@ import { KeyRegistry } from './keys.js';
 import { SessionStore, ensureAdminKey } from './admin.js';
 import { RequestStore } from './requests.js';
 import { SchedulerService } from './scheduler.js';
+import { prevDateKey, zonedDateKey } from './checkin-window.js';
 import { InsightsLedger } from './insights.js';
 import type { Adapter } from 'waygate-core';
 
@@ -665,6 +666,109 @@ describe('Admin API: 新增功能路由测试', () => {
       const acc = res.body.accounts.find((a: any) => a.name === 'acc_due');
       expect(acc).toBeDefined();
       expect(acc.nextCheckinAt).toBeTypeOf('number');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('GET /admin/api/accounts 下发签到摘要（昨天签没签 / 积分 / 下次 / 异常）', async () => {
+    const ctx = await setupServer();
+    try {
+      const d = accountDir('acc_sum');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_sum',
+          refreshToken: 'refresh_sum',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      const store = ctx.pool.getAccountStore();
+      store.upsert('acc_sum', 'cn');
+      /* 昨天签到成功、今天失败一次 —— 摘要要能同时表达这两件事。 */
+      const yesterdayKey = prevDateKey(zonedDateKey(Date.now(), 'Asia/Shanghai'));
+      store.update('acc_sum', {
+        checkinDays: {
+          [yesterdayKey]: {
+            at: Date.now() - 86_400_000,
+            outcome: 'claimed',
+            signed: true,
+            signedAt: Date.now() - 86_400_000,
+            points: 42,
+            streak: 2,
+            message: '签到成功',
+          },
+          [zonedDateKey(Date.now(), 'Asia/Shanghai')]: {
+            at: Date.now(),
+            outcome: 'error',
+            signed: false,
+            signedAt: null,
+            points: null,
+            streak: null,
+            message: '上游 5xx',
+          },
+        },
+      });
+
+      const res = await ctx.req('/admin/api/accounts');
+      expect(res.status).toBe(200);
+      const acc = res.body.accounts.find((a: any) => a.name === 'acc_sum');
+      expect(acc).toBeDefined();
+      const s = acc.checkinSummary;
+      expect(s).toBeTruthy();
+      expect(s.yesterdayKey).toBe(yesterdayKey);
+      expect(s.yesterday.signed).toBe(true);
+      expect(s.yesterday.points).toBe(42);
+      expect(s.today.signed).toBe(false);
+      /* 上次异常必须能被前端读到。 */
+      expect(s.lastError.outcome).toBe('error');
+      expect(s.lastError.message).toBe('上游 5xx');
+      /* 台账本身也下发（近 7 天小格子要用）。 */
+      expect(Object.keys(acc.checkinDays).length).toBe(2);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('POST 单账号签到会写进台账（手动与后台自动同一套口径）', async () => {
+    const ctx = await setupServer();
+    try {
+      const d = accountDir('acc_manual');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_manual',
+          refreshToken: 'refresh_manual',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      ctx.pool.getAccountStore().upsert('acc_manual', 'cn');
+
+      const { MinimaxActivity } = await import('./activity.js');
+      const spy = vi.spyOn(MinimaxActivity.prototype, 'checkin').mockResolvedValue({
+        outcome: 'claimed',
+        points: 66,
+        streak: 3,
+        message: '签到成功',
+      });
+
+      const res = await ctx.req('/admin/api/accounts/acc_manual/checkin', { method: 'POST' });
+      expect(res.status).toBe(200);
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      /* 手动签到必须与后台自动签到一样进台账 —— 否则页面会误报「昨天没签」。 */
+      const list = await ctx.req('/admin/api/accounts');
+      const acc = list.body.accounts.find((a: any) => a.name === 'acc_manual');
+      const todayKey = zonedDateKey(Date.now(), 'Asia/Shanghai');
+      expect(acc.checkinDays[todayKey]?.signed).toBe(true);
+      expect(acc.checkinDays[todayKey]?.points).toBe(66);
+      expect(acc.checkinSummary.today?.signed).toBe(true);
+
+      spy.mockRestore();
     } finally {
       await ctx.close();
     }

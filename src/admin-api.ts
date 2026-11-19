@@ -89,7 +89,7 @@ import { probeAccount, probeAllAccounts, warmupAccount, warmupAllAccounts } from
 import { parseHhMm, isValidTimezone } from './checkin-window.js';
 import { CredentialError } from './errors.js';
 import type { RequestStore, RequestSource } from './requests.js';
-import type { SchedulerService } from './scheduler.js';
+import type { SchedulerService, AccountCheckinSummary } from './scheduler.js';
 
 export const SESSION_COOKIE = 'mmcode_session';
 
@@ -230,11 +230,16 @@ function validateSchedulerPatch(body: Record<string, unknown>): string | null {
  * `probability` = 此刻开新会话分配到该账号的概率（0~1）——
  * 由 `AccountPool.selectionProbabilities()` 算好传进来，
  * 保证管理页显示的算法与调度器实际用的算法**是同一套**。
+ *
+ * `checkinSummary` = 签到摘要（昨天签没签 / 什么时候签的 / 拿到多少积分 /
+ * 下次什么时候签 / 上次有没有异常）—— 由调度器按**该账号所属时区**算好传进来，
+ * 前端不自己算时区，免得「昨天」对海外号算错。
  */
 function accountView(
   a: PoolAccount,
   probability = 0,
   nextCheckinAt: number | null = null,
+  checkinSummary: AccountCheckinSummary | null = null,
 ): Record<string, unknown> {
   const cooling = typeof a.record.disabledUntil === 'number' && a.record.disabledUntil > Date.now();
   const frozen = a.record.frozen === true;
@@ -245,6 +250,10 @@ function accountView(
     checkinEnabled: a.record.checkinEnabled !== false,
     /** 下次计划签到时刻（epoch ms）。 */
     nextCheckinAt,
+    /** 签到摘要（昨天/今天/上次/下次/异常）—— 没有调度器时为 null。 */
+    checkinSummary,
+    /** 按天的签到台账（最近 N 天）—— 供页面画「近 7 天」的小格子。 */
+    checkinDays: a.record.checkinDays ?? {},
     /** 优先级层（数字越小越优先）。 */
     priority: a.record.priority,
     /** 新会话分配到该账号的概率（0~1）。0 = 不在当前最高可用层，或不可调度。 */
@@ -325,6 +334,10 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
     const nextCheckinOf = (a: PoolAccount): number | null => {
       return ctx.scheduler ? ctx.scheduler.nextAccountDueAt(a) : null;
     };
+    /** 签到摘要（昨天签没签 / 什么时候签的 / 积分 / 下次 / 异常）—— 按账号时区算。 */
+    const checkinSummaryOf = (a: PoolAccount): AccountCheckinSummary | null => {
+      return ctx.scheduler ? ctx.scheduler.accountCheckinSummary(a) : null;
+    };
 
     /* ── 会话相关：不要求已鉴权（否则没法登录） ── */
     if (route === 'session') {
@@ -369,7 +382,9 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
     try {
       /* ── 账号列表 ── */
       if (route === 'accounts' && method === 'GET') {
-        const accounts = ctx.pool.refresh().map((a) => accountView(a, probOf(a.record.name), nextCheckinOf(a)));
+        const accounts = ctx.pool.refresh().map((a) =>
+          accountView(a, probOf(a.record.name), nextCheckinOf(a), checkinSummaryOf(a)),
+        );
         sendJson(res, 200, {
           accounts,
           mode: store.mode(),
@@ -389,7 +404,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const region: MinimaxRegion = body.region === 'global' ? 'global' : 'cn';
         const record = store.upsert(name, region);
         const found = ctx.pool.get(name);
-        sendJson(res, 200, { ok: true, account: found ? accountView(found, probOf(found.record.name), nextCheckinOf(found)) : record });
+        sendJson(res, 200, { ok: true, account: found ? accountView(found, probOf(found.record.name), nextCheckinOf(found), checkinSummaryOf(found)) : record });
         return true;
       }
 
@@ -402,7 +417,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
         const order = raw.filter((n): n is string => typeof n === 'string' && n.length > 0);
         const accounts = store.reorder(order).map((rec) => {
           const found = ctx.pool.get(rec.name);
-          return found ? accountView(found, probOf(found.record.name), nextCheckinOf(found)) : rec;
+          return found ? accountView(found, probOf(found.record.name), nextCheckinOf(found), checkinSummaryOf(found)) : rec;
         });
         sendJson(res, 200, { ok: true, accounts });
         return true;
@@ -548,7 +563,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
             return true;
           }
           const found = ctx.pool.get(name);
-          sendJson(res, 200, { ok: true, account: found ? accountView(found, probOf(found.record.name), nextCheckinOf(found)) : updated });
+          sendJson(res, 200, { ok: true, account: found ? accountView(found, probOf(found.record.name), nextCheckinOf(found), checkinSummaryOf(found)) : updated });
           return true;
         }
 
@@ -622,15 +637,17 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
             () => found.credential?.region ?? found.record.region,
           );
           const result = await activity.checkin();
-          const update: Partial<AccountRecord> = {
-            lastCheckin: { at: Date.now(), ...result },
-          };
-          if (result.outcome === 'claimed' && result.points != null) {
-            update.lastReward = { at: Date.now(), points: result.points };
-          } else if (result.outcome === 'already' && result.points != null && (!found.record.lastReward || !found.record.lastReward.points)) {
-            update.lastReward = { at: Date.now(), points: result.points };
+          /* 手动签到与后台自动签到**共用同一套落盘口径**（台账 + lastCheckin + lastReward），
+             否则手动补签成功了、台账却没记，页面会误报「昨天没签」。 */
+          if (ctx.scheduler) {
+            ctx.scheduler.recordCheckinAttempt(name, result);
+          } else {
+            const update: Partial<AccountRecord> = { lastCheckin: { at: Date.now(), ...result } };
+            if (result.outcome === 'claimed' && result.points != null) {
+              update.lastReward = { at: Date.now(), points: result.points };
+            }
+            store.update(name, update);
           }
-          store.update(name, update);
           sendJson(res, 200, result);
           return true;
         }
@@ -666,7 +683,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           } catch (err) {
             checks.push({ name: '令牌刷新', ok: false, detail: (err as Error).message });
           }
-          sendJson(res, 200, { name, checks, credential: accountView(found, probOf(found.record.name), nextCheckinOf(found)) });
+          sendJson(res, 200, { name, checks, credential: accountView(found, probOf(found.record.name), nextCheckinOf(found), checkinSummaryOf(found)) });
           return true;
         }
 
@@ -675,7 +692,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           const found = mustFind(name);
           const result = await probeAccount(ctx.pool, found, { requests: ctx.requests });
           const refreshed = ctx.pool.get(name);
-          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed, probOf(refreshed.record.name), nextCheckinOf(refreshed)) : null });
+          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed, probOf(refreshed.record.name), nextCheckinOf(refreshed), checkinSummaryOf(refreshed)) : null });
           return true;
         }
 
@@ -684,7 +701,7 @@ export function createAdminApi(ctx: AdminApiContext): (req: IncomingMessage, res
           const found = mustFind(name);
           const result = await warmupAccount(ctx.pool, found, { requests: ctx.requests });
           const refreshed = ctx.pool.get(name);
-          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed, probOf(refreshed.record.name), nextCheckinOf(refreshed)) : null });
+          sendJson(res, 200, { ok: result.ok, result, account: refreshed ? accountView(refreshed, probOf(refreshed.record.name), nextCheckinOf(refreshed), checkinSummaryOf(refreshed)) : null });
           return true;
         }
 

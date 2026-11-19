@@ -29,7 +29,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { AccountPool, PoolAccount } from './pool.js';
-import type { AccountRecord } from './accounts.js';
+import type { AccountRecord, CheckinDayEntry } from './accounts.js';
+import { recordCheckinDay } from './accounts.js';
 import type { MinimaxRegion } from './credential.js';
 import { MinimaxActivity, type SigninResult } from './activity.js';
 import {
@@ -46,6 +47,7 @@ import {
   nextDateKey,
   normalizeHhMm,
   parseHhMm,
+  prevDateKey,
   resolveDailyDueAt,
   resolveWindowRange,
   zonedDateKey,
@@ -223,12 +225,59 @@ export interface CreditsHistoryItem {
 }
 
 /**
+ * 单个账号的**签到摘要** —— 管理页「自动签到」面板直接照这个渲染。
+ *
+ * 字段刻意只围绕真正关心的问题：
+ *   昨天签没签（`yesterday.signed`）→ 什么时候签的（`yesterday.signedAt`）
+ *   → 拿到多少积分（`yesterday.points`）→ 下次什么时候签（`nextAt`）
+ *   → 上次有没有异常（`lastError`）。
+ */
+export interface AccountCheckinSummary {
+  /** 该账号所在时区的今天（"YYYY-MM-DD"）。 */
+  todayKey: string;
+  /** 昨天（"YYYY-MM-DD"）。 */
+  yesterdayKey: string;
+  /** 昨天的签到记录；null = 昨天没有任何签到动作（漏签，或当时服务没跑）。 */
+  yesterday: CheckinDayEntry | null;
+  /** 今天的签到记录。 */
+  today: CheckinDayEntry | null;
+  /** 最近一次签到尝试（不限当天）。 */
+  last: CheckinDayEntry | null;
+  /** 最近一次尝试是否异常（error / unavailable）；没有异常为 null。 */
+  lastError: { at: number; outcome: string; message: string } | null;
+  /** 下次计划签到时刻（epoch ms）；已停用自动签到为 null。 */
+  nextAt: number | null;
+  /** 今天是否已经签到。 */
+  signedToday: boolean;
+}
+
+/**
  * 签到失败后的最小重试间隔（ms）。
  *
  * 为什么需要：签到失败时「今天已签」的标记不会写上，账号仍算未签到 ——
  * 若不加这个间隔，精确唤醒会立刻再次触发，反复打上游（热循环）。
  */
 export const CHECKIN_RETRY_DELAY_MS = 10 * 60 * 1000;
+
+/**
+ * 失败重试间隔的**上限**（2 小时）。
+ *
+ * 为什么要有上限：翻倍到几小时后就别再频繁试了 —— 上游真出问题时，
+ * 继续高频重试只是骚扰；两小时一次足够在它恢复后很快跟上。
+ */
+export const CHECKIN_RETRY_MAX_DELAY_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * 签到失败后的重试间隔（ms）—— **逐次翻倍**，封顶 `CHECKIN_RETRY_MAX_DELAY_MS`。
+ *
+ * 为什么不用固定间隔：固定 10 分钟的话，一个持续报错的账号一天能被刷几十次
+ * （上游视角就是 abuse）；翻倍后**前几次很快**（网络抖动要立刻补签），
+ * 后面越拖越久（上游真挂了就别继续骚扰）。
+ */
+export function checkinRetryDelayMs(failStreak: number): number {
+  const n = Number.isFinite(failStreak) && failStreak > 0 ? Math.floor(failStreak) : 1;
+  return Math.min(CHECKIN_RETRY_MAX_DELAY_MS, CHECKIN_RETRY_DELAY_MS * 2 ** (n - 1));
+}
 
 export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
   autoCheckin: {
@@ -298,6 +347,15 @@ export class SchedulerService {
    * 有了它，失败账号至少隔 `CHECKIN_RETRY_DELAY_MS` 才会再试。
    */
   private readonly lastCheckinAttempt = new Map<string, number>();
+
+  /**
+   * 每个账号**连续签到失败**的次数 —— 决定下一次重试要等多久。
+   *
+   * 为什么要单独记：`lastCheckinAttempt` 只有时刻，算不出「已经失败几次」；
+   * 有了次数才能做**递增退避**（10 分钟 → 20 → 40 … 封顶 2 小时），
+   * 避免一个坏账号被反复重试刷爆上游。
+   */
+  private readonly checkinFailStreak = new Map<string, number>();
 
   private checkinHistory: CheckinHistoryItem[] = [];
   private refreshHistory: RefreshHistoryItem[] = [];
@@ -610,15 +668,8 @@ export class SchedulerService {
           () => account.credential?.region ?? account.record.region,
         );
         const result = await activity.checkin();
-        const update: Partial<AccountRecord> = {
-          lastCheckin: { at: Date.now(), ...result },
-        };
-        if (result.outcome === 'claimed' && result.points != null) {
-          update.lastReward = { at: Date.now(), points: result.points };
-        } else if (result.outcome === 'already' && result.points != null && (!account.record.lastReward || !account.record.lastReward.points)) {
-          update.lastReward = { at: Date.now(), points: result.points };
-        }
-        this.pool.getAccountStore().update(account.record.name, update);
+        /* 落盘口径统一走这里 —— 台账 + lastCheckin + lastReward 一次写齐。 */
+        this.recordCheckinAttempt(account.record.name, result);
 
         const historyItem: CheckinHistoryItem = {
           at: Date.now(),
@@ -641,6 +692,8 @@ export class SchedulerService {
           streak: null,
           message: errMsg,
         };
+        /* 失败也要进台账 —— 「上次签到是否异常」靠的就是这条。 */
+        this.recordCheckinAttempt(account.record.name, errResult);
         this.checkinHistory.unshift({
           at: Date.now(),
           account: account.record.name,
@@ -706,15 +759,8 @@ export class SchedulerService {
           () => account.credential?.region ?? account.record.region,
         );
         const result = await activity.checkin();
-        const update: Partial<AccountRecord> = {
-          lastCheckin: { at: Date.now(), ...result },
-        };
-        if (result.outcome === 'claimed' && result.points != null) {
-          update.lastReward = { at: Date.now(), points: result.points };
-        } else if (result.outcome === 'already' && result.points != null && (!account.record.lastReward || !account.record.lastReward.points)) {
-          update.lastReward = { at: Date.now(), points: result.points };
-        }
-        this.pool.getAccountStore().update(account.record.name, update);
+        /* 落盘口径统一走这里 —— 台账 + lastCheckin + lastReward 一次写齐。 */
+        this.recordCheckinAttempt(account.record.name, result);
 
         this.checkinHistory.unshift({
           at: Date.now(),
@@ -728,7 +774,15 @@ export class SchedulerService {
 
         this.log(`[后台自动签到] 账号 [${account.record.name}]：${result.outcome} (${result.message})`);
       } catch (err) {
-        this.log(`[后台自动签到] 账号 [${account.record.name}] 失败：${(err as Error).message}`);
+        const errMsg = (err as Error).message;
+        /* 失败也要进台账 —— 页面要能看到「上次签到异常」。 */
+        this.recordCheckinAttempt(account.record.name, {
+          outcome: 'error',
+          points: null,
+          streak: null,
+          message: errMsg,
+        });
+        this.log(`[后台自动签到] 账号 [${account.record.name}] 失败：${errMsg}`);
       }
     }
     this.lastCheckinRun = now;
@@ -748,16 +802,124 @@ export class SchedulerService {
     return this.config.autoCheckin[region] ?? this.config.autoCheckin.cn;
   }
 
-  /** 该账号今天是否已经签到成功（claimed / already 都算 —— 上游说「今天已签」也是签过了）。 */
+  /**
+   * 该账号今天是否已经签到成功（claimed / already 都算 —— 上游说「今天已签」也是签过了）。
+   *
+   * ★ **台账优先**：`lastCheckin` 只留最近一次，若当天「先签成功、之后一次重试失败」，
+   *   只看 `lastCheckin` 会把今天误判成「没签」→ 白白重复签一次。
+   *   台账里 `signed` 是粘性的（成功后不会被失败覆盖），所以以它为准。
+   *
+   * 兼容老数据：台账是新版才有的，老账号只有 `lastCheckin` —— 回落到它。
+   */
   checkedInToday(account: PoolAccount, now: number): boolean {
-    const last = account.record.lastCheckin;
-    if (!last?.at) return false;
     const region = account.record.region ?? 'cn';
     const timezone = this.scheduleFor(region).timezone;
+    const todayKey = zonedDateKey(now, timezone);
+    const entry = account.record.checkinDays?.[todayKey];
+    if (entry) return entry.signed;
+    const last = account.record.lastCheckin;
+    if (!last?.at) return false;
     return (
       isSameZonedDay(last.at, now, timezone) &&
       (last.outcome === 'claimed' || last.outcome === 'already')
     );
+  }
+
+  /**
+   * 落盘一次签到尝试 —— 写「按天台账」+ 更新 `lastCheckin` / `lastReward`。
+   *
+   * 为什么后台自动签到与管理页手动签到都走这里：
+   * 两者的落盘口径必须**完全一致**，否则台账会互相打架
+   * （手动补签成功却没进台账 → 页面显示「昨天没签」）。
+   */
+  recordCheckinAttempt(
+    accountName: string,
+    result: SigninResult,
+    at: number = Date.now(),
+  ): void {
+    const store = this.pool.getAccountStore();
+    const record = store.get(accountName);
+    if (!record) return;
+    const region = record.region ?? 'cn';
+    const timezone = this.scheduleFor(region).timezone;
+    const dateKey = zonedDateKey(at, timezone);
+    const update: Partial<AccountRecord> = {
+      lastCheckin: { at, ...result },
+      checkinDays: recordCheckinDay(record.checkinDays, dateKey, {
+        at,
+        outcome: result.outcome,
+        points: result.points,
+        streak: result.streak,
+        message: result.message,
+      }),
+    };
+    if (result.outcome === 'claimed' && result.points != null) {
+      update.lastReward = { at, points: result.points };
+    } else if (
+      result.outcome === 'already' &&
+      result.points != null &&
+      (!record.lastReward || !record.lastReward.points)
+    ) {
+      update.lastReward = { at, points: result.points };
+    }
+    store.update(accountName, update);
+
+    /* 成功就把失败计数清零 —— 退避是按「连续失败」算的。 */
+    if (result.outcome === 'claimed' || result.outcome === 'already') {
+      this.checkinFailStreak.delete(accountName);
+    } else {
+      this.checkinFailStreak.set(
+        accountName,
+        (this.checkinFailStreak.get(accountName) ?? 0) + 1,
+      );
+    }
+  }
+
+  /**
+   * 某个账号的**签到摘要** —— 管理页面板的数据源。
+   *
+   * 全部按**该账号所属时区**计算：国内号与海外号的「今天/昨天」不是同一个日子。
+   */
+  accountCheckinSummary(account: PoolAccount, now: number = Date.now()): AccountCheckinSummary {
+    const region = account.record.region ?? 'cn';
+    const timezone = this.scheduleFor(region).timezone;
+    const todayKey = zonedDateKey(now, timezone);
+    const yesterdayKey = prevDateKey(todayKey);
+    const days = account.record.checkinDays ?? {};
+
+    /* 最近一次尝试 = 台账里 at 最大的一条；台账为空时回落到 lastCheckin（老数据）。 */
+    let last: CheckinDayEntry | null = null;
+    for (const entry of Object.values(days)) {
+      if (!last || entry.at > last.at) last = entry;
+    }
+    if (!last && account.record.lastCheckin?.at) {
+      const c = account.record.lastCheckin;
+      last = {
+        at: c.at,
+        outcome: c.outcome,
+        signed: c.outcome === 'claimed' || c.outcome === 'already',
+        signedAt: c.outcome === 'claimed' || c.outcome === 'already' ? c.at : null,
+        points: c.points,
+        streak: c.streak,
+        message: c.message,
+      };
+    }
+
+    const lastError =
+      last && (last.outcome === 'error' || last.outcome === 'unavailable')
+        ? { at: last.at, outcome: last.outcome, message: last.message }
+        : null;
+
+    return {
+      todayKey,
+      yesterdayKey,
+      yesterday: days[yesterdayKey] ?? null,
+      today: days[todayKey] ?? null,
+      last,
+      lastError,
+      nextAt: this.nextAccountDueAt(account, now),
+      signedToday: this.checkedInToday(account, now),
+    };
   }
 
   /**
@@ -798,7 +960,10 @@ export class SchedulerService {
     }
     const dueAt = this.accountDueAt(account.record.name, region, todayKey);
     const attempted = this.lastCheckinAttempt.get(account.record.name);
-    return attempted === undefined ? dueAt : Math.max(dueAt, attempted + CHECKIN_RETRY_DELAY_MS);
+    if (attempted === undefined) return dueAt;
+    /* 失败重试按「连续失败次数」递增退避（10 分钟 → 20 → 40 … 封顶 2 小时）。 */
+    const streak = this.checkinFailStreak.get(account.record.name) ?? 0;
+    return Math.max(dueAt, attempted + checkinRetryDelayMs(streak));
   }
 
   /** 某区域今日的签到窗口（给管理页展示）。 */
@@ -825,7 +990,13 @@ export class SchedulerService {
       const schedule = this.scheduleFor(region);
       const dateKey = zonedDateKey(now, schedule.timezone);
       const dueAt = this.accountDueAt(account.record.name, region, dateKey);
-      if (now < dueAt) out.push({ account, dueAt });
+      /* 正在退避等待重试的账号 —— 展示的时刻要用退避后的，否则页面会显示「马上要签」
+         而实际还要再等十几分钟。 */
+      const attempted = this.lastCheckinAttempt.get(account.record.name);
+      const streak = this.checkinFailStreak.get(account.record.name) ?? 0;
+      const effectiveDue =
+        attempted === undefined ? dueAt : Math.max(dueAt, attempted + checkinRetryDelayMs(streak));
+      if (now < effectiveDue) out.push({ account, dueAt: effectiveDue });
     }
     return out;
   }
@@ -885,8 +1056,9 @@ export class SchedulerService {
       }
       const dueAt = this.accountDueAt(account.record.name, region, todayKey);
       const attempted = this.lastCheckinAttempt.get(account.record.name);
+      const streak = this.checkinFailStreak.get(account.record.name) ?? 0;
       const retryAt =
-        attempted === undefined ? dueAt : Math.max(dueAt, attempted + CHECKIN_RETRY_DELAY_MS);
+        attempted === undefined ? dueAt : Math.max(dueAt, attempted + checkinRetryDelayMs(streak));
       bump(retryAt);
     }
     return best;

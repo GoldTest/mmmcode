@@ -47,6 +47,123 @@ export interface CheckinSnapshot {
   message: string;
 }
 
+/**
+ * 某一天的签到记录 —— 按**账号所属时区**的自然日归档。
+ *
+ * ## 为什么要有它
+ * `lastCheckin` 只留**最近一次**，答不了「昨天签没签」。
+ * 而「昨天签没签」恰恰是判断**自动签到到底有没有在跑**的唯一硬证据：
+ * 没有台账，页面只能显示「上次签到成功」，看不出那是今天、昨天还是上上周。
+ *
+ * ## 一个账号一天只留一条
+ * 同一天可能签很多次（失败重试、手动补签），这里**合并成一条**：
+ *   · `outcome` / `at` / `message` = 当天**最后一次尝试**（用于「上次是否有异常」）；
+ *   · `signed` / `signedAt` = 当天**签成的那一刻**（成功后再失败也不会被抹掉）；
+ *   · `points` = 当天拿到的积分（第一次成功时记下）。
+ */
+export interface CheckinDayEntry {
+  /** 当天**最后一次签到尝试**的时刻（epoch ms）。 */
+  at: number;
+  /** 当天最后一次尝试的结果。 */
+  outcome: 'claimed' | 'already' | 'unavailable' | 'error';
+  /** 当天是否签到成功（`claimed` / `already` 都算 —— 上游说「今天已签」也是签过了）。 */
+  signed: boolean;
+  /** 当天**签成的那一刻**（epoch ms）；没签成过为 null。 */
+  signedAt: number | null;
+  /** 当天拿到的积分；没拿到为 null。 */
+  points: number | null;
+  /** 上游回报的连续签到天数。 */
+  streak: number | null;
+  /** 最后一次尝试的说明（异常时是错误信息）。 */
+  message: string;
+}
+
+/** 签到台账保留的自然日天数 —— 够看「昨天/今天」又不至于把注册表撑大。 */
+export const CHECKIN_LEDGER_DAYS = 7;
+
+/**
+ * 清洗签到台账 —— 只保留结构合法的条目。
+ *
+ * 为什么必须清洗：台账是从磁盘读回来的**外部数据**（用户可能手改过 accounts.json），
+ * 字段类型不对就直接用会让管理页渲染炸掉。宁可丢掉这条，也不要整个页面 500。
+ */
+export function sanitizeCheckinDays(raw: unknown): Record<string, CheckinDayEntry> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, CheckinDayEntry> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    /* 日期键必须是 "YYYY-MM-DD" —— 字典序即时间序，裁剪时靠它排序。 */
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) continue;
+    if (!value || typeof value !== 'object') continue;
+    const v = value as Record<string, unknown>;
+    const outcome = v['outcome'];
+    if (
+      outcome !== 'claimed' &&
+      outcome !== 'already' &&
+      outcome !== 'unavailable' &&
+      outcome !== 'error'
+    ) {
+      continue;
+    }
+    const at = Number(v['at']);
+    if (!Number.isFinite(at)) continue;
+    const num = (x: unknown): number | null => {
+      if (x == null) return null;
+      const n = Number(x);
+      return Number.isFinite(n) ? n : null;
+    };
+    out[key] = {
+      at,
+      outcome,
+      signed: v['signed'] === true,
+      signedAt: num(v['signedAt']),
+      points: num(v['points']),
+      streak: num(v['streak']),
+      message: typeof v['message'] === 'string' ? v['message'] : '',
+    };
+  }
+  return out;
+}
+
+/**
+ * 往台账里写一次签到尝试 —— 同一天合并，只保留最近 `keep` 天。
+ *
+ * 合并规则（见 `CheckinDayEntry` 注释）：成功是**粘性**的 ——
+ * 当天签成之后再来一次失败重试，不能把「今天签了」抹成「今天没签」。
+ */
+export function recordCheckinDay(
+  days: Record<string, CheckinDayEntry> | undefined,
+  dateKey: string,
+  attempt: {
+    at: number;
+    outcome: CheckinDayEntry['outcome'];
+    points: number | null;
+    streak: number | null;
+    message: string;
+  },
+  keep: number = CHECKIN_LEDGER_DAYS,
+): Record<string, CheckinDayEntry> {
+  const next = { ...sanitizeCheckinDays(days) };
+  const prev = next[dateKey];
+  const ok = attempt.outcome === 'claimed' || attempt.outcome === 'already';
+  next[dateKey] = {
+    at: attempt.at,
+    outcome: attempt.outcome,
+    signed: ok || prev?.signed === true,
+    signedAt: ok ? attempt.at : (prev?.signedAt ?? null),
+    points: attempt.points ?? prev?.points ?? null,
+    streak: attempt.streak ?? prev?.streak ?? null,
+    message: attempt.message,
+  };
+  /* 只保留最近的 N 天 —— 日期键字典序即时间序，从最老的开始丢。 */
+  const keys = Object.keys(next).sort();
+  const limit = Math.max(1, Math.floor(keep));
+  while (keys.length > limit) {
+    const dropped = keys.shift();
+    if (dropped) delete next[dropped];
+  }
+  return next;
+}
+
 /** 一次签到奖励快照（获取到奖励的时刻与积分值）。 */
 export interface RewardSnapshot {
   at: number;
@@ -120,6 +237,13 @@ export interface AccountRecord {
   lastUsedAt?: number;
   /** 上次签到结果。 */
   lastCheckin?: CheckinSnapshot;
+  /**
+   * 每日签到台账 —— key 是该账号所属时区下的自然日（"YYYY-MM-DD"）。
+   *
+   * 回答「昨天签没签 / 什么时候签的 / 拿到多少积分 / 上次有没有异常」；
+   * 只保留最近 `CHECKIN_LEDGER_DAYS` 天。
+   */
+  checkinDays?: Record<string, CheckinDayEntry>;
   /** 上次获取到的签到奖励（积分 + 获得时间）。 */
   lastReward?: RewardSnapshot;
   /** 上次积分查询结果。 */
@@ -323,6 +447,11 @@ export class AccountStore {
       frozenReason: typeof raw.frozenReason === 'string' ? raw.frozenReason : undefined,
       rateLimited: raw.rateLimited === true,
       rateLimitReason: typeof raw.rateLimitReason === 'string' ? raw.rateLimitReason : undefined,
+      /* 台账是外部数据 —— 读进来先清洗，别让坏字段流到页面上。 */
+      checkinDays: (() => {
+        const days = sanitizeCheckinDays(raw.checkinDays);
+        return Object.keys(days).length > 0 ? days : undefined;
+      })(),
       ...(lastReward ? { lastReward } : {}),
     };
   }

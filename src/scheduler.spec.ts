@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { isSameDayInShanghai, SchedulerService } from './scheduler.js';
-import { AccountStore } from './accounts.js';
+import { isSameDayInShanghai, SchedulerService, checkinRetryDelayMs } from './scheduler.js';
+import { AccountStore, recordCheckinDay } from './accounts.js';
 import { AccountPool } from './pool.js';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -362,5 +362,201 @@ describe('SchedulerService', () => {
       if (origHome === undefined) delete process.env.MMCODE_HOME;
       else process.env.MMCODE_HOME = origHome;
     }
+  });
+
+  /* ─────────────────── 签到台账（回答「昨天签没签」） ─────────────────── */
+
+  it('台账优先：当天先签成功、后来一次失败，仍算「今天已签」', async () => {
+    vi.useFakeTimers();
+    /* 北京时间 2026-11-12 09:00 */
+    vi.setSystemTime(new Date('2026-11-12T01:00:00Z'));
+
+    const dir = mkdtempSync(join(tmpdir(), 'mmcode-test-'));
+    const store = new AccountStore({ filePath: join(dir, 'accounts.json') });
+    const origHome = process.env.MMCODE_HOME;
+    process.env.MMCODE_HOME = dir;
+    try {
+      const { accountDir } = await import('./accounts.js');
+      const d = accountDir('acc_cn');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_cn',
+          refreshToken: 'refresh_cn',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      store.upsert('acc_cn', 'cn');
+
+      const pool = new AccountPool(store);
+      const scheduler = new SchedulerService(pool, { configPath: join(dir, 'scheduler.json') });
+      scheduler.updateConfig({
+        autoCheckin: { cn: { time: '08:00', jitterMinutes: 0, timezone: 'Asia/Shanghai' } },
+      });
+
+      const signedAt = new Date('2026-11-12T00:05:00Z').getTime();
+      const failedAt = new Date('2026-11-12T00:30:00Z').getTime();
+      const days = recordCheckinDay(
+        recordCheckinDay(undefined, '2026-11-12', {
+          at: signedAt,
+          outcome: 'claimed',
+          points: 50,
+          streak: 2,
+          message: '签到成功',
+        }),
+        '2026-11-12',
+        { at: failedAt, outcome: 'error', points: null, streak: null, message: '上游 5xx' },
+      );
+      store.update('acc_cn', { checkinDays: days });
+
+      const acc = pool.get('acc_cn')!;
+      /* 关键：lastCheckin 是失败那次，但当天已签的事实不能丢。 */
+      expect(scheduler.checkedInToday(acc, Date.now())).toBe(true);
+      /* 下次签到应排到明天。 */
+      expect(scheduler.nextAccountDueAt(acc)).toBe(new Date('2026-11-13T00:00:00Z').getTime());
+
+      scheduler.stop();
+    } finally {
+      if (origHome === undefined) delete process.env.MMCODE_HOME;
+      else process.env.MMCODE_HOME = origHome;
+    }
+  });
+
+  it('accountCheckinSummary：给出昨天签没签 / 什么时候签的 / 积分 / 下次 / 上次异常', async () => {
+    vi.useFakeTimers();
+    /* 北京时间 2026-11-12 09:00 */
+    vi.setSystemTime(new Date('2026-11-12T01:00:00Z'));
+
+    const dir = mkdtempSync(join(tmpdir(), 'mmcode-test-'));
+    const store = new AccountStore({ filePath: join(dir, 'accounts.json') });
+    const origHome = process.env.MMCODE_HOME;
+    process.env.MMCODE_HOME = dir;
+    try {
+      const { accountDir } = await import('./accounts.js');
+      const d = accountDir('acc_cn');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_cn',
+          refreshToken: 'refresh_cn',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      store.upsert('acc_cn', 'cn');
+
+      const pool = new AccountPool(store);
+      const scheduler = new SchedulerService(pool, { configPath: join(dir, 'scheduler.json') });
+      scheduler.updateConfig({
+        autoCheckin: { cn: { time: '08:00', jitterMinutes: 0, timezone: 'Asia/Shanghai' } },
+      });
+
+      /* 昨天（11-11）签到成功，今天（11-12）失败一次。 */
+      const yesterdayAt = new Date('2026-11-11T00:05:00Z').getTime();
+      const todayFailedAt = new Date('2026-11-12T00:30:00Z').getTime();
+      let days = recordCheckinDay(undefined, '2026-11-11', {
+        at: yesterdayAt,
+        outcome: 'claimed',
+        points: 88,
+        streak: 4,
+        message: '签到成功',
+      });
+      days = recordCheckinDay(days, '2026-11-12', {
+        at: todayFailedAt,
+        outcome: 'error',
+        points: null,
+        streak: null,
+        message: '上游 5xx',
+      });
+      store.update('acc_cn', { checkinDays: days });
+
+      const acc = pool.get('acc_cn')!;
+      const s = scheduler.accountCheckinSummary(acc, Date.now());
+      expect(s.todayKey).toBe('2026-11-12');
+      expect(s.yesterdayKey).toBe('2026-11-11');
+      /* 昨天：签了、什么时候签的、拿到多少积分。 */
+      expect(s.yesterday?.signed).toBe(true);
+      expect(s.yesterday?.signedAt).toBe(yesterdayAt);
+      expect(s.yesterday?.points).toBe(88);
+      /* 今天还没签上，下次排到今天 08:00（已过点 → 立即补签）。 */
+      expect(s.signedToday).toBe(false);
+      expect(s.today?.outcome).toBe('error');
+      /* 上次异常要被指出来。 */
+      expect(s.lastError?.outcome).toBe('error');
+      expect(s.lastError?.message).toBe('上游 5xx');
+      expect(s.nextAt).not.toBeNull();
+
+      scheduler.stop();
+    } finally {
+      if (origHome === undefined) delete process.env.MMCODE_HOME;
+      else process.env.MMCODE_HOME = origHome;
+    }
+  });
+
+  it('后台签到成功会写进台账（昨天签没签才答得出来）', async () => {
+    vi.useFakeTimers();
+    /* 北京时间 2026-11-12 09:00 —— 已过 08:00 窗口，该签。 */
+    vi.setSystemTime(new Date('2026-11-12T01:00:00Z'));
+
+    const dir = mkdtempSync(join(tmpdir(), 'mmcode-test-'));
+    const store = new AccountStore({ filePath: join(dir, 'accounts.json') });
+    const origHome = process.env.MMCODE_HOME;
+    process.env.MMCODE_HOME = dir;
+    try {
+      const { accountDir } = await import('./accounts.js');
+      const d = accountDir('acc_cn');
+      mkdirSync(d, { recursive: true });
+      writeFileSync(
+        join(d, 'credential.json'),
+        JSON.stringify({
+          accessToken: 'token_cn',
+          refreshToken: 'refresh_cn',
+          expiresAt: Date.now() + 3_600_000,
+          region: 'cn',
+        }),
+      );
+      store.upsert('acc_cn', 'cn');
+
+      const pool = new AccountPool(store);
+      const scheduler = new SchedulerService(pool, { configPath: join(dir, 'scheduler.json') });
+      scheduler.updateConfig({
+        autoCheckin: { cn: { time: '08:00', jitterMinutes: 0, timezone: 'Asia/Shanghai' } },
+      });
+
+      const { MinimaxActivity } = await import('./activity.js');
+      const checkinSpy = vi.spyOn(MinimaxActivity.prototype, 'checkin').mockResolvedValue({
+        outcome: 'claimed',
+        points: 66,
+        streak: 5,
+        message: '签到成功',
+      });
+
+      await scheduler.checkAndRunAutoCheckin();
+      expect(checkinSpy).toHaveBeenCalledTimes(1);
+
+      const record = store.get('acc_cn');
+      expect(record?.checkinDays?.['2026-11-12']?.signed).toBe(true);
+      expect(record?.checkinDays?.['2026-11-12']?.points).toBe(66);
+      expect(record?.lastReward?.points).toBe(66);
+
+      scheduler.stop();
+      checkinSpy.mockRestore();
+    } finally {
+      if (origHome === undefined) delete process.env.MMCODE_HOME;
+      else process.env.MMCODE_HOME = origHome;
+    }
+  });
+
+  it('失败重试按「连续失败次数」递增退避，封顶 2 小时', () => {
+    expect(checkinRetryDelayMs(1)).toBe(10 * 60 * 1000);
+    expect(checkinRetryDelayMs(2)).toBe(20 * 60 * 1000);
+    expect(checkinRetryDelayMs(3)).toBe(40 * 60 * 1000);
+    /* 封顶 —— 不能无限翻倍，否则一个坏账号会被刷成灾难。 */
+    expect(checkinRetryDelayMs(20)).toBe(2 * 60 * 60 * 1000);
+    /* 非法值退回最小间隔。 */
+    expect(checkinRetryDelayMs(0)).toBe(10 * 60 * 1000);
   });
 });

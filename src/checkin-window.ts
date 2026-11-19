@@ -172,6 +172,20 @@ export function nextDateKey(dateKey: string): string {
 }
 
 /**
+ * 日期键的上一个自然日（用于算「昨天」）。
+ *
+ * 为什么要有「昨天」：自动签到真正的价值是**昨天有没有替我签上**，
+ * 这是判断后台任务是否真的在跑的硬指标（今天才刚开始，看不出来）。
+ */
+export function prevDateKey(dateKey: string): string {
+  const { y, m, d } = parseDateKey(dateKey);
+  const prev = new Date(Date.UTC(y, m - 1, d) - 24 * 3600 * 1000);
+  const mm = String(prev.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(prev.getUTCDate()).padStart(2, '0');
+  return `${prev.getUTCFullYear()}-${mm}-${dd}`;
+}
+
+/**
  * 指定时区某天某刻对应的 epoch 毫秒。
  *
  * 先拿「墙上时间当成 UTC」的粗估，再用该时刻的时区偏移校正回去。

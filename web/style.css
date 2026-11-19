@@ -69,7 +69,6 @@
 
   /* ── 布局 ── */
   --content-max: 1280px;
-  --topbar-h: 56px;
 }
 
 * { box-sizing: border-box; }
@@ -131,57 +130,10 @@ code {
 .hint p { margin: var(--sp-2) 0 0; }
 
 /* ───────── 顶栏 ─────────
-   为什么必须有顶栏：管理页只有一个 Tab 导航时，用户打开页面看不到
-   「这是什么产品 / 现在什么状态 / 怎么退出」。顶栏补上这三件事。 */
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-4);
-  height: var(--topbar-h);
-  padding: 0 var(--sp-6);
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-  position: sticky;
-  top: 0;
-  z-index: 30;
-}
-.topbar-brand {
-  display: flex;
-  align-items: baseline;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-.topbar-brand strong {
-  font-size: var(--fs-md);
-  font-weight: 600;
-  letter-spacing: 0.2px;
-  white-space: nowrap;
-}
-.topbar-version {
-  font-size: var(--fs-xs);
-  font-family: var(--font-mono);
-  color: var(--fg-mute);
-  white-space: nowrap;
-}
-.topbar-status {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  font-size: var(--fs-sm);
-  color: var(--fg-dim);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* 状态用**文字**表达而不是小圆点 —— 一个色块在深色底上很难读懂，
-   「3/5 账号可用」这种文案直接说明状态，不用点开就知道。 */
-.topbar-status b { color: var(--fg); font-weight: 600; }
-.topbar-status.is-ok b { color: var(--ok); }
-.topbar-status.is-warn b { color: var(--warn); }
-.topbar-status.is-err b { color: var(--err); }
-.topbar-actions { display: flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }
+   原来这里有一条顶栏（品牌 / 版本 / 状态 / 刷新 / 退出），已整条删除 ——
+   管理页的垂直空间紧张，那条 56px 的横条换来的信息都有别处可看：
+   版本号在「设置 → 系统运行环境信息」，退出登录在设置页底部，
+   服务状态在「反代」Tab 里。 */
 
 /* ───────── 蹬额度模式横幅 ───────── */
 .burn-banner {
@@ -218,7 +170,7 @@ code {
   background: var(--bg);
   padding: 0 var(--sp-6);
   position: sticky;
-  top: var(--topbar-h);
+  top: 0;
   z-index: 20;
   overflow-x: auto;
   scrollbar-width: none;
@@ -423,6 +375,152 @@ main {
 .tag.warn { color: var(--warn); border-color: rgba(210, 153, 34, 0.35); background: var(--warn-soft); }
 .tag.err { color: var(--err); border-color: rgba(248, 81, 73, 0.35); background: var(--err-soft); }
 .tag.info { color: var(--accent); border-color: rgba(76, 141, 255, 0.35); background: var(--accent-soft); }
+
+/* ───────── 自动签到：紧凑版 ─────────
+   为什么不用表格：签到只需要回答几个固定问题，表格的表头 + 七列宽度
+   会把「每账号一行」撑成「每账号四五行」，页面纵向被吃满。
+   改成「一行 chip 概览 + 每账号一行的紧凑列表」——同样的信息，
+   纵向占用只有原来的三分之一。 */
+.ckin-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--line-soft);
+}
+.ckin-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--bg-soft);
+  font-size: var(--fs-sm);
+  color: var(--fg-dim);
+  min-width: 0;
+}
+.ckin-chip i { font-style: normal; color: var(--fg-mute); }
+.ckin-chip b {
+  color: var(--fg);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.ckin-chip b.ok { color: var(--ok); }
+.ckin-chip b.warn { color: var(--warn); }
+.ckin-chip b.err { color: var(--err); }
+.ckin-chip b.muted { color: var(--fg-mute); }
+.ckin-chip em {
+  font-style: normal;
+  color: var(--fg-mute);
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 30ch;
+}
+
+/* 每账号一行 —— 横向四段：账号 / 昨天 / 下次 / 异常，末尾是操作。 */
+.ckin-list { display: flex; flex-direction: column; }
+.ckin-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.4fr) minmax(120px, 1fr) minmax(130px, 1fr) minmax(80px, 0.9fr) auto;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 5px var(--sp-4);
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--line-soft);
+}
+.ckin-row:last-child { border-bottom: none; }
+.ckin-row:hover { background: var(--bg-soft); }
+.ckin-row.is-err { background: var(--err-soft); }
+
+.ckin-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--fg);
+}
+.ckin-name b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ckin-region { color: var(--fg-mute); font-size: var(--fs-xs); flex-shrink: 0; }
+
+/* 状态点：一枚点说明「昨天签没签」，比一个字省地方。 */
+.ckin-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--line);
+  flex-shrink: 0;
+}
+.ckin-dot.ok { background: var(--ok); }
+.ckin-dot.warn { background: var(--warn); }
+.ckin-dot.err { background: var(--err); }
+.ckin-dot.off { background: var(--fg-mute); }
+
+.ckin-when { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.ckin-time { color: var(--fg-dim); font-family: var(--font-mono); white-space: nowrap; }
+.ckin-pts { color: var(--ok); font-weight: 600; white-space: nowrap; }
+.ckin-pts.none { color: var(--fg-mute); font-weight: 400; }
+.ckin-pts.warn { color: var(--warn); }
+.ckin-pts.err { color: var(--err); }
+
+.ckin-next {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ckin-next em { font-style: normal; color: var(--fg-mute); font-size: var(--fs-xs); }
+.ckin-next.overdue { color: var(--warn); }
+
+.ckin-err {
+  color: var(--fg-mute);
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ckin-err.has { color: var(--err); }
+
+.ckin-ops { display: flex; gap: 6px; justify-content: flex-end; }
+
+/* 空态（没有账号 / 过滤后没有异常） */
+.ckin-empty {
+  padding: var(--sp-4);
+  text-align: center;
+  color: var(--fg-mute);
+  font-size: var(--fs-sm);
+}
+
+/* 近 N 天签到小格子 —— 一眼看出自动签到有没有连续在跑 */
+.day-dots { display: inline-flex; gap: 3px; flex-shrink: 0; }
+.day-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+  background: var(--line);
+  display: inline-block;
+}
+.day-dot.ok { background: var(--ok); }
+.day-dot.warn { background: var(--warn); }
+.day-dot.err { background: var(--err); }
+.ok-text { color: var(--ok); }
+
+/* 窄屏：紧凑行的四段换行堆叠，别把文字挤成竖条 */
+@media (max-width: 900px) {
+  .ckin-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 2px;
+  }
+  .ckin-when,
+  .ckin-next,
+  .ckin-err { grid-column: 1 / -1; }
+}
 
 .card-metrics {
   display: grid;
@@ -664,6 +762,12 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.primary:hover:not(:disabled) { background: #3d7ded; border-color: #3d7ded; }
 button.ghost { background: transparent; }
 button.ghost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.04); }
+/* 开关型 ghost 按钮的「打开」态 —— 要一眼看出筛选生效了。 */
+button.ghost.on {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
 
 /* 破坏性操作：**视觉降权**。红色的实心按钮会和主操作抢注意力，
    而这些按钮（清空缓存 / 清空统计 / 删除）几乎不需要被「看见」，
@@ -1111,9 +1215,6 @@ pre.code-block {
   .kv dd { margin-bottom: var(--sp-2); }
   .nav-tabs { padding: 0 var(--sp-3); justify-content: flex-start; }
   .tab-btn { padding: 10px var(--sp-3); font-size: var(--fs-sm); }
-  .topbar { padding: 0 var(--sp-3); gap: var(--sp-2); }
-  /* 窄屏顶栏放不下状态文案 —— 状态在「反代」Tab 里还有完整一份。 */
-  .topbar-status { display: none; }
   .empty { padding: var(--sp-6) var(--sp-3); }
   .input-search { width: 100%; }
 }
